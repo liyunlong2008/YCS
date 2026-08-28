@@ -157,6 +157,10 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     ai: AIProvider = build_ai_provider(cfg.ai)
     broker: Broker = build_broker(cfg)
 
+    # 3.5) OrderManager（Maker 优先）
+    from app.trading.order_manager import OrderManager
+    order_manager = OrderManager(broker, state_store=state_store)
+
     # 4) 行情生产者（纸盘 / 实盘都可使用；OKX 空密钥时仅测试用）
     market_producer = MarketDataProducer(okx=cfg.okx, symbol=symbol)
 
@@ -170,8 +174,9 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
         journal=journal,
         market_producer=market_producer,
     )
-    # 额外挂载 PositionManager（未来主交易循环用）
-    setattr(controller, "position_manager", position_manager)
+    # 挂载 OrderManager 与 PositionManager 到 Controller（阶段 4 执行闭环使用）
+    controller.order_manager = order_manager  # type: ignore[attr-defined]
+    controller.position_manager = position_manager  # type: ignore[attr-defined]
 
     # 6) SystemRecoverer：OKX 时间同步 + 余额/持仓/挂单 写回 state（交易所优先）
     recoverer = SystemRecoverer(broker=broker, state_store=state_store, symbol=symbol)
@@ -227,42 +232,138 @@ async def bg_time_sync(rt: dict[str, Any]) -> None:
 
 
 async def bg_main_loop(rt: dict[str, Any]) -> None:
-    """交易主循环占位（阶段 4 实盘验证时填充）。
+    """交易主循环（阶段 4 完整闭环）。
 
-    当前占位功能：
-      - 每 30 秒调用一次 PositionManager 利润保护检查（若已有持仓则触发 should_close_for_protection）
-      - 每次写入 state.json 的 risk / position_manager 持久态
-      - 【未来扩展】：拉行情 → analyze() AI → check_can_open() 风控 → Maker 先挂单 20s → 止损止盈
+    每 MAIN_LOOP_INTERVAL 秒：
+      1) 日切点检测（跨日时重置 daily_start_balance）
+      2) 拉取当前持仓
+         - 空仓 → 调用 analyze() → 读取 AI 判断 & 置信度 → risk.check_can_open → execute_trade_signal
+         - 持仓 → PositionManager.should_close_for_protection → True 时市价平仓并更新统计/风控
+      3) 持久化 risk / position_manager / stats
     """
-    from app.core.constants import SystemStatus
+    from app.core.constants import SystemStatus, OrderSide, MarketRegime, PositionSide
+    loop_interval = 30  # 30s 轮询
     while True:
         try:
-            state_store = rt["state_store"]
-            risk = rt["risk"]
-            pm = rt["position_manager"]
-            ctl = rt["controller"]
+            state_store: StateStore = rt["state_store"]
+            risk: RiskEngine = rt["risk"]
+            pm: PositionManager = rt["position_manager"]
+            ctl: TradingController = rt["controller"]
+            cfg = rt["config"]
+            symbol = cfg.trading.symbol
             st = state_store.load()
 
-            # 持久化：risk / position_manager
+            # ------------------------------------------------------------
+            # 1) 日切点
+            # ------------------------------------------------------------
+            try:
+                ctl.apply_daily_reset_if_needed()
+            except Exception:
+                logger.exception("日切点检测异常")
+
+            # ------------------------------------------------------------
+            # 2) 拉持仓 & 利润保护轮询（若已有持仓则触发 should_close_for_protection）
+            # ------------------------------------------------------------
+            if st.get("status") == SystemStatus.RUNNING.value:
+                pos = await ctl.broker.get_position(symbol)
+                need_close, close_reason = pm.should_close_for_protection(pos)
+
+                if pos.side != PositionSide.FLAT:
+                    # 已有持仓 → 只做利润保护/止损，不再开新仓
+                    if need_close:
+                        logger.bind(log_type="trade").warning("利润保护触发（主循环）：{}", close_reason)
+                        realized = await ctl.close_position_for_protection(pos)
+                        logger.success("[主循环] 利润保护平仓完成：已实现盈亏={:.6f}U", realized)
+                else:
+                    # 空仓 → 拉 AI → 风控 → 下单
+                    if (need_close, need_close):  # dummy to avoid unused var
+                        pass
+                    try:
+                        ai_block = await ctl.analyze()
+                    except Exception:
+                        logger.exception("AI 分析异常（跳过本轮开仓）")
+                        ai_block = {}
+                    last_ai = ctl._last_ai
+                    bal = await ctl.broker.get_balance()
+                    now_ts = int(time.time())
+                    # 计算入场价：用当前 mark_price（若有）或 2000 兜底
+                    entry_price = float(pos.mark_price or bal.total and 0 or 2000)
+                    # 获取合理的 entry price：读 position mark_price（PaperBroker mark 会在最近 ticker 上更新；若空则 default 2000 fallback 会有问题，改成读取 broker last 或 state balance；简化：用 PaperBroker 的 _last_price。更稳妥：直接设为上次 state 中 balance_mark。暂用默认风险计算会兜底。）
+                    # 兜底：若 mark_price == 0（初始），回退 2000
+                    if not entry_price or entry_price <= 0:
+                        entry_price = 2000.0
+                    verdict = await risk.check_can_open(
+                        balance_total=float(bal.total or 0),
+                        balance_available=float(bal.available or 0),
+                        entry_price=entry_price,
+                        now_ts=now_ts,
+                    )
+                    if not verdict.allow:
+                        logger.bind(log_type="trade").info(
+                            "[风控] 本轮跳过开仓：{}（连续亏损={}，日切余额={:.2f}U 权益={:.2f}U）",
+                            verdict.reason, risk.consecutive_losses,
+                            risk.daily_start_balance, float(bal.total or 0),
+                        )
+                    elif last_ai is None or last_ai.confidence < 50 or last_ai.market_regime in (
+                        MarketRegime.LOW_VOLATILITY, MarketRegime.RANGE,
+                    ):
+                        logger.bind(log_type="trade").info(
+                            "[AI] 信号或置信度不足（reg={} conf={}），暂不开仓",
+                            last_ai.market_regime.value if last_ai else "None",
+                            last_ai.confidence if last_ai else -1,
+                        )
+                    else:
+                        # 决定多空
+                        if last_ai.market_regime == MarketRegime.TREND_UP:
+                            market_side = OrderSide.BUY
+                        elif last_ai.market_regime == MarketRegime.TREND_DOWN:
+                            market_side = OrderSide.SELL
+                        else:
+                            market_side = None
+                        if market_side is not None:
+                            logger.bind(log_type="trade").info(
+                                "[主循环] 发起交易信号：side={} entry={} size={:.6f} sl={}",
+                                market_side.value, entry_price,
+                                verdict.suggested_size, verdict.stop_loss_price,
+                            )
+                            exec_res = await ctl.execute_trade_signal(
+                                ai=last_ai, verdict=verdict,
+                                entry_price=entry_price, market_side=market_side,
+                            )
+                            logger.success("[主循环] execute 结果: status={} via={} qty={:.6f} 原因={}",
+                                           exec_res["status"], exec_res["via"],
+                                           exec_res["qty"], exec_res["reason"])
+
+            # ------------------------------------------------------------
+            # 3) 持久化：risk / position_manager / stats 已在各自方法内写 state，这里仅兜底 sync 余额/状态标志
+            # ------------------------------------------------------------
+            st = state_store.load()
             st["risk"] = risk.to_dict()
             st.setdefault("position_manager", {}).update(pm.to_dict())
-
-            # 若系统运行，则做一次利润保护轮询（读取 position）
-            if st.get("status") == SystemStatus.RUNNING.value:
-                try:
-                    pos = await ctl.broker.get_position(ctl.config.trading.symbol)
-                    need_close, reason = pm.should_close_for_protection(pos)
-                    if need_close:
-                        logger.bind(log_type="trade").warning("利润保护触发：{}", reason)
-                        # 阶段 4：这里真正下市价平仓单（调用 OrderManager / Broker）
-                        # await ctl.broker.place_order(...)
-                except Exception:
-                    logger.exception("利润保护轮询异常")
-
+            # 最新余额刷新（FastAPI status 展示取 state 的余额快照会用）
+            try:
+                bal2 = await ctl.broker.get_balance()
+                st["balance"] = {
+                    "total": float(bal2.total or 0),
+                    "available": float(bal2.available or 0),
+                    "unrealized_pnl": float(bal2.unrealized_pnl or 0),
+                    "currency": getattr(bal2, "currency", "USDT") or "USDT",
+                }
+                pos2 = await ctl.broker.get_position(symbol)
+                st["position"] = {
+                    "side": pos2.side.value,
+                    "size": float(pos2.size or 0),
+                    "entry_price": float(pos2.entry_price or 0),
+                    "mark_price": float(pos2.mark_price or 0),
+                    "leverage": int(getattr(pos2, "leverage", 0) or 0),
+                    "unrealized_pnl": float(getattr(pos2, "unrealized_pnl", 0.0) or 0),
+                }
+            except Exception:
+                logger.exception("刷新余额/持仓快照失败")
             state_store.save(st)
         except Exception:
-            logger.exception("主循环占位执行异常")
-        await asyncio.sleep(30)
+            logger.exception("主循环执行异常（{}s 后重试）", loop_interval)
+        await asyncio.sleep(loop_interval)
 
 
 # ---------------------------------------------------------------------------

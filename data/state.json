@@ -20,7 +20,8 @@
   "risk": {
     "consecutive_losses": 0,
     "cooldown_until_ts": 0,
-    "daily_start_balance": 1000.0
+    "daily_start_balance": 1000.0,
+    "known_order_ids": []
   },
   "stats": {
     "trades_total": 0,
@@ -51,10 +52,11 @@
     ]
   },
   "time_sync": {
-    "server_ms": 1787956531115,
-    "local_ms": 1787956531115,
+    "server_ms": 1787957145418,
+    "local_ms": 1787957145418,
     "drift_ms": 0,
-    "last_sync_at": 1787956531,
+    "last_sync_at": 1787957145,
     "drifted_pause": false
-  }
+  },
+  "daily_reset_day": "2026-08-28"
 }
