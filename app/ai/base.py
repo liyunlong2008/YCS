@@ -21,12 +21,12 @@ class MarketData(BaseModel):
     仅用于分析，不直接触发交易（风控 + Controller 拥有最终决定权）。
     """
     symbol: str
-    timestamp: int                       # 毫秒时间戳
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+    timestamp: int = 0                     # 毫秒时间戳
+    open: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+    volume: float = 0.0
     ohlcv_1h: list[list[float]] = Field(default_factory=list)   # 近 N 根 1H K 线
     ohlcv_15m: list[list[float]] = Field(default_factory=list)  # 近 N 根 15m K 线
     extra: dict[str, Any] = Field(default_factory=dict)
