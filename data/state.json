@@ -52,10 +52,10 @@
     ]
   },
   "time_sync": {
-    "server_ms": 1787957145418,
-    "local_ms": 1787957145418,
+    "server_ms": 1787957871814,
+    "local_ms": 1787957871814,
     "drift_ms": 0,
-    "last_sync_at": 1787957145,
+    "last_sync_at": 1787957871,
     "drifted_pause": false
   },
   "daily_reset_day": "2026-08-28"

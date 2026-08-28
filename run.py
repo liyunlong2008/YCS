@@ -114,6 +114,7 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     """
     from app.core.config import load_config, AppConfig
     from app.core.constants import SYMBOL
+    from app.core.safety import validate_runtime_credentials
     from app.ai.factory import build_ai_provider
     from app.ai.base import AIProvider
     from app.broker.factory import build_broker
@@ -142,6 +143,19 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     symbol = cfg.trading.symbol
     data_dir = PROJECT_ROOT / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # === 0) 启动前安全自检：实盘占位密钥 → 立刻拒绝启动 ===
+    try:
+        validate_runtime_credentials(
+            live=bool(cfg.trading.live),
+            okx_api_key=cfg.okx.api_key,
+            okx_secret=cfg.okx.secret,
+            okx_passphrase=cfg.okx.passphrase,
+            ai_api_key=cfg.ai.api_key,
+        )
+    except RuntimeError as exc:
+        logger.error("[安全拦截] {}", exc)
+        raise SystemExit(2) from exc
 
     # 1) 存储层
     state_store = StateStore(data_dir)

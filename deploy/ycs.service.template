@@ -1,0 +1,27 @@
+[Unit]
+Description=YunLong Challenge System (YCS) - ETH-USDT-SWAP Auto Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 自动检测 uv run python 路径；需要在 Installer 中替换 WorkingDirectory/ExecStart/User
+User=__USER__
+WorkingDirectory=__WORKDIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+ExecStart=__UV__ run python __RUN_PY__
+Restart=always
+RestartSec=8
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ycs
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# 允许写数据 / 日志 / journal 持久化目录
+ReadWritePaths=__WORKDIR__/data __WORKDIR__/logs __WORKDIR__/.venv
+
+[Install]
+WantedBy=multi-user.target
