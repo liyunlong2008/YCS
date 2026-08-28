@@ -1,8 +1,8 @@
 # =============================================================================
 # 云龙挑战赛（YCS）启动入口
 # 用法：
-#   cd yunlong
-#   ../.venv/bin/python run.py          # 或  uv run python yunlong/run.py
+#   cd /workspace
+#   .venv/bin/python run.py     # 或  uv run python run.py
 # =============================================================================
 
 import sys
