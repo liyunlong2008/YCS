@@ -1,0 +1,15 @@
+[project]
+name = "yunlong"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt>=4.5.76",
+    "fastapi>=0.141.1",
+    "litellm>=1.98.0",
+    "loguru>=0.7.3",
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "uvicorn[standard]>=0.52.4",
+]

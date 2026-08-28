@@ -1,0 +1,22 @@
+# =============================================================================
+# 云龙挑战赛（YCS）配置文件
+# 仅保存密钥与运行模式，其它参数写入代码常量
+# =============================================================================
+
+# OKX API 凭证
+okx:
+  api_key: "YOUR_OKX_API_KEY"
+  secret: "YOUR_OKX_API_SECRET"
+  passphrase: "YOUR_OKX_PASSPHRASE"
+
+# AI 提供商配置（通过 LiteLLM 统一接入）
+ai:
+  provider: "deepseek"        # deepseek / openai / claude / gemini / openrouter
+  api_key: "YOUR_AI_API_KEY"
+  model: "deepseek-chat"      # 更换模型时仅修改此处
+  base_url: ""                # 可选，自定义 endpoint
+
+# 交易运行模式
+trading:
+  live: false                 # false=纸盘模式(Paper)   true=实盘模式(Live)
+  symbol: "ETH-USDT-SWAP"     # 单品种
