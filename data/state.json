@@ -1,0 +1,60 @@
+{
+  "status": "RUNNING",
+  "started_at": null,
+  "balance": {
+    "total": 1000.0,
+    "available": 1000.0,
+    "unrealized_pnl": 0.0
+  },
+  "position": {
+    "symbol": "ETH-USDT-SWAP",
+    "side": "FLAT",
+    "size": 0.0,
+    "entry_price": 0.0,
+    "mark_price": 2000.0,
+    "unrealized_pnl": 0.0,
+    "leverage": 3,
+    "liquidation_price": 0.0
+  },
+  "last_ai": null,
+  "risk": {
+    "consecutive_losses": 0,
+    "cooldown_until_ts": 0,
+    "daily_start_balance": 1000.0
+  },
+  "stats": {
+    "trades_total": 0,
+    "wins": 0,
+    "losses": 0,
+    "total_pnl_pct": 0.0
+  },
+  "open_orders": [],
+  "position_manager": {
+    "current_lock_pct": null,
+    "steps": [
+      [
+        3.0,
+        0.0
+      ],
+      [
+        8.0,
+        3.0
+      ],
+      [
+        15.0,
+        8.0
+      ],
+      [
+        30.0,
+        15.0
+      ]
+    ]
+  },
+  "time_sync": {
+    "server_ms": 1787956531115,
+    "local_ms": 1787956531115,
+    "drift_ms": 0,
+    "last_sync_at": 1787956531,
+    "drifted_pause": false
+  }
+}

@@ -207,6 +207,11 @@ class PaperBroker(Broker):
         self._update_position_on_fill(order.side, qty, fill_price)
         logger.info("PaperBroker 成交: cid={} side={} qty={} @ {} type={}",
                     order.client_order_id, order.side.value, qty, fill_price, order.type.value)
+        # 交易日志（trade.log）
+        logger.bind(log_type="trade").info(
+            "[PaperBroker 成交] cid={} side={} type={} qty={} price={}",
+            order.client_order_id, order.side.value, order.type.value, qty, fill_price,
+        )
 
     def _fill_market(self, order: Order) -> None:
         """市价单：对 BUY 用 ask，对 SELL 用 bid。"""
@@ -338,6 +343,10 @@ class PaperBroker(Broker):
             self._position = Position(symbol=self.symbol, side=PositionSide.FLAT, leverage=self.leverage)
         logger.info("PaperBroker 平仓/减仓: side={} reduce={} @{} 已实现盈亏={}",
                     side.value, reduce, price, round(realized, 6))
+        logger.bind(log_type="trade").info(
+            "[PaperBroker 平仓/减仓] side={} reduce_qty={} price={} 已实现盈亏(USDT)={}",
+            side.value, reduce, price, round(realized, 6),
+        )
 
     # ------------------------------------------------------------------
     def _refresh_pnl(self) -> None:

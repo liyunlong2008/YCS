@@ -80,31 +80,28 @@ class TradingController:
     # 初始化：从 state_store 恢复 last_ai；若仍为空，用构造的 MarketData 调一次 AI 给初始值
     # ------------------------------------------------------------------
     def _restore_last_ai_from_store(self) -> None:
-        import asyncio as _aio
         st = self.state_store.load()
-        saved = st.get("last_ai") or {}
-        if saved and saved.get("market_regime"):
+        saved = st.get("last_ai") if isinstance(st, dict) else None
+        if isinstance(saved, dict):
             try:
+                from ..ai.base import MarketAnalysisResult
                 self._last_ai = MarketAnalysisResult(
-                    market_regime=MarketRegime(saved["market_regime"]),
+                    market_regime=MarketRegime(saved.get("market_regime", MarketRegime.RANGE.value)),
                     confidence=int(saved.get("confidence") or 0),
                     reason=str(saved.get("reason") or ""),
                 )
                 self._last_ai_ts = saved.get("ts")
             except Exception:
                 self._last_ai = None
-        # 若还没有（冷启动），用默认 MarketData 调一次 AI，让 Dashboard 首次展示不空
+        # 冷启动：用默认 RANGE 填充，避免 Dashboard 显示 "暂无" 且合法 MarketRegime
         if self._last_ai is None:
-            try:
-                md = MarketData(
-                    symbol=self.config.trading.symbol,
-                    timestamp=int(time.time() * 1000),
-                )
-                res = _aio.run(self.ai.analyze_market(md))
-                self._last_ai = res
-                self._last_ai_ts = int(time.time() * 1000)
-            except Exception:
-                pass
+            from ..ai.base import MarketAnalysisResult
+            self._last_ai = MarketAnalysisResult(
+                market_regime=MarketRegime.RANGE,
+                confidence=0,
+                reason="冷启动：等待首次 AI 行情分析",
+            )
+            self._last_ai_ts = int(time.time() * 1000)
 
     # ------------------------------------------------------------------
     # 统一中文翻译辅助
@@ -224,19 +221,39 @@ class TradingController:
     async def analyze(self) -> dict[str, Any]:
         """拉行情 → 调 AI → 写入 last_ai，返回中文展示。
 
-        若未配置 market_producer，则构造一份默认 MarketData 调 AI，保证注入的 AIProvider 始终被使用。
+        若未配置 market_producer 或拉取失败（超时/无网络），回退到默认 MarketData，
+        确保 Dashboard 始终有可用结果展示。
         """
+        from ..ai.base import MarketAnalysisResult
         if self.market_producer is not None:
-            md: MarketData = await self.market_producer.get_market_data()
+            try:
+                md: MarketData = await self.market_producer.get_market_data()
+            except Exception as e:
+                logger.warning("行情拉取失败（回退默认）：{}", e)
+                md = MarketData(
+                    symbol=self.config.trading.symbol,
+                    timestamp=int(time.time() * 1000),
+                )
         else:
-            # 无行情生产者（单测/轻量启动），构造默认 MarketData，让 AI 仍可执行
             md = MarketData(
                 symbol=self.config.trading.symbol,
                 timestamp=int(time.time() * 1000),
             )
-        result = await self.ai.analyze_market(md)
+        try:
+            result = await self.ai.analyze_market(md)
+        except Exception as e:
+            logger.warning("AI 分析失败（回退默认 RANGE）：{}", e)
+            result = MarketAnalysisResult(
+                market_regime=MarketRegime.RANGE,
+                confidence=0,
+                reason=f"AI 暂不可用: {e}",
+            )
         self._last_ai = result
         self._last_ai_ts = int(time.time() * 1000)
+        logger.bind(log_type="trade").info(
+            "[AI 决策] 市场状态={} 置信度={} 理由={}",
+            result.market_regime.value, result.confidence, result.reason,
+        )
         # 持久化到 state.json 便于恢复
         st = self.state_store.load()
         st["last_ai"] = {

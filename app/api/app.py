@@ -17,8 +17,9 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
@@ -46,13 +47,48 @@ def _zh(value: str | None) -> str:
     return ZH_STATUS.get(value, value)
 
 
-def create_app(config_path: Path | str | None = None) -> FastAPI:
-    """构建 FastAPI 应用。"""
+def create_app(
+    config_path: Path | str | None = None,
+    *,
+    on_startup: list[Callable[[], Any]] | None = None,
+    on_shutdown: list[Callable[[], Any]] | None = None,
+) -> FastAPI:
+    """构建 FastAPI 应用。
+
+    Args:
+        config_path: 配置文件路径（预留，单测可不传）
+        on_startup: 可选启动期同步回调列表（lifespan 启动时调用）
+        on_shutdown: 可选关闭期同步回调列表（lifespan 关闭时调用）
+    """
+
+    @asynccontextmanager
+    async def _lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
+        # 启动阶段
+        for fn in on_startup or []:
+            try:
+                result = fn()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                from loguru import logger
+                logger.exception("on_startup 回调异常")
+        yield
+        # 关闭阶段
+        for fn in on_shutdown or []:
+            try:
+                result = fn()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                from loguru import logger
+                logger.exception("on_shutdown 回调异常")
+
     app = FastAPI(
         title="云龙挑战赛 Dashboard",
         version="1.0.0",
         description="云龙挑战赛（YCS）：ETH-USDT-SWAP 单品种 AI 分析 + Maker 优先 + 严格风控 + 自动恢复 + 利润保护 自动交易系统。",
         docs_url="/docs",
+        lifespan=_lifespan,
     )
 
     # ------------------------------------------------------------------
