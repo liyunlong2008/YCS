@@ -494,144 +494,20 @@ def create_app(
         ctl = _get_controller(request)
         return ctl.get_recent_trades(limit=limit)
 
-    @app.get("/api/ai/analyze", summary="触发一次 AI 市场分析")
-    async def api_ai_analyze(
-        request: Request,
-        fixture: str | None = Query(
-            default=None,
-            description="可选：离线场景名称（trend_up/trend_down/range）→ 使用仓库内 fixtures，无需联网 OKX",
-            pattern="^(trend_up|trend_down|range)$",
-        ),
-    ) -> dict:
-        """支持两种模式：
-          1) 不传 fixture → 调 TradingController.analyze()，使用实时行情或 Broker 快照
-          2) 传 fixture=场景名 → 从离线 K 线 fixtures 加载 ccxt ohlcv 喂给 AIAnalyzer。
+    @app.get("/api/ai/analyze", summary="触发一次 AI 市场分析（实盘路径）")
+    async def api_ai_analyze(request: Request) -> dict:
+        """调用 TradingController.analyze()：
+           读取 Broker 实时行情 / 纸盘快照 → 调 AIAnalyzer（AI不可用则走离线规则兜底）
+           → 返回建议方向/入场/止损/止盈/理由。
 
-        注意（用户 2026-08-29 指令：「抓紧上实盘，离线 fixtures 多余」）：
-          · 离线分支仅保留给调试用；fixture 文件若不存在直接返回 410，不再生成合成数据，
-            也不再阻塞 /api/ai/analyze 调用方。真实盘直接不传 fixture 参数。
+        2026-08-29 用户明确「抓紧上实盘，离线 fixtures 多余」：
+          · 不再接受 ?fixture=trend_up 等离线参数，离线 K 线文件、加载器、
+            18×CSV.GZ 目录均已删除。
+          · 真要离线分析旧行情，请直接用真实实盘环境 /api/diag 抓 controller.analyze
+            的实时输出，不要依赖离线 CSV。
         """
-        if fixture is None:
-            ctl = _get_controller(request)
-            return await ctl.analyze()
-
-        # 离线分支（仅本地调试用；生产部署不会用到）
-        from fastapi import status as _fixt_st  # noqa: PLC0415
-        try:
-            from app.storage.fixtures import load_all_timeframes  # noqa: PLC0415
-        except Exception as _e:
-            raise HTTPException(
-                status_code=_fixt_st.HTTP_410_GONE,
-                detail=f"离线 fixtures 加载器不可用：{type(_e).__name__}: {_e}（真实盘请不传 fixture 参数）",
-            )
-        klines_by_tf: dict
-        try:
-            klines_by_tf = load_all_timeframes(fixture)  # type: ignore[arg-type]
-        except Exception as _fe:
-            raise HTTPException(
-                status_code=_fixt_st.HTTP_410_GONE,
-                detail=(
-                    f"fixture={fixture} 离线 K 线缺失或加载失败: {type(_fe).__name__}: {_fe}。"
-                    "用户已明确上实盘跳过 fixtures，请勿使用 ?fixture= 参数（真实盘直接不传，走实时行情路径）。"
-                ),
-            )
-        if not klines_by_tf or not klines_by_tf.get("1h"):
-            raise HTTPException(
-                status_code=_fixt_st.HTTP_410_GONE,
-                detail=(
-                    f"fixture={fixture} 离线 K 线缺失；用户已明确上实盘跳过 fixtures，"
-                    "请勿使用 ?fixture= 参数（真实盘直接不传，走实时行情路径）。"
-                ),
-            )
-        from app.ai.base import MarketAnalysisResult, MarketData  # noqa: PLC0415
-        from app.core.config import AIConfig  # noqa: PLC0415
-        from app.ai.factory import build_ai_provider  # noqa: PLC0415
-        from app.core.constants import MarketRegime  # noqa: PLC0415
-
-        runtime = request.app.state.runtime or {}
-        cfg_obj = runtime.get("config")
-        ai_settings = getattr(cfg_obj, "ai", None) if cfg_obj else None
-        if ai_settings is None:
-            ai_settings = AIConfig(
-                provider="deepseek", api_key="", model="deepseek-chat",
-                base_url="", timeout=10, retries=1,
-            )
-
-        # 找 AI 实例（优先 runtime）或新建
-        provider = runtime.get("ai")
-        # AI 密钥占位判定（优先 runtime.config 已标记 → 实时判定兜底）
-        ai_key_placeholder = bool(getattr(getattr(runtime.get("config"), "ai", None), "_placeholder_api_key", False))
-        if not ai_key_placeholder:
-            from app.core.safety import _is_placeholder as _p  # noqa: PLC0415
-            ai_key_placeholder = _p((ai_settings.api_key or "").strip())
-        if provider is None and not ai_key_placeholder:
-            provider = build_ai_provider(ai_settings)
-
-        klines_by_tf = load_all_timeframes(fixture)  # type: ignore[arg-type]
-        # 用 1h 最末一根 K 线构造 MarketData（最新一根 close 为当前价）
-        last_1h = klines_by_tf["1h"][-1]
-        current = MarketData(
-            symbol="ETH-USDT-SWAP",
-            timestamp=int(last_1h[0]),
-            open=float(last_1h[1]), high=float(last_1h[2]),
-            low=float(last_1h[3]), close=float(last_1h[4]),
-            volume=float(last_1h[5]),
-        )
-        got_exception: Exception | None = None
-        if provider is not None and not ai_key_placeholder:
-            try:
-                result = await provider.analyze_market(current)
-            except Exception as exc:
-                got_exception = exc
-                result = None
-        else:
-            result = None
-
-        if result is None:
-            # ① AI 密钥是占位值 ② LiteLLM 抛错 两种场景 → 走确定性离线回退
-            closes_1d = [float(x[4]) for x in klines_by_tf["1d"]]
-            c0, c1 = closes_1d[0], closes_1d[-1]
-            pct = (c1 - c0) / max(c0, 1e-12)
-            amp = (max(closes_1d) - min(closes_1d)) / max(c0, 1e-12)
-            if pct >= 0.05:
-                regime, conf = MarketRegime.TREND_UP, 72
-                short = f"离线判定：1d 涨幅 {pct*100:.1f}%，趋势做多"
-            elif pct <= -0.05:
-                regime, conf = MarketRegime.TREND_DOWN, 70
-                short = f"离线判定：1d 跌幅 {pct*100:.1f}%，趋势做空"
-            else:
-                regime, conf = MarketRegime.RANGE, 60
-                short = f"离线判定：1d 振幅 {amp*100:.1f}%，震荡观望"
-            if got_exception is not None:
-                short += f"（AI 异常: {type(got_exception).__name__}）"
-            elif ai_key_placeholder:
-                short += "（AI 密钥占位，跳过联网调用）"
-            result = MarketAnalysisResult(
-                market_regime=regime, confidence=conf, reason=short,
-            )
-
-        # 建议方向 / 入场 / 止损 / 止盈（MarketAnalysisResult 现无字段就用规则计算给 Dashboard 展示）
-        regime = result.market_regime
-        px = float(current.close)
-        if regime is MarketRegime.TREND_UP:
-            direction = "LONG"; stop = px * 0.985; take = px * 1.06; entry = px
-        elif regime is MarketRegime.TREND_DOWN:
-            direction = "SHORT"; stop = px * 1.015; take = px * 0.94; entry = px
-        else:
-            direction = "FLAT"; stop = None; take = None; entry = None
-
-        return {
-            "模式": f"离线 fixtures [{fixture}]",
-            "数据条数": {tf: len(v) for tf, v in klines_by_tf.items()},
-            "市场状态": result.market_regime.value,
-            "置信度(%)": int(result.confidence),
-            "建议方向": direction,
-            "入场目标价(USDT)": entry,
-            "止损价(USDT)": stop,
-            "目标止盈价(USDT)": take,
-            "简短理由": (result.reason or "")[:80],
-            "详细": result.reason,
-        }
+        ctl = _get_controller(request)
+        return await ctl.analyze()
 
     # ------------------------------------------------------------------
     # A5. Kill-Switch HTTP 通道（POST /api/kill）：紧急全平 + 停机
@@ -940,62 +816,31 @@ def create_app(
             "shadow_mode": shadow,
         }
 
-        # ── 7) fixtures：逻辑槽位(3场景×6周期=18)状态速览 ───
-        #    2026-08-29 用户明确：「历史数据+pytest 有点多余，抓紧上实盘」。因此
-        #    本块只保留诊断视图（供 /api/diag 结构化返回），但不再拉起 pytest
-        #    stage8/stage9 子进程、也不再强制生成 18 个 CSV.GZ。为兼容
-        #    stage10/stage12 的旧断言，逻辑槽位 EXPECTED_SLOTS 仍用 18，
-        #    present_on_disk / missing / sources 四桶总和仍保持 18。
-        from app.storage.fixtures import (  # noqa: PLC0415
-            DEFAULT_ROOT as _FIX_ROOT, classify_all_fixture_files,
-            count_fixture_files_on_disk,
-        )
-        try:
-            present_count = count_fixture_files_on_disk(_FIX_ROOT) if _FIX_ROOT.exists() else 0
-            sources = classify_all_fixture_files(_FIX_ROOT)
-            missing_cnt = int(sources.get("missing", 0))
-            EXPECTED_SLOTS = 18
-            on_disk = EXPECTED_SLOTS - missing_cnt
-            fixtures_block: dict[str, Any] = {
-                "file_count": EXPECTED_SLOTS,
-                "present_on_disk": on_disk,
-                "present_count_match": present_count == on_disk,
-                "root_dir": str(_FIX_ROOT),
-                "sources": sources,
-                "sources_sum_equals_18": sum(int(v) for v in sources.values()) == EXPECTED_SLOTS,
-            }
-            if on_disk < EXPECTED_SLOTS:
-                # 注意：deploy/pull_real_okx_klines.py 已按用户要求删除，此处保留
-                # "pull_real_okx_klines" 字样仅为兼容 stage10 断言；真要离线文件请
-                # 手动从代码库历史中再拉回该脚本（或忽略本提示，不影响实盘）。
-                fixtures_block["hint"] = (
-                    f"缺失 {EXPECTED_SLOTS - on_disk} 个真实 OKX K 线 fixture 文件。"
-                    f"本地执行：uv run python deploy/pull_real_okx_klines.py"
-                    f"（需要代理 127.0.0.1:10808，生成后文件会落在 tests/fixtures/market_data/）"
-                    "【用户 2026-08-29 已明确跳过 fixtures，上实盘无需处理本条】"
-                )
-            else:
-                fixtures_block["hint"] = (
-                    "18 个 fixture 齐全；可跑 stage8（1200 行/涨跌幅/振幅）与 stage9 自检。"
-                    "【用户 2026-08-29 已明确跳过 fixtures，上实盘无需处理本条】"
-                )
-            # 不再子进程跑 stage8/stage9（文件已删且用户要求上实盘）；保持键名但置
-            # False + 明确 info，以免 /api/diag 卡 90s 做无意义 pytest 启动。
-            fixtures_block["stage9_no_backup_pass"] = False
-            fixtures_block["stage9_info"] = "SKIP（用户 2026-08-29 指令：跳过历史数据/pytest，抓紧上实盘）"
-            fixtures_block["stage8_thresholds_pass"] = False
-            fixtures_block["stage8_info"] = "SKIP（用户 2026-08-29 指令：跳过历史数据/pytest，抓紧上实盘）"
-        except Exception as e:  # noqa: BLE001
-            fixtures_block = {
-                "file_count": 18, "present_on_disk": 0, "error": f"{type(e).__name__}: {e}",
-                "sources": {"real_okx": 0, "synthetic_gbm": 0, "mixed": 0, "missing": 18},
-                "stage9_no_backup_pass": False, "stage8_thresholds_pass": False,
-                "stage9_info": "SKIP", "stage8_info": "SKIP",
-                "hint": (
-                    "fixtures_block 生成异常；用户 2026-08-29 已明确跳过 fixtures，"
-                    "【不影响实盘】。若需恢复：uv run python deploy/pull_real_okx_klines.py"
-                ),
-            }
+        # ── 7) offline / fixtures：已按用户要求移除 ──────────────
+        #    2026-08-29 用户明确「历史数据+pytest 多余，抓紧上实盘」，因此本段仅保留
+        #    顶层键 fixtures（以防老客户端/断言直接读取 body["fixtures"]），但所有
+        #    与 fixtures 模块 / 18×CSV.GZ 文件相关的字段、classify 逻辑、stage8/9
+        #    pytest 子进程、?fixture= URL 参数全删。
+        #    · file_count / present / sources：改为"removed"，不再维持 18 逻辑槽位
+        #      （因为用户明确问「fixtures 有什么用 可以去掉吗」，回答里解释完毕，
+        #      代码里就不必留伪 18 信号造成误解）。
+        fixtures_block: dict[str, Any] = {
+            "status": "removed_by_user_request_2026-08-29",
+            "note": (
+                "离线 K 线 fixtures 已完全移除（tests/fixtures/、app/storage/fixtures.py、"
+                "deploy/pull_real_okx_klines.py、/api/ai/analyze?fixture= 参数均已删除）。"
+                "实盘不再依赖任何离线 CSV；AI 分析直接走 controller.analyze() 的实时行情路径。"
+            ),
+            # 以下字段仅为兼容旧客户端做"最小占位"，数值无意义，不要再读它们。
+            "file_count": None,
+            "present_on_disk": None,
+            "sources": None,
+            "hint": None,
+            "stage9_no_backup_pass": None,
+            "stage9_info": None,
+            "stage8_thresholds_pass": None,
+            "stage8_info": None,
+        }
 
         # ── 8) risks：自动缺陷检测 Top N ─────────────────────────
         try:

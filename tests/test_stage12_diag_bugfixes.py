@@ -143,11 +143,51 @@ class Test_3_ProjectRootResolve:
             f"api/app.py parents[2] 应是项目根 {REPO}，实际 {computed}"
         )
 
-    def test_diag_stage_subprocess_has_python_fallback_when_no_uv(self, monkeypatch):
-        """diag 内部跑 pytest 的辅助函数在 `uv` 不存在（Windows 未装 / 非激活环境）
-           时，必须 fallback 到 `sys.executable -m pytest`，不能直接报错。
-           验证方式：在 subprocess.run 被调用前记录 argv，首段必须是 python 路径 + '-m' 'pytest'。"""
-        import sys, shutil, subprocess
+
+# ============================================================================
+# ④ fixtures.sources/文件分类：用户 2026-08-29 明确 fixtures 「有啥用 去了吧」
+# ============================================================================
+class Test_4_FixtureRemovedCleanly:
+    def test_diag_fixtures_is_removed_not_18_slot_shell(self):
+        """fixtures 既然用户要移除，代码里就别再伪造 18 逻辑槽位。
+
+        2026-08-29 之前的契约是 sources.sum() == file_count == 18；现在 fixtures 功能
+        整体删掉，所以：
+          · fixtures.status == "removed_by_user_request_2026-08-29"
+          · file_count/sources 必须为 None（不再留"伪 18 槽位"的陷阱信号，
+            避免以后巡检看到以为还存在）
+        """
+        from fastapi.testclient import TestClient
+        from app.api.app import create_app
+        app = create_app()
+        with TestClient(app) as client:
+            fx = client.get("/api/diag").json()["fixtures"]
+        assert fx.get("status") == "removed_by_user_request_2026-08-29", (
+            f"fixtures.status 应 removed，实际 {fx.get('status')!r}"
+        )
+        # 不再校验 sources.sum==18 这种旧信号；若以后需要离线功能，另行设计接口
+        assert fx.get("sources") is None, (
+            f"fixtures 移除后 sources 必须=None（避免误导"
+            f"仍有 18 槽位判定），实际 {fx.get('sources')!r}"
+        )
+        assert fx.get("file_count") is None, (
+            f"fixtures 移除后 file_count 必须=None，实际 {fx.get('file_count')!r}"
+        )
+
+
+# ============================================================================
+# ⑤ pytest fallback：当 uv 缺失时 _diag_run_pytest 必须 fallback sys.executable -m pytest
+# ============================================================================
+class Test_5_RunPytestFallbackWhenUvMissing:
+    def test_diag_pytest_helper_falls_back_when_no_uv(self, monkeypatch):
+        """即使 /api/diag 不再起 stage8/stage9 子进程（用户 2026-08-29 要求移除
+        fixtures 相关），辅助函数 _diag_run_pytest 仍要兼容调用方（如未来 ycsctl 自
+        检/应急诊断）。当 `uv` 不存在（Windows 未装 / 非激活环境）时，必须
+        fallback 到 `sys.executable -m pytest`，不能直接报错。
+
+        验证方式：在 subprocess.run 被调用前记录 argv，首段必须是 python 路径 + '-m' 'pytest'。
+        """
+        import shutil, subprocess
         from app.api import app as api_mod
         captured: dict[str, list] = {"argv": []}
 
@@ -161,21 +201,15 @@ class Test_3_ProjectRootResolve:
 
         def fake_run(argv, **kwargs):
             captured["argv"] = list(argv)
-            # 不真跑 pytest；返回一个假装成功的 CompletedProcess(rc=0, stdout=1 passed)
             return subprocess.CompletedProcess(args=argv, returncode=0, stdout="1 passed\n", stderr="")
 
-        # 用 monkeypatch 设模块属性（_diag_run_pytest 通过 _shutil/_sp 引用模块）
         monkeypatch.setattr(api_mod._shutil, "which", fake_which)
         monkeypatch.setattr(api_mod._sp, "run", fake_run)
 
         ok, info = api_mod._diag_run_pytest(
-            ["tests/test_stage9_no_backup.py", "-q"],
+            ["tests/test_stage6_ycsctl.py", "-q"],
             project_root=REPO, timeout_seconds=5,
         )
-        # 验证：
-        # - ok=True（fake_run 返回 0）
-        # - argv 首段不是 "uv"（因为 fake_which(uv)=None → fallback python -m pytest）
-        # - 首段是当前解释器路径或 "python"，且 argv 中包含 "-m" 后跟 "pytest"
         assert ok is True, f"_diag_run_pytest ok={ok}，应 True（rc=0）"
         argv = captured["argv"]
         assert argv, "subprocess.run 未被调用（未执行）"
@@ -188,44 +222,9 @@ class Test_3_ProjectRootResolve:
 
 
 # ============================================================================
-# ④ fixtures.sources：逐文件分类（18 个 .csv.gz），而不是 3 场景抽样
+# ⑥ safety placeholder 计数：兜底空串/None 也算
 # ============================================================================
-class Test_4_FixtureSourcesPerFile:
-    def test_diag_fixtures_sources_sum_matches_file_count(self):
-        """sources.values().sum() 必须 == fixtures.file_count（逐文件分类槽位数恒=18 信号）。
-
-        兼容二分：
-          · 18 个 csv.gz 存在：file_count=18，sources 四桶和=18（其中 missing=0）
-          · 18 个 csv.gz 不存在（远端删干净未生成）：file_count=18，sources 四桶和=18
-            （其中 missing=18）——这里 classify_all 恒按 18 个逻辑槽位统计，保证 0=18 不会错。
-        若仍只是抽样 3 场景×1d → sources.sum=3 ≠ 18 → fail。"""
-        from fastapi.testclient import TestClient
-        from app.api.app import create_app
-        app = create_app()
-        with TestClient(app) as client:
-            fx = client.get("/api/diag").json()["fixtures"]
-        # file_count（逻辑槽位）恒=18
-        slots = int(fx.get("file_count", -1))
-        total = sum(int(v) for v in fx.get("sources", {}).values())
-        assert slots == 18, f"file_count（逻辑槽位 18）= {slots}，应恒=18"
-        assert total == slots, (
-            f"sources 总和 {total} ≠ file_count(逻辑槽位) {slots}。"
-            " 当前应按 18 个 fixture 槽位各自归类（缺的算 missing，不要只抽样 3 个场景），"
-            " 以便准确判断用户机器上究竟多少还是旧 synthetic/多少真实 OKX/多少未生成。"
-        )
-        # 额外：若磁盘有 present_on_disk 个文件，应与 (18 - sources.missing) 对齐
-        if "present_on_disk" in fx:
-            present = int(fx["present_on_disk"])
-            missing = int(fx["sources"].get("missing", 0))
-            assert present + missing == slots, (
-                f"present_on_disk({present}) + missing({missing}) != slots({slots})"
-            )
-
-
-# ============================================================================
-# ⑤ safety placeholder 计数：兜底空串/None 也算
-# ============================================================================
-class Test_5_PlaceholderCountOnFallbacks:
+class Test_6_PlaceholderCountOnFallbacks:
     def test_diag_safety_counts_empty_string_okx_as_placeholder(self):
         """run.py 里 config.yaml 缺失时会 fallback 到 okx=空串 → 这 3 项必须都算占位。
            当前用户 payload 显示 okx_placeholder_key_count=0 可能是因为 fallback 到空串时

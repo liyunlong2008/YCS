@@ -223,6 +223,12 @@ class Test_B_DiagnosticSnapshotAPI:
         """GET /api/diag 应返回 200，顶层至少包含 8 大类：
            system, broker, controller, position_manager, journal,
            safety, fixtures, risks（自动缺陷检测 Top 3 警告）。
+
+        2026-08-29 用户要求「fixtures 有什么用，可以去掉吗」：
+          · 『fixtures』键仍在顶层（保留 8 大段以免老客户端崩），但内部是
+            status=removed_by_user_request_2026-08-29；file_count/present/sources
+            这些槽位字段置 None，不再代表 18 逻辑槽位或磁盘文件。
+          · 本断言只要求 key 存在即可（不再要求内部 18 结构合法）。
         """
         r = client.get("/api/diag")
         assert r.status_code == 200, f"/api/diag HTTP {r.status_code}（应 200）: {r.text[:200]}"
@@ -252,35 +258,30 @@ class Test_B_DiagnosticSnapshotAPI:
         # 占位配置下应至少检测出 1 条风险（key 占位）
         assert len(risks) >= 1, "占位配置下 diag.risks 至少 1 条警告（key 占位）"
 
-    def test_diag_fixtures_section_contains_stage9_and_stage8_status(self, client):
-        """fixtures 段应含：file_count（恒=18）、sources（real/synth/mixed/missing）、
-           stage9_no_backup_pass（bool）、stage8_thresholds_pass（bool）四项。
+    def test_diag_fixtures_section_marks_removed_per_user_request(self, client):
+        """2026-08-29 用户指令：「fixtures 有什么用 可以去掉吗？」。
 
-        兼容二分：
-          · 18 个 csv.gz 全在磁盘：present_on_disk=18，sources.missing=0，hint=正常提示
-          · 18 个 csv.gz 都不在（远端 f60f3ac 删了仓库中 18 文件）：
-              present_on_disk=0，file_count=18 仍合法；且 hint 必含
-              'pull_real_okx_klines' 字样引导用户本地生成。
+        旧 fixtures 段（file_count=18、sources 四桶总和=18、present=0/18、
+        hint 必含 pull_real_okx_klines、stage8/stage9 pytest 子进程）全部作废。
+        新契约：
+          · 顶层键 fixtures 必须仍在（防老客户端 KeyError，保留 8 大段结构）
+          · fixtures.status 必须等于 "removed_by_user_request_2026-08-29"
+          · file_count / present_on_disk / sources / hint 允许存在但值为 None
+            （不再校验 18 逻辑槽位 / missing 桶）。
         """
         body = client.get("/api/diag").json()
+        assert "fixtures" in body, "/api/diag 顶层必须仍含 fixtures（兼容 8 大段结构）"
         fx = body["fixtures"]
-        for k in ("file_count", "sources", "stage9_no_backup_pass", "stage8_thresholds_pass",
-                  "present_on_disk", "hint"):
-            assert k in fx, f"diag.fixtures 缺少 {k}，实际 keys={list(fx.keys())}"
-        # file_count 恒=18（逻辑槽位数）；present_on_disk ∈ {0, 18}（要么全生成，要么未生成）
-        assert int(fx["file_count"]) == 18, (
-            f"fixtures file_count（逻辑槽位）恒应 == 18，实际 {fx['file_count']}"
+        assert isinstance(fx, dict), f"diag.fixtures 类型应为 dict，实际 {type(fx)}"
+        # 用户要求"彻底去掉 fixtures"，核心信号：status=removed
+        assert fx.get("status") == "removed_by_user_request_2026-08-29", (
+            "diag.fixtures.status 必须是 removed_by_user_request_2026-08-29，"
+            f"实际 {fx.get('status')!r}"
         )
-        present = int(fx["present_on_disk"])
-        assert present in (0, 18), f"present_on_disk 应为 0 或 18（要么未生成要么齐全），实际 {present}"
-        sources = fx["sources"]
-        missing = int(sources.get("missing", -1))
-        assert missing == 18 - present, (
-            f"sources.missing={missing} 与 present_on_disk={present} 不匹配（18-present={18-present}）"
-        )
-        if present == 0:
-            assert "pull_real_okx_klines" in str(fx.get("hint", "")), (
-                f"0 个 fixture 在磁盘时，hint 必须含 pull_real_okx_klines 引导用户生成，"
-                f"实际 hint={fx.get('hint')!r}"
+        # 兼容老字段：允许存在，但必须是 None，不要再误导调用方"还有 18 槽位 / 磁盘判定"
+        for key in ("file_count", "present_on_disk", "sources", "hint",
+                    "stage9_no_backup_pass", "stage8_thresholds_pass"):
+            assert fx.get(key) is None, (
+                f"fixtures.{key} 移除后必须 =None（防老字段误导），实际 {fx.get(key)!r}"
             )
 
