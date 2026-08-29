@@ -17,13 +17,105 @@
 
 from __future__ import annotations
 
+import json as _json
+import os as _os
+import re as _re
+import shutil as _shutil
+import subprocess as _sp
+import sys as _sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse as _JSONResponse
 from fastapi.testclient import TestClient  # noqa: F401  —— 方便测试里直接 import
+
+
+# =============================================================================
+# 全局 JSON 编码约定：显式 charset=utf-8 + ensure_ascii=False
+#   · 避免 Windows PowerShell/cmd 下 curl 管道默认 GBK 把 UTF-8 中文解成乱码
+#   · 内部拼接字符串时，清掉 unpaired surrogate（Windows 端常见 GBK→UTF-8 污染）
+# =============================================================================
+_SURROGATE_RE = _re.compile("[\uD800-\uDFFF]")
+
+
+class UTF8JSONResponse(_JSONResponse):
+    """FastAPI JSONResponse 子类：显式 media_type 带 charset=utf-8；且 ensure_ascii=False，
+       这样 Windows 终端 curl | python -m json.tool 不用加 --utf8 也能正确显示中文。"""
+    media_type = "application/json; charset=utf-8"
+
+    def render(self, content: Any) -> bytes:
+        # 遍历字符串子节点，清掉孤立 surrogate（上游链路脏输入时兜底）
+        def _clean(obj: Any) -> Any:
+            if isinstance(obj, str):
+                return _SURROGATE_RE.sub("\ufffd", obj)
+            if isinstance(obj, dict):
+                return {_clean(k): _clean(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_clean(x) for x in obj]
+            return obj
+        cleaned = _clean(content)
+        return _json.dumps(
+            cleaned, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        ).encode("utf-8")
+
+
+# FastAPI 默认 response_class → UTF8JSONResponse
+_DEFAULT_RESPONSE_CLASS = UTF8JSONResponse
+
+# 项目根：统一用 app/api/app.py → parents[2]（app/ → 项目根 /workspace）
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+
+
+def _diag_run_pytest(
+    pytest_args: list[str],
+    *,
+    project_root: Path,
+    timeout_seconds: int = 90,
+) -> tuple[bool, str]:
+    """stage8 / stage9 快速自检。优先用 `uv run pytest`；若找不到 uv（Windows 常
+    见：未把 uv 加入 PATH 或用全局 python 直接启 run.py），回退到 `sys.executable -m pytest`。
+
+    返回 (passed, tail_summary)：passed=(returncode==0)，tail_summary 取 stderr+stdout 末
+    3 行（pytest summary 形如「18 passed」「5 failed」）。
+    """
+    # 优先 uv（复用项目锁版本更稳）
+    use_uv = _shutil.which("uv") is not None
+    if use_uv:
+        argv: list[str] = ["uv", "run", "pytest", *pytest_args]
+    else:
+        py = _sys.executable or "python"
+        argv = [py, "-m", "pytest", *pytest_args]
+    env = _os.environ.copy()
+    # 清空代理变量（fixtures 都是本地离线，不需要代理；防止 Windows 用户系统代理污染 pytest 网络探测）
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        env.pop(k, None)
+    common = dict(
+        cwd=str(project_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+    try:
+        r = _sp.run(argv, **common)  # type: ignore[arg-type]
+    except FileNotFoundError:
+        if use_uv:
+            return False, "未找到 uv 可执行文件"
+        return False, f"未找到 python pytest：{argv[0]}"
+    except _sp.TimeoutExpired:
+        return False, f"pytest 超时（>{timeout_seconds}s，参数={pytest_args}）"
+    except Exception as e:  # noqa: BLE001
+        return False, f"执行异常 {type(e).__name__}: {e}"
+
+    ok = (r.returncode == 0)
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    tail = "\n".join(lines[-3:])
+    if not tail:
+        tail = f"exit={r.returncode}"
+    return ok, tail
 
 # 中文映射表（设计文档 · 第二十节）
 ZH_STATUS = {
@@ -91,6 +183,7 @@ def create_app(
         description="云龙挑战赛（YCS）：ETH-USDT-SWAP 单品种 AI 分析 + Maker 优先 + 严格风控 + 自动恢复 + 利润保护 自动交易系统。",
         docs_url="/docs",
         lifespan=_lifespan,
+        default_response_class=UTF8JSONResponse,
     )
 
     # ------------------------------------------------------------------
@@ -620,6 +713,7 @@ def create_app(
         cfg = rt.get("config")
         ctl = rt.get("controller")
         store = rt.get("state_store")
+        project_root = PROJECT_ROOT  # 模块级统一推导（跨平台/跨部署稳定）
 
         # ── 1) system 元信息 ──────────────────────────────────────
         version = "1.0.0"
@@ -660,9 +754,16 @@ def create_app(
         broker_block: dict[str, Any] = {"available": False, "broker_type": None}
         bal_total = None; bal_avail = None; bal_upl = None
         if ctl is not None and hasattr(ctl, "broker"):
+            broker = ctl.broker
+            bname = broker.__class__.__name__
+            broker_block["broker_type"] = bname
+            # Bugfix(用户 payload): 纸盘模式下如果误注入了 OKXBroker（实盘类）会触发外网
+            # RequestTimeout。这里根据 broker 类名做短路：PaperBroker 承诺纯本地，直接
+            # available=True，不做任何网络 IO。
+            is_paper = (bname == "PaperBroker")
+            sym = getattr(cfg.trading, "symbol", None) or "ETH-USDT-SWAP" if cfg else "ETH-USDT-SWAP"
             try:
-                broker_block["broker_type"] = ctl.broker.__class__.__name__
-                bal = await ctl.broker.get_balance()
+                bal = await broker.get_balance()
                 bal_total = float(getattr(bal, "total", 0.0) or 0.0)
                 bal_avail = float(getattr(bal, "available", 0.0) or 0.0)
                 bal_upl = float(getattr(bal, "unrealized_pnl", 0.0) or 0.0)
@@ -672,7 +773,7 @@ def create_app(
                     "balance_available": bal_avail,
                     "balance_unrealized_pnl": bal_upl,
                 })
-                pos = await ctl.broker.get_position(getattr(cfg.trading, "symbol", None) or "ETH-USDT-SWAP" if cfg else "ETH-USDT-SWAP")
+                pos = await broker.get_position(sym)
                 broker_block["position"] = {
                     "symbol": pos.symbol,
                     "side": pos.side.value,
@@ -683,10 +784,31 @@ def create_app(
                     "leverage": int(pos.leverage),
                     "liquidation_price": float(pos.liquidation_price or 0.0),
                 }
-                opens = await ctl.broker.get_open_orders("ETH-USDT-SWAP")
+                opens = await broker.get_open_orders(sym)
                 broker_block["open_order_count"] = len(opens or [])
+                if is_paper and "position" not in broker_block:
+                    # PaperBroker 正常应已填充；这里兜底补 paper_only=true 标识
+                    broker_block["paper_only"] = True
             except Exception as e:  # noqa: BLE001
-                broker_block["error"] = f"{type(e).__name__}: {e}"
+                err = f"{type(e).__name__}: {e}"
+                broker_block["error"] = err
+                # 如果是 PaperBroker 但居然抛异常，也算致命；如果是 live=false 但 broker=OKXBroker
+                #（工厂串台），给一条明确的修复建议，别只显示 RequestTimeout 让用户摸不着头
+                live_flag = bool(getattr(getattr(cfg, "trading", None), "live", False)) if cfg else False
+                if bname == "OKXBroker" and not live_flag:
+                    broker_block["hint"] = (
+                        "【异常】纸盘模式(live=false) 但 broker=OKXBroker（实盘类），触发外网 OKX 请求。"
+                        "请检查：① app/broker/factory.py build_broker 是否正确使用 mode；"
+                        "② run.py 是否正确调用了 build_broker(cfg)；"
+                        "③ Windows 下若无代理/直连不通，必须走 PaperBroker（纯本地）。"
+                    )
+                elif is_paper:
+                    broker_block["hint"] = "PaperBroker 本地 IO 失败，排查 data/ 目录权限"
+                else:
+                    broker_block["hint"] = (
+                        "实盘 OKX 请求超时：检查 ① 代理(127.0.0.1:10808) 或直连是否通畅；"
+                        "② OKX 账户 IP 白名单；③ 密钥 okx.api_key/secret/passphrase 正确。"
+                    )
 
         # ── 3) controller / AI ────────────────────────────────────
         controller_block: dict[str, Any] = {"controller_available": False}
@@ -773,7 +895,7 @@ def create_app(
         from app.core.safety import (  # noqa: PLC0415
             check_emergency_halt_file, detect_risks, _is_placeholder,
         )
-        project_root = _P(__file__).resolve().parent.parent.parent
+        # project_root 已在入口处赋值模块级 PROJECT_ROOT（跨平台一致）；此处仅引用
         halt_exists, halt_reason = check_emergency_halt_file(project_root / "data" / "EMERGENCY_HALT")
         placeholder_okx = 0; placeholder_ai = 0
         if cfg is not None:
@@ -788,40 +910,35 @@ def create_app(
             "shadow_mode": shadow,
         }
 
-        # ── 7) fixtures：切片文件统计 + stage9/stage8 快速自检 ───
-        from app.storage.fixtures import DEFAULT_ROOT as _FIX_ROOT, detect_fixture_source  # noqa: PLC0415
+        # ── 7) fixtures：逐文件分类 18 个 CSV.GZ + stage9/stage8 快速自检 ───
+        from app.storage.fixtures import (  # noqa: PLC0415
+            DEFAULT_ROOT as _FIX_ROOT, classify_all_fixture_files,
+        )
         try:
             all_files = sorted(_FIX_ROOT.glob("*.csv.gz")) if _FIX_ROOT.exists() else []
-            sources: dict[str, int] = {"real_okx": 0, "synthetic_gbm": 0, "mixed": 0, "missing": 0}
-            scenes = ("trend_up", "trend_down", "range")
-            for s in scenes:
-                try:
-                    src = detect_fixture_source(s, root=_FIX_ROOT, timeframes=("1d",))  # type: ignore[arg-type]
-                except Exception:
-                    src = "missing"
-                sources[src] = sources.get(src, 0) + 1
+            # Bugfix: 之前只抽样 3 场景×1d → sources 总和=3，无法准确反映 18 个文件里真实/合成
+            # 的比例（用户要求一定要真实 K，需要能一眼看出还剩多少旧数据）。
+            sources = classify_all_fixture_files(_FIX_ROOT)
             fixtures_block: dict[str, Any] = {
                 "file_count": len(all_files),
                 "root_dir": str(_FIX_ROOT),
                 "sources": sources,
+                "sources_sum_equals_18": sum(int(v) for v in sources.values()) == 18,
             }
-            # stage9 / stage8 快速自检（非阻塞，10s 内搞定）
-            import subprocess as _sp, json as _json  # noqa: E401
-            env = _os.environ.copy()
-            env.update({"HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": ""})
-            def _run_py(paths: list[str]) -> tuple[bool, str]:
-                r = _sp.run(
-                    ["uv", "run", "pytest", *paths, "-q", "--no-header", "--tb=no",
-                     "--timeout=15", "-p", "no:cacheprovider"],
-                    cwd=str(project_root), env=env, capture_output=True, text=True, timeout=90,
-                )
-                ok = (r.returncode == 0)
-                out = (r.stdout or "") + (r.stderr or "")
-                last = "\n".join([ln for ln in out.splitlines()[-3:] if ln.strip()])
-                return ok, (last or f"exit={r.returncode}")
+            # stage9 / stage8 快速自检（非阻塞，90s 兜底；优先 uv，找不到 uv 时 fallback python -m pytest）
+            pytest_common_args = [
+                "-q", "--no-header", "--tb=no", "--no-header", "-p", "no:cacheprovider",
+                "--override-ini=cache_dir=/tmp/pytest_ycs_diag_cache",
+            ]
             try:
-                ok9, info9 = _run_py(["tests/test_stage9_no_backup.py"])
-                ok8, info8 = _run_py(["tests/test_stage8_market_fixtures.py"])
+                ok9, info9 = _diag_run_pytest(
+                    ["tests/test_stage9_no_backup.py", *pytest_common_args],
+                    project_root=project_root, timeout_seconds=90,
+                )
+                ok8, info8 = _diag_run_pytest(
+                    ["tests/test_stage8_market_fixtures.py", *pytest_common_args],
+                    project_root=project_root, timeout_seconds=120,
+                )
             except Exception as _e:
                 ok9, info9 = False, f"未执行: {type(_e).__name__}"
                 ok8, info8 = False, f"未执行: {type(_e).__name__}"

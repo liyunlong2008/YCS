@@ -12,9 +12,17 @@ from typing import Iterable, Literal
 
 SCENES_LITERAL = Literal["trend_up", "trend_down", "range"]
 TIMEFRAMES_LITERAL = Literal["1m", "5m", "15m", "1h", "4h", "1d"]
+FIXTURE_SOURCE_LITERAL = Literal["real_okx", "synthetic_gbm", "mixed", "missing"]
+ALL_SCENES: tuple[SCENES_LITERAL, ...] = ("trend_up", "trend_down", "range")
+ALL_TIMEFRAMES: tuple[TIMEFRAMES_LITERAL, ...] = ("1m", "5m", "15m", "1h", "4h", "1d")
 
 # 仓库内默认 fixtures 根目录
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures" / "market_data"
+
+
+def fixture_filename(scene: SCENES_LITERAL, timeframe: TIMEFRAMES_LITERAL) -> str:
+    """统一 fixture 文件名：<scene>__<tf>.csv.gz。"""
+    return f"{scene}__{timeframe.replace('/', '_')}.csv.gz"
 
 # 历史占位锚点（仅用于 detect_fixture_source 判别真实/占位小文件；真实 OKX 历史不会命中）
 _SYNTH_START_TS_MS = 1767225600_000  # 2026-01-01 00:00:00 UTC
@@ -89,6 +97,39 @@ def detect_fixture_source(
     if "real_okx" in uniq and "synthetic_gbm" in uniq:
         return "mixed"
     return "mixed"
+
+
+def classify_single_fixture_file(
+    path: Path,
+    *,
+    scene: SCENES_LITERAL,
+    timeframe: TIMEFRAMES_LITERAL,
+) -> FIXTURE_SOURCE_LITERAL:
+    """对单个 CSV.GZ fixture 文件分类。复用 detect_fixture_source 单时间窗口逻辑。"""
+    return detect_fixture_source(scene, root=path.parent, timeframes=(timeframe,))  # type: ignore[arg-type]
+
+
+def classify_all_fixture_files(
+    root: Path | None = None,
+) -> dict[FIXTURE_SOURCE_LITERAL, int]:
+    """逐文件分类 fixtures 目录下全部 3×6=18 个 CSV.GZ。返回 dict[str, int]；
+       key ∈ {real_okx, synthetic_gbm, mixed, missing}；sum(values) 恒 == 18。
+       缺文件算到 missing；多的"不知名"csv.gz 不计入 18（但单独记录到 extra，
+       这里 API 简化：只输出四个分类 bucket）。
+    """
+    root = Path(root) if root else DEFAULT_ROOT
+    stats: dict[FIXTURE_SOURCE_LITERAL, int] = {
+        "real_okx": 0, "synthetic_gbm": 0, "mixed": 0, "missing": 0,
+    }
+    for scene in ALL_SCENES:
+        for tf in ALL_TIMEFRAMES:
+            p = root / fixture_filename(scene, tf)
+            if not p.is_file():
+                stats["missing"] += 1
+                continue
+            cls = classify_single_fixture_file(p, scene=scene, timeframe=tf)
+            stats[cls] += 1
+    return stats
 
 
 TF_SECONDS_MS = {
