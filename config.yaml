@@ -20,3 +20,17 @@ ai:
 trading:
   live: false                 # false=纸盘模式(Paper)   true=实盘模式(Live)
   symbol: "ETH-USDT-SWAP"     # 单品种
+
+# 实盘硬风控阈值（按用户当前账户 14.8 USDT 保守配置，护栏 A1/A2/A3/A5/A7）
+risk_limits:
+  # A1. 本金上限硬锁：系统用到的总资产绝不超过此数（你充值再多也只当这部分用）
+  live_max_equity_usdt: 15.0
+  # A2. 每日亏损熔断（USDT 绝对值，比百分比更稳）：当日累计 realized + unrealized <= -3.0U → 全平 + 停机
+  live_max_daily_loss_usdt: 3.0
+  # A3. 单笔下单名义上限 & 仓位变动率上限（0 加到 N 的变化 ÷ 总资产 ≤ position_change_pct）
+  live_max_single_order_usdt: 2.0
+  position_change_pct: 0.10   # 10%：不能一口吃成胖子
+  # A5. Kill-Switch API Token（POST /api/kill 时用 X-YCS-Admin-Token: <这里的值>；生产必须改成 32 位随机串）
+  kill_switch_token: "YCS_KILL_CHANGEME_32BYTES_RANDOM_STRING_PLEASE"
+  # A7. 影子模式（观察模式）：true = 生成完整订单但绝不真发（用于链路联调 6 小时再切 live=true）
+  shadow_mode: false

@@ -104,6 +104,46 @@ class RiskEngine:
             self.consecutive_losses = 0
 
     # ------------------------------------------------------------------
+    # A2. 每日亏损熔断（USDT 绝对值：realized + unrealized 合计 ≤ -limit 立即 HALT）
+    #     比百分比更稳，适合 < 50U 超小账户（14.8U 用户现在就是这种情况）
+    # ------------------------------------------------------------------
+    def check_absolute_daily_loss(
+        self,
+        *,
+        total_now: float,
+        realized_pnl_usdt: float,
+        unrealized_pnl_usdt: float,
+        limit_usdt: float,
+    ) -> tuple[bool, str]:
+        """A2 绝对日损熔断。
+
+        Args:
+            total_now: 当前账户总权益（仅用于日志上下文展示）
+            realized_pnl_usdt: 已实现盈亏（当日平仓合计）
+            unrealized_pnl_usdt: 未实现浮动盈亏（当前持仓）
+            limit_usdt: 阈值（正数，例如 3.0 = 最多允许亏 3 USDT）
+
+        Returns:
+            (allow: bool, reason: str) → allow=False 表示已触发 HALT。
+        """
+        limit = abs(float(limit_usdt or 0))
+        realized = float(realized_pnl_usdt or 0)
+        unrealized = float(unrealized_pnl_usdt or 0)
+        total_loss = realized + unrealized          # 正常为负数
+        if limit > 0 and total_loss <= -limit:
+            msg = (
+                f"[A2 HALT] 当日合计亏损 {total_loss:.4f} U ≤ -{limit:.4f} U 阈值："
+                f"已实现 {realized:.4f} U + 未实现 {unrealized:.4f} U；当前权益 {float(total_now or 0):.4f} U。"
+                "立即全平 + 停机，待次日手动解除。"
+            )
+            # 同步熔断：后续 check_can_open 也直接挡
+            self.cooldown_until_ts = int(__import__("time").time()) + 86_400  # 直接冻 24 小时
+            return False, msg
+        return True, (
+            f"日损监控：合计 {realized + unrealized:.4f} U / 阈值 -{limit:.4f} U（正常）。"
+        )
+
+    # ------------------------------------------------------------------
     # 风控主入口
     # ------------------------------------------------------------------
     async def check_can_open(

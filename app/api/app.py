@@ -510,4 +510,355 @@ def create_app(
             "详细": result.reason,
         }
 
+    # ------------------------------------------------------------------
+    # A5. Kill-Switch HTTP 通道（POST /api/kill）：紧急全平 + 停机
+    # ------------------------------------------------------------------
+    @app.post("/api/kill", summary="【紧急】Kill-Switch：撤所有挂单→市价全平→写入 STOP 状态→熔断24h")
+    async def api_kill(request: Request):
+        """三通道之一：HTTP POST。其它通道：ycsctl kill、data/EMERGENCY_HALT 文件。
+           安全：必须带 X-YCS-Admin-Token 头 == config.risk_limits.kill_switch_token。
+        """
+        from fastapi import status as _st
+        rt = request.app.state.runtime or {}
+        cfg = rt.get("config")
+        expected_token = ""
+        if cfg is not None and hasattr(cfg, "risk_limits"):
+            expected_token = str(getattr(cfg.risk_limits, "kill_switch_token", "") or "")
+        got_token = str(request.headers.get("x-ycs-admin-token") or "")
+        if expected_token and got_token != expected_token:
+            raise HTTPException(
+                status_code=_st.HTTP_401_UNAUTHORIZED,
+                detail="X-YCS-Admin-Token 不匹配（配置 risk_limits.kill_switch_token）",
+            )
+
+        ctl = rt.get("controller")
+        result_payload: dict[str, Any] = {"ok": True, "actions": []}
+
+        # 动作①：把 state_store 标成 STOPPED + 熔断 24 小时
+        store = rt.get("state_store")
+        if store is not None and hasattr(store, "load"):
+            try:
+                st = store.load() or {}
+                from app.core.constants import SystemStatus as _SS  # noqa: PLC0415
+                st["status"] = _SS.STOPPED.value
+                st["stopped_by"] = "kill-switch-http"
+                st["stopped_at"] = int(__import__("time").time())
+                risk_dict = st.get("risk") or {}
+                risk_dict["cooldown_until"] = st["stopped_at"] + 86_400
+                risk_dict["allow_trading"] = False
+                st["risk"] = risk_dict
+                store.save(st)
+                result_payload["actions"].append("state_store: STOPPED + cooldown 24h")
+            except Exception as e:  # noqa: BLE001
+                result_payload["actions"].append(f"state_store: ERROR {type(e).__name__}: {e}")
+
+        # 动作②：若 Controller 可用 → 撤所有挂单 + 市价全平当前仓位（PaperBroker 也走模拟全平）
+        if ctl is not None and hasattr(ctl, "broker"):
+            try:
+                sym = getattr(ctl.config.trading, "symbol", None) or "ETH-USDT-SWAP"
+                broker = ctl.broker
+                # 撤所有挂单
+                open_orders = await broker.get_open_orders(sym)
+                for o in open_orders or []:
+                    try:
+                        await broker.cancel_order(sym, o.client_order_id)
+                    except Exception:
+                        pass
+                result_payload["actions"].append(f"broker: canceled {len(open_orders or [])} open orders")
+                # 全平
+                from app.core.constants import (  # noqa: PLC0415
+                    OrderSide as _OS, OrderType as _OT, PositionSide as _PS,
+                )
+                pos = await broker.get_position(sym)
+                if pos.side != _PS.FLAT and abs(float(pos.size or 0)) > 0:
+                    side = _OS.SELL if pos.side == _PS.LONG else _OS.BUY
+                    filled_order = await broker.place_order(
+                        sym, side=side, type=_OT.MARKET, amount=abs(float(pos.size)),
+                        client_order_id=None,
+                    )
+                    result_payload["actions"].append(
+                        f"broker: closed {pos.side.value} × {float(pos.size)} via MARKET → {filled_order.status.value if hasattr(filled_order, 'status') else 'done'}"
+                    )
+                else:
+                    result_payload["actions"].append("broker: no position to close")
+            except Exception as e:  # noqa: BLE001
+                result_payload["actions"].append(f"broker: ERROR {type(e).__name__}: {e}")
+                result_payload["ok"] = False
+        else:
+            result_payload["actions"].append("broker: Controller/broker 未注入（仅写状态机 STOP）")
+
+        # 动作③：写 data/EMERGENCY_HALT 兜底文件（双保险）
+        try:
+            from pathlib import Path as _P  # noqa: PLC0415
+            import time as _t  # noqa: PLC0415
+            project_root = _P(__file__).resolve().parent.parent.parent
+            halt_path = project_root / "data" / "EMERGENCY_HALT"
+            halt_path.parent.mkdir(parents=True, exist_ok=True)
+            halt_path.write_text(
+                f"created_by=api_kill_http\nat={int(_t.time())}\n",
+                encoding="utf-8",
+            )
+            result_payload["actions"].append(f"wrote EMERGENCY_HALT: {halt_path}")
+        except Exception as e:  # noqa: BLE001
+            result_payload["actions"].append(f"EMERGENCY_HALT: ERROR {type(e).__name__}: {e}")
+        return result_payload
+
+    # ------------------------------------------------------------------
+    # B. GET /api/diag 诊断快照（供 AI 分析项目缺陷 / 用户远程自查）
+    # ------------------------------------------------------------------
+    @app.get("/api/diag", summary="诊断快照：返回 system/broker/controller/pm/journal/safety/fixtures/risks 8 大类结构化数据")
+    async def api_diag(request: Request) -> dict[str, Any]:
+        """输出结构化、键名稳定（可做 AI Prompt 直接粘）的系统快照，用于：
+           ① 你直接 curl 贴过来给我分析缺陷；
+           ② 自动化巡检脚本比对；
+           ③ 实盘出事时的"黑匣子"快照。
+        """
+        import time as _t, os as _os, sys as _sys  # noqa: E401
+        from pathlib import Path as _P  # noqa: E401
+
+        rt = request.app.state.runtime or {}
+        cfg = rt.get("config")
+        ctl = rt.get("controller")
+        store = rt.get("state_store")
+
+        # ── 1) system 元信息 ──────────────────────────────────────
+        version = "1.0.0"
+        mode_cn = "纸盘模式"
+        shadow = False
+        max_eq = 15.0; max_daily_loss = 3.0
+        if cfg is not None:
+            if hasattr(cfg.trading, "live"):
+                mode_cn = "实盘模式" if cfg.trading.live else "纸盘模式"
+            if hasattr(cfg, "risk_limits"):
+                shadow = bool(cfg.risk_limits.shadow_mode or False)
+                max_eq = float(cfg.risk_limits.live_max_equity_usdt or max_eq)
+                max_daily_loss = float(cfg.risk_limits.live_max_daily_loss_usdt or max_daily_loss)
+        if shadow:
+            mode_cn = f"{mode_cn}(影子 SHADOW)"
+        state_snapshot: dict[str, Any] = {}
+        started_at = None
+        if store is not None and hasattr(store, "load"):
+            try:
+                state_snapshot = store.load() or {}
+                started_at = state_snapshot.get("started_at")
+            except Exception:
+                state_snapshot = {}
+        system_block: dict[str, Any] = {
+            "runtime_mode": mode_cn,
+            "started_at": started_at,
+            "uptime_seconds": int(_t.time() - started_at) if isinstance(started_at, (int, float)) and started_at > 0 else None,
+            "pid": _os.getpid(),
+            "python_version": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+            "version": version,
+            "cwd": str(_P.cwd()),
+            "platform": _sys.platform,
+            "live_max_equity_usdt": max_eq,
+            "live_max_daily_loss_usdt": max_daily_loss,
+        }
+
+        # ── 2) broker ──────────────────────────────────────────────
+        broker_block: dict[str, Any] = {"available": False, "broker_type": None}
+        bal_total = None; bal_avail = None; bal_upl = None
+        if ctl is not None and hasattr(ctl, "broker"):
+            try:
+                broker_block["broker_type"] = ctl.broker.__class__.__name__
+                bal = await ctl.broker.get_balance()
+                bal_total = float(getattr(bal, "total", 0.0) or 0.0)
+                bal_avail = float(getattr(bal, "available", 0.0) or 0.0)
+                bal_upl = float(getattr(bal, "unrealized_pnl", 0.0) or 0.0)
+                broker_block.update({
+                    "available": True,
+                    "balance_total": bal_total,
+                    "balance_available": bal_avail,
+                    "balance_unrealized_pnl": bal_upl,
+                })
+                pos = await ctl.broker.get_position(getattr(cfg.trading, "symbol", None) or "ETH-USDT-SWAP" if cfg else "ETH-USDT-SWAP")
+                broker_block["position"] = {
+                    "symbol": pos.symbol,
+                    "side": pos.side.value,
+                    "size": float(pos.size),
+                    "entry_price": float(pos.entry_price),
+                    "mark_price": float(pos.mark_price),
+                    "unrealized_pnl": float(pos.unrealized_pnl),
+                    "leverage": int(pos.leverage),
+                    "liquidation_price": float(pos.liquidation_price or 0.0),
+                }
+                opens = await ctl.broker.get_open_orders("ETH-USDT-SWAP")
+                broker_block["open_order_count"] = len(opens or [])
+            except Exception as e:  # noqa: BLE001
+                broker_block["error"] = f"{type(e).__name__}: {e}"
+
+        # ── 3) controller / AI ────────────────────────────────────
+        controller_block: dict[str, Any] = {"controller_available": False}
+        if ctl is not None:
+            try:
+                ai_ts = None; ai_regime = None; ai_conf = 0; ai_reason = ""
+                last_ai = getattr(ctl, "_last_ai", None)
+                last_ai_ts = getattr(ctl, "_last_ai_ts", None)
+                if last_ai is not None:
+                    ai_regime = getattr(last_ai.market_regime, "value", str(last_ai.market_regime)) if hasattr(last_ai.market_regime, "value") else str(last_ai.market_regime)
+                    ai_conf = int(getattr(last_ai, "confidence", 0) or 0)
+                    ai_reason = str(getattr(last_ai, "reason", "") or "")
+                    ai_ts = last_ai_ts
+                controller_block = {
+                    "controller_available": True,
+                    "last_ai": {
+                        "ts_ms": ai_ts,
+                        "regime": ai_regime,
+                        "confidence": ai_conf,
+                        "reason_preview": ai_reason[:120],
+                    },
+                    "risk": {
+                        "consecutive_losses": int(getattr(getattr(ctl, "risk", None), "consecutive_losses", 0) or 0),
+                        "cooldown_until_ts": int(getattr(getattr(ctl, "risk", None), "cooldown_until_ts", 0) or 0),
+                        "daily_start_balance": float(getattr(getattr(ctl, "risk", None), "daily_start_balance", 0.0) or 0.0),
+                    },
+                }
+            except Exception as e:  # noqa: BLE001
+                controller_block["error"] = f"{type(e).__name__}: {e}"
+
+        # ── 4) position_manager（利润阶梯 / 累计盈亏） ──────────
+        pm_block: dict[str, Any] = {}
+        pm_saved = (state_snapshot or {}).get("position_manager") or {}
+        if ctl is not None and hasattr(ctl, "risk"):
+            pm_block = {
+                "current_lock_pct": float(pm_saved.get("current_lock_pct", 0.0) or 0.0),
+                "trailing_stop_price": float(pm_saved.get("trailing_stop_price", 0.0) or 0.0),
+                "ladder_trigger_count": int(pm_saved.get("ladder_trigger_count", 0) or 0),
+                "realized_pnl_usdt": float(pm_saved.get("realized_pnl_usdt", 0.0) or 0.0),
+                "unrealized_pnl_usdt": bal_upl if (bal_upl is not None) else float(
+                    pm_saved.get("unrealized_pnl_usdt", 0.0) or 0.0
+                ),
+                "peak_equity_usdt": float(pm_saved.get("peak_equity_usdt", bal_total or 0.0) or bal_total or 0.0),
+                "drawdown_from_peak_pct": 0.0,
+            }
+            peak = float(pm_block["peak_equity_usdt"] or 0.0)
+            cur = float(bal_total or (state_snapshot.get("balance") or {}).get("total", 0.0) or 0.0)
+            if peak > 0 and cur > 0 and cur < peak:
+                pm_block["drawdown_from_peak_pct"] = round((1 - cur / peak) * 100, 3)
+
+        # ── 5) journal（近 24h 统计） ───────────────────────────
+        journal_block: dict[str, Any] = {"journal_available": False}
+        stats = (state_snapshot or {}).get("stats") or {}
+        if ctl is not None and hasattr(ctl, "journal"):
+            try:
+                total_records = 0
+                recent50 = []
+                if hasattr(ctl.journal, "read_all"):
+                    records = list(ctl.journal.read_all() or [])
+                    total_records = len(records)
+                    recent50 = records[-50:]
+                # Top 失败原因
+                failure_reasons: dict[str, int] = {}
+                for r in recent50 or []:
+                    result = str(getattr(r, "result", "") or r.get("结果") or "")
+                    if "亏损" in result or "止损" in result or "STOP" in result:
+                        extra = str(getattr(r, "extra", "") or r.get("附加信息") or "")
+                        key = extra[:30] if extra else result[:30]
+                        failure_reasons[key] = failure_reasons.get(key, 0) + 1
+                top_failures = sorted(failure_reasons.items(), key=lambda x: x[1], reverse=True)[:3]
+                journal_block = {
+                    "journal_available": True,
+                    "total_records": total_records,
+                    "trades_closed": int(stats.get("trades_closed", stats.get("wins", 0) + stats.get("losses", 0)) or 0),
+                    "wins": int(stats.get("wins", 0) or 0),
+                    "losses": int(stats.get("losses", 0) or 0),
+                    "total_pnl_pct": round(float(stats.get("total_pnl_pct", 0.0) or 0.0), 3),
+                    "top_3_failure_reasons": [{"reason": k, "count": v} for k, v in top_failures],
+                }
+            except Exception as e:  # noqa: BLE001
+                journal_block["error"] = f"{type(e).__name__}: {e}"
+
+        # ── 6) safety ─────────────────────────────────────────────
+        from app.core.safety import (  # noqa: PLC0415
+            check_emergency_halt_file, detect_risks, _is_placeholder,
+        )
+        project_root = _P(__file__).resolve().parent.parent.parent
+        halt_exists, halt_reason = check_emergency_halt_file(project_root / "data" / "EMERGENCY_HALT")
+        placeholder_okx = 0; placeholder_ai = 0
+        if cfg is not None:
+            placeholder_okx = sum(1 for x in (cfg.okx.api_key, cfg.okx.secret, cfg.okx.passphrase) if _is_placeholder(x))
+            placeholder_ai = 1 if _is_placeholder(cfg.ai.api_key) else 0
+        safety_block: dict[str, Any] = {
+            "emergency_halt_exists": halt_exists,
+            "emergency_halt_reason": halt_reason,
+            "okx_placeholder_key_count": placeholder_okx,
+            "ai_placeholder_key_count": placeholder_ai,
+            "runtime_config_loaded": cfg is not None,
+            "shadow_mode": shadow,
+        }
+
+        # ── 7) fixtures：切片文件统计 + stage9/stage8 快速自检 ───
+        from app.storage.fixtures import DEFAULT_ROOT as _FIX_ROOT, detect_fixture_source  # noqa: PLC0415
+        try:
+            all_files = sorted(_FIX_ROOT.glob("*.csv.gz")) if _FIX_ROOT.exists() else []
+            sources: dict[str, int] = {"real_okx": 0, "synthetic_gbm": 0, "mixed": 0, "missing": 0}
+            scenes = ("trend_up", "trend_down", "range")
+            for s in scenes:
+                try:
+                    src = detect_fixture_source(s, root=_FIX_ROOT, timeframes=("1d",))  # type: ignore[arg-type]
+                except Exception:
+                    src = "missing"
+                sources[src] = sources.get(src, 0) + 1
+            fixtures_block: dict[str, Any] = {
+                "file_count": len(all_files),
+                "root_dir": str(_FIX_ROOT),
+                "sources": sources,
+            }
+            # stage9 / stage8 快速自检（非阻塞，10s 内搞定）
+            import subprocess as _sp, json as _json  # noqa: E401
+            env = _os.environ.copy()
+            env.update({"HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": ""})
+            def _run_py(paths: list[str]) -> tuple[bool, str]:
+                r = _sp.run(
+                    ["uv", "run", "pytest", *paths, "-q", "--no-header", "--tb=no",
+                     "--timeout=15", "-p", "no:cacheprovider"],
+                    cwd=str(project_root), env=env, capture_output=True, text=True, timeout=90,
+                )
+                ok = (r.returncode == 0)
+                out = (r.stdout or "") + (r.stderr or "")
+                last = "\n".join([ln for ln in out.splitlines()[-3:] if ln.strip()])
+                return ok, (last or f"exit={r.returncode}")
+            try:
+                ok9, info9 = _run_py(["tests/test_stage9_no_backup.py"])
+                ok8, info8 = _run_py(["tests/test_stage8_market_fixtures.py"])
+            except Exception as _e:
+                ok9, info9 = False, f"未执行: {type(_e).__name__}"
+                ok8, info8 = False, f"未执行: {type(_e).__name__}"
+            fixtures_block["stage9_no_backup_pass"] = bool(ok9)
+            fixtures_block["stage9_info"] = info9
+            fixtures_block["stage8_thresholds_pass"] = bool(ok8)
+            fixtures_block["stage8_info"] = info8
+        except Exception as e:  # noqa: BLE001
+            fixtures_block = {
+                "file_count": 0, "error": f"{type(e).__name__}: {e}",
+                "sources": {}, "stage9_no_backup_pass": None,
+                "stage8_thresholds_pass": None,
+            }
+
+        # ── 8) risks：自动缺陷检测 Top N ─────────────────────────
+        try:
+            risks = detect_risks(cfg)
+        except Exception as e:  # noqa: BLE001
+            risks = [f"[ERROR] detect_risks 异常：{type(e).__name__}: {e}"]
+        # 再拼几个「实际运行时」的动态风险（比静态 config 检测更贴近真运行）
+        if bal_total is not None and bal_total > max_eq:
+            risks.append(f"[WARN] 真实账户总权益 {bal_total:.2f} U > 本金上限硬锁 {max_eq:.2f} U，超过部分未被保护（A1 护栏仅逻辑拦截，建议子账户严格限额）。")
+        if bal_total is not None and bal_total < 10 and mode_cn.startswith("实盘") and not shadow:
+            risks.append(f"[INFO] 账户极小（{bal_total:.2f} U）+ 已进实盘无影子：注意 ETH-USDT-SWAP OKX 最小下单额约 1 U，太小会被交易所直接拒单。")
+        if halt_exists:
+            risks.append(f"[FATAL] EMERGENCY_HALT 文件仍存在：{halt_reason} → 请处理完后手动删除，否则系统永不恢复开仓。")
+
+        return {
+            "generated_at_ms": int(_t.time() * 1000),
+            "system": system_block,
+            "broker": broker_block,
+            "controller": controller_block,
+            "position_manager": pm_block,
+            "journal": journal_block,
+            "safety": safety_block,
+            "fixtures": fixtures_block,
+            "risks": list(risks)[:5],
+        }
+
     return app

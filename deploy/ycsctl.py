@@ -78,6 +78,7 @@ def cmd_help() -> int:
   config [show|path]     显示 config.yaml 内容 / 仅打印路径
   install [--no-enable]  一键安装 systemd 服务（自动调用 install_systemd.sh）
   uninstall              停止 + 禁用 + 删除 unit（需 root / sudo）
+  kill [--token T] [--host URL]  【紧急】一键紧急停机+全平所有仓位（调 /api/kill → EMERGENCY_HALT → systemctl stop 三通道）
 
 提示：
   · 所有子命令优先在 /workspace 项目根目录查找配置与脚本
@@ -317,6 +318,85 @@ def cmd_uninstall() -> int:
     return _run_installer(["--uninstall"])
 
 
+def cmd_kill(args: "argparse.Namespace") -> int:
+    """A5 Kill-Switch CLI 通道：
+       1) 调 POST /api/kill（127.0.0.1 + Token），让 Controller 内部撤单+全平+写入状态；
+       2) 若接口失败（API 已挂/Token 错）→ 写 data/EMERGENCY_HALT 文件兜底；
+       3) 再 systemctl stop ycs 防进程再起。
+    """
+    import json as _json
+    import urllib.request as _req
+    import urllib.error as _err
+    from pathlib import Path as _P
+
+    token = args.token
+    cfg_path = DEFAULT_CONFIG_PATH
+    if not token and _P(cfg_path).is_file():
+        try:
+            import yaml as _yaml
+            raw = _yaml.safe_load(_P(cfg_path).read_text()) or {}
+            token = (raw.get("risk_limits") or {}).get("kill_switch_token")
+        except Exception:
+            token = None
+
+    host = (args.host or "http://127.0.0.1:8000").rstrip("/")
+    _print_err(f"[ycsctl kill] 通道① POST {host}/api/kill ...")
+    ok_http = False
+    status_code = 0
+    body_str = ""
+    if token:
+        try:
+            req = _req.Request(
+                f"{host}/api/kill", method="POST",
+                headers={"X-YCS-Admin-Token": str(token), "Content-Type": "application/json"},
+                data=b"{}",
+            )
+            with _req.urlopen(req, timeout=15) as resp:
+                status_code = int(getattr(resp, "status", 200) or 200)
+                body_bytes = resp.read() or b""
+                body_str = body_bytes.decode("utf-8", errors="replace") or ""
+            ok_http = 200 <= status_code < 300
+        except _err.HTTPError as e:
+            status_code = int(e.code or 0)
+            try:
+                body_str = (e.read() or b"").decode("utf-8", errors="replace")
+            except Exception:
+                body_str = str(e)
+        except Exception as e:
+            _print_err(f"  HTTP 异常：{type(e).__name__}: {e}（走通道②兜底）")
+            status_code = 0
+    else:
+        _print_err("  未获取到 kill_switch_token（--token 或 config.yaml 都缺失），跳过 HTTP 通道。")
+
+    if ok_http:
+        _print_ok(f"✓ /api/kill 返回 HTTP {status_code}：{body_str[:200]}")
+    else:
+        _print_err(f"✗ /api/kill 失败（HTTP {status_code}）：{body_str[:200]}")
+        # 兜底通道②：写 EMERGENCY_HALT 文件
+        project_root = _P(__file__).resolve().parent.parent
+        halt_path = project_root / "data" / "EMERGENCY_HALT"
+        try:
+            halt_path.parent.mkdir(parents=True, exist_ok=True)
+            import time as _t
+            halt_path.write_text(
+                f"created_by=ycsctl_kill\nat={int(_t.time())}\nstatus={status_code}\n",
+                encoding="utf-8",
+            )
+            _print_ok(f"✓ 兜底②：写文件 {halt_path} 成功（Controller 每秒轮询到会自停）")
+        except Exception as e:
+            _print_err(f"✗ 兜底② 写失败：{type(e).__name__}: {e}")
+
+    # 最后兜底③：systemctl stop ycs
+    import shutil as _shutil
+    if _shutil.which("systemctl"):
+        try:
+            subprocess.run(["sudo", "-n", "systemctl", "stop", "ycs"], check=False, timeout=30)
+            _print_ok("✓ 兜底③：systemctl stop ycs 已执行（无需 sudo 密码则生效）")
+        except Exception as e:
+            _print_err(f"  systemctl stop 异常：{type(e).__name__}: {e}（非 systemd 环境可忽略）")
+    return 0 if ok_http else 2
+
+
 # ---------------------------------------------------------------------------
 # 顶层解析
 # ---------------------------------------------------------------------------
@@ -374,6 +454,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ins.set_defaults(func=cmd_install)
     p_unins = sub.add_parser("uninstall", help="停止并卸载 systemd 服务")
     p_unins.set_defaults(func=lambda *a, **k: cmd_uninstall())
+
+    # kill（紧急停机 · A5 Kill-Switch 三通道之一）
+    p_kill = sub.add_parser(
+        "kill",
+        help="【紧急】一键紧急停机+全平所有仓位（优先调 /api/kill；失败则写 EMERGENCY_HALT + systemctl stop）",
+    )
+    p_kill.add_argument("--token", default=None,
+                        help=f"kill_switch_token（未提供时从 {DEFAULT_CONFIG_PATH}.risk_limits.kill_switch_token 读取）")
+    p_kill.add_argument("--host", default="http://127.0.0.1:8000",
+                        help="Dashboard API 地址（默认 http://127.0.0.1:8000）")
+    p_kill.set_defaults(func=cmd_kill)
 
     return parser
 
