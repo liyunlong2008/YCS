@@ -2,15 +2,21 @@
 # =============================================================================
 # 云龙挑战赛（YCS）一键 systemd 安装脚本
 # 用法：
-#   cd /workspace
+#   cd <项目根目录>（如 /opt/ycs 或 ~/ycs；脚本会自动按 deploy/install_systemd.sh 所在位置推导）
 #   bash deploy/install_systemd.sh                # 安装服务 + 启动 + 开机自启
 #   bash deploy/install_systemd.sh --no-enable    # 只安装+启动，不做开机自启
 #   bash deploy/install_systemd.sh --uninstall    # 停止 + 禁用 + 删除 unit
+#
+# sudo 场景下找不到 ~/.local/bin/uv？用 env 透传绝对路径（上方 install.sh 默认已做）：
+#   sudo env UV_BIN=/root/.local/bin/uv bash deploy/install_systemd.sh
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+# 允许上层 install.sh 通过 env 传 INSTALL_DIR / CONFIG_PATH；未传就按 PROJECT_ROOT 兜底
+: "${INSTALL_DIR:=$PROJECT_ROOT}"
+: "${CONFIG_PATH:=}"
 TEMPLATE="${SCRIPT_DIR}/ycs.service.template"
 UNIT_NAME="ycs.service"
 UNIT_DST="/etc/systemd/system/${UNIT_NAME}"
@@ -26,7 +32,7 @@ ok()   { echo -e "${BLD}[ycs-install]${NC} ${OK}OK${NC}: $*"; }
 warn() { echo -e "${BLD}[ycs-install]${NC} ${WARN}WARN${NC}: $*"; }
 die()  { echo -e "${BLD}[ycs-install]${NC} ${ERR}FATAL${NC}: $*" >&2; exit 1; }
 
-# ---- uninstall ----
+# ---- 卸载分支 ----
 if [[ "${1:-}" == "--uninstall" ]]; then
   log "卸载服务 ${UNIT_NAME} …"
   [ "$(id -u)" -eq 0 ] || die "必须以 root 执行：sudo bash $0 --uninstall"
@@ -34,7 +40,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   systemctl is-enabled -q "${UNIT_NAME}"   && systemctl disable "${UNIT_NAME}"    && log "已禁用开机自启" || true
   rm -f "${UNIT_DST}"
   systemctl daemon-reload
-  ok "服务 ${UNIT_NAME} 已卸载；/workspace 下的数据与配置已保留。"
+  ok "服务 ${UNIT_NAME} 已卸载；${PROJECT_ROOT} 下的数据与配置已保留。"
   exit 0
 fi
 
@@ -52,8 +58,42 @@ done
 # ---- root 检查 ----
 [ "$(id -u)" -eq 0 ] || die "必须以 root 执行：sudo bash $0"
 
-# ---- 依赖检查 ----
-command -v uv          >/dev/null || die "未检测到 uv，先安装：curl -LsSf https://astral.sh/uv/install.sh | sh"
+# ---- 解决：sudo 下 secure_path 清掉 PATH → 找不到用户级 ~/.local/bin/uv
+# 候选目录搜索（与 install.sh _resolve_uv_bin 一致）
+_expand_path_for_uv() {
+  local u_home="${HOME:-/root}"
+  local sudouser_home=""
+  if [ -n "${SUDO_USER:-}" ]; then
+    # shellcheck disable=SC2086
+    sudouser_home="$(eval echo ~$SUDO_USER 2>/dev/null || true)"
+  fi
+  local d
+  for d in \
+    "${u_home}/.local/bin" \
+    "${u_home}/.cargo/bin" \
+    "${sudouser_home}/.local/bin" \
+    "${sudouser_home}/.cargo/bin" \
+    "/root/.local/bin" \
+    "/root/.cargo/bin" \
+    "/usr/local/bin" \
+    "/usr/bin"; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    case ":$PATH:" in *":$d:"*) ;; *) export PATH="$d:$PATH" ;; esac
+  done
+}
+_expand_path_for_uv
+
+# ---- 依赖检查：UV_BIN env（来自 install.sh 透传）优先，其次 PATH 内 command -v ----
+if [ -n "${UV_BIN:-}" ] && [ -x "$UV_BIN" ]; then
+  :   # 上层传过来的绝对路径（最稳），直接信任，跳过 command -v 检查
+elif command -v uv >/dev/null 2>&1; then
+  UV_BIN="$(command -v uv)"
+else
+  die "未检测到 uv。两种解法二选一：
+   1) 先安装：curl -LsSf https://astral.sh/uv/install.sh | sh
+   2) 从上层 install.sh 调：sudo env UV_BIN=/root/.local/bin/uv bash deploy/install_systemd.sh
+      （把绝对路径透传进来就不会被 sudo secure_path 清掉）"
+fi
 command -v systemctl   >/dev/null || die "当前环境无 systemctl（容器内不可用 systemd）"
 command -v python3     >/dev/null || die "未检测到 python3"
 
@@ -63,7 +103,6 @@ command -v python3     >/dev/null || die "未检测到 python3"
 
 # ---- 自动探测参数 ----
 RUN_USER="$(stat -c '%U' "${PROJECT_ROOT}/run.py" 2>/dev/null || echo "$(logname 2>/dev/null || echo root)")"
-UV_BIN="$(command -v uv || echo /usr/local/bin/uv)"
 RUN_PY="${PROJECT_ROOT}/run.py"
 
 log "参数探测："
@@ -76,7 +115,8 @@ echo "   Enable-once : ${OPT_ENABLE}"
 # ---- 依赖（虚拟环境）----
 if [ ! -d "${PROJECT_ROOT}/.venv" ]; then
   log "首次安装：以 ${RUN_USER} 身份执行 uv sync 创建 .venv …"
-  su -s /bin/bash "${RUN_USER}" -c "cd '${PROJECT_ROOT}' && uv sync"
+  # 用 $UV_BIN 绝对路径（避开 su 下 PATH 丢失问题）
+  su -s /bin/bash "${RUN_USER}" -c "cd '${PROJECT_ROOT}' && '${UV_BIN}' sync"
 fi
 [ -x "${PROJECT_ROOT}/.venv/bin/python" ] || die ".venv/bin/python 不存在，uv sync 可能失败"
 

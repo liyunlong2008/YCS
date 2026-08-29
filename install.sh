@@ -29,6 +29,57 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# 0.5) UV_BIN / SUDO 辅助：解决「用户级安装 uv 到 ~/.local/bin」后，
+#      sudo bash / sudo <命令> 时 sudo secure_path 把 PATH 清掉导致
+#      `sudo: uv: command not found` / `[ycs-install] FATAL: 未检测到 uv` 连锁失败。
+#      VPS 场景（用户直接 root 跑 / 非 root 但 sudo 到 root 装 systemd）全覆盖。
+# ---------------------------------------------------------------------------
+# 候选 uv 安装目录：官方 install.sh 默认写 ~/.local/bin；cargo 源会在 ~/.cargo/bin；
+# 包管理器 / 手动复制常见落点：/usr/local/bin / usr/bin。按顺序先搜到即命中。
+_resolve_uv_bin() {
+  # 先在当前 PATH 里找（最快）
+  local p
+  p="$(command -v uv 2>/dev/null || true)"
+  if [ -n "$p" ] && [ -x "$p" ]; then echo "$p"; return 0; fi
+  local u_home="${HOME:-/root}"
+  local sudouser_home=""
+  if [ -n "${SUDO_USER:-}" ]; then
+    # shellcheck disable=SC2086
+    sudouser_home="$(eval echo ~$SUDO_USER 2>/dev/null || true)"
+  fi
+  for d in \
+    "${u_home}/.local/bin" \
+    "${u_home}/.cargo/bin" \
+    "${sudouser_home}/.local/bin" \
+    "${sudouser_home}/.cargo/bin" \
+    "/root/.local/bin" \
+    "/root/.cargo/bin" \
+    "/usr/local/bin" \
+    "/usr/bin"; do
+    [ -z "$d" ] && continue
+    if [ -x "${d}/uv" ]; then echo "${d}/uv"; return 0; fi
+  done
+  return 1
+}
+# SUDO：已经是 root 就空字符串（避免 sudo 再跑一次清 PATH 的问题）；非 root 才 sudo
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+else
+  SUDO="sudo"
+fi
+# PATH 膨胀：把上面候选 uv 目录全部追加进 PATH（本脚本后续裸 `uv` 调用也能 work）
+for _d in \
+  "${HOME:-/root}/.local/bin" \
+  "${HOME:-/root}/.cargo/bin" \
+  "/root/.local/bin" \
+  "/root/.cargo/bin" \
+  "/usr/local/bin"; do
+  [ -n "$_d" ] && [ -d "$_d" ] || continue
+  case ":$PATH:" in *":$_d:"*) ;; *) export PATH="$_d:$PATH" ;; esac
+done
+unset _d
+
+# ---------------------------------------------------------------------------
 # 0) 参数默认值（环境变量优先）
 # ---------------------------------------------------------------------------
 : "${GIT_REPO:=https://github.com/YOUR_GITHUB_USERNAME/YOUR_GITHUB_REPO.git}"
@@ -201,23 +252,29 @@ log_o "项目目录校验通过（config.yaml / config.yaml.example 就绪）"
 # 7) 依赖：uv + uv sync
 # ---------------------------------------------------------------------------
 hr
-if ! need uv; then
+# 用 _resolve_uv_bin 比 need uv 更稳：即使 PATH 里没有，也能搜到用户级安装的 uv
+UV_BIN=""
+if UV_BIN="$(_resolve_uv_bin 2>/dev/null || true)"; [ -n "$UV_BIN" ] && [ -x "$UV_BIN" ]; then
+  :
+else
   log_i "未检测到 uv → 执行官方安装脚本"
   setup_git_proxy
   curl -LsSf https://astral.sh/uv/install.sh | sh \
     || die "uv 安装失败。请手动运行：curl -LsSf https://astral.sh/uv/install.sh | sh"
   unset_git_proxy
-  case ":$PATH:" in
-    *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;;
-  esac
-  case ":$PATH:" in
-    *":$HOME/.cargo/bin:"*) ;; *) export PATH="$HOME/.cargo/bin:$PATH" ;;
-  esac
+  # 官方安装脚本写 ~/.local/bin，再搜一次就拿到了
+  UV_BIN="$(_resolve_uv_bin 2>/dev/null || true)"
+  if [ -z "$UV_BIN" ] || [ ! -x "$UV_BIN" ]; then
+    die "uv 已执行 install.sh，但仍找不到 uv 可执行文件。" \
+        "请：1) 重开终端或 source ~/.bashrc；2) 确认 ~/.local/bin/uv 存在且可执行。"
+  fi
 fi
-log_o "uv 就绪：$(uv --version)"
+# 把找到的 UV_BIN 再次 export（保证本脚本后续裸 uv 调用和 systemd 子脚本都能拿到绝对路径）
+export UV_BIN
+log_o "uv 就绪：$("$UV_BIN" --version)  ($UV_BIN)"
 
 log_i "uv sync（创建 .venv / 对齐 lock 版本）"
-uv sync || die "uv sync 失败，常见原因：网络（配置 HTTP_PROXY=host:port）/Python 版本不匹配"
+"$UV_BIN" sync || die "uv sync 失败，常见原因：网络（配置 HTTP_PROXY=host:port）/Python 版本不匹配"
 log_o ".venv 就绪"
 
 # ---------------------------------------------------------------------------
@@ -304,7 +361,7 @@ else
   #   （兼容 VPS /opt/ycs、容器 /app、本地任意目录部署，不再依赖硬编码 /workspace）
   cd "$INSTALL_DIR"
   export PYTHONPATH="$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}"
-  if uv run pytest "${PYTEST_DEFAULT_TARGETS[@]}" -q --no-header; then
+  if "$UV_BIN" run pytest "${PYTEST_DEFAULT_TARGETS[@]}" -q --no-header; then
     log_o "pytest 风控/诊断子集全部通过"
   else
     die "pytest 子集失败，已中止部署（避免 bug 版本进实盘）。" \
@@ -340,16 +397,23 @@ fi
 
 if [ "$IS_FIRST" -eq 1 ]; then
   log_i "首次安装 → 调用 deploy/install_systemd.sh（若提示密码，请输入 sudo 密码）"
-  sudo bash deploy/install_systemd.sh || die "install_systemd.sh 失败，见上方输出"
+  # 透传 UV_BIN + INSTALL_DIR：sudo 会清空用户级 PATH，子脚本在 secure_path 下找不到 ~/.local/bin/uv
+  # shellcheck disable=SC2086
+  $SUDO env UV_BIN="$UV_BIN" INSTALL_DIR="$INSTALL_DIR" CONFIG_PATH="${CONFIG_PATH:-}" \
+    bash deploy/install_systemd.sh || die "install_systemd.sh 失败，见上方输出"
   log_o "部署完成；系统状态摘要："
   systemctl status ycs --no-pager --lines=10 || true
 else
   log_i "更新完成 → ycsctl restart（加载新代码）"
-  if sudo uv run python deploy/ycsctl.py restart; then
+  # 主路径：ycsctl restart（UV_BIN 绝对路径 → sudo 下也不会被清 PATH）
+  # shellcheck disable=SC2086
+  if $SUDO env UV_BIN="$UV_BIN" "$UV_BIN" run python deploy/ycsctl.py restart; then
     log_o "ycs 服务重启成功"
   else
     log_w "ycsctl restart 失败（可能 systemd unit 尚未安装），改为首次执行 install_systemd.sh"
-    sudo bash deploy/install_systemd.sh || die "install_systemd.sh 兜底失败，见上方输出"
+    # shellcheck disable=SC2086
+    $SUDO env UV_BIN="$UV_BIN" INSTALL_DIR="$INSTALL_DIR" CONFIG_PATH="${CONFIG_PATH:-}" \
+      bash deploy/install_systemd.sh || die "install_systemd.sh 兜底失败，见上方输出"
   fi
 fi
 
