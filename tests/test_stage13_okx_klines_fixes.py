@@ -40,7 +40,7 @@ class Test_1_NoIndexErrorOnEmptyResponse:
         calls: list[tuple] = []
         class Fake:
             def fetch_ohlcv(self, sym, timeframe=None, limit=None, params=None):
-                calls.append((sym, timeframe, limit, params))
+                calls.append((sym, timeframe, limit, dict(params or {})))
                 return []
         with pytest.raises(RuntimeError) as ri:
             mod.fetch_ohlcv_paginated(Fake(), "ETH/USDT:USDT", "1m",
@@ -93,7 +93,9 @@ class Test_3_PaginationAccumulatesAllBars:
                 self.call_count = 0
             def fetch_ohlcv(self, sym, timeframe=None, limit=None, params=None):
                 self.call_count += 1
-                until = int((params or {}).get("until", start_ms))
+                p = params or {}
+                # OKX/ccxt 原生 key 是 before；兼容历史脚本里的 until
+                until = int(p.get("before") or p.get("until") or start_ms)
                 # 严格模拟 OKX：返回最多 100 根
                 per_page = min(limit or 100, 100)
                 # 用 ms 步长 60_000（1m）—— timeframes 无关，只测分页拼接
@@ -135,7 +137,8 @@ class Test_3_PaginationAccumulatesAllBars:
                     return []
                 per = 100
                 step = 60_000
-                until = int((params or {}).get("until", base_ms))
+                p = params or {}
+                until = int(p.get("before") or p.get("until") or base_ms)
                 return [[until - (per - 1 - i) * step, 2000, 2001, 1999, 2000, 10] for i in range(per)]
 
         with pytest.raises(RuntimeError) as ri:
