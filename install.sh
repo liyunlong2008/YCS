@@ -221,6 +221,53 @@ uv sync || die "uv sync 失败，常见原因：网络（配置 HTTP_PROXY=host:
 log_o ".venv 就绪"
 
 # ---------------------------------------------------------------------------
+# 7.2) 全局命令：ycs / ycsctl（pyproject [project.scripts] 入口 + ~/.local/bin shim）
+#
+# 用户指令："命令或许记不住 写个菜单 通过选项选择执行，ycs 呼出菜单"。
+#   · uv run 或 .venv/bin/activate 后：ycs / ycsctl 直接来自 [project.scripts]
+#     （venv/bin/ycs、venv/bin/ycsctl）
+#   · 新 shell 登录未 source .venv：写 $HOME/.local/bin/ycs 和 ycsctl 小 shim，
+#     自动切到 $INSTALL_DIR 用 `uv run ycs` 跑。新 ssh 登录直接敲 ycs 即可。
+# ---------------------------------------------------------------------------
+_YCS_LOCAL_BIN="$HOME/.local/bin"
+mkdir -p "$_YCS_LOCAL_BIN"
+case ":$PATH:" in
+  *":$_YCS_LOCAL_BIN:"*) ;;
+  *)
+    if ! grep -q '$HOME/.local/bin' ~/.bashrc 2>/dev/null; then
+      log_i "把 ~/.local/bin 追加进 PATH（写进 ~/.bashrc 永久生效）"
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+    fi
+    export PATH="$_YCS_LOCAL_BIN:$PATH"
+    ;;
+esac
+
+# 生成两个 shim：ycs / ycsctl
+_shim_content="#!/usr/bin/env bash
+# 自动生成的 ycs/ycsctl shim（install.sh 部署时写入 $_YCS_LOCAL_BIN）。
+# 作用：用户新 SSH 登录没 source .venv，也能直接敲 ycs → 走项目 uv run。
+set -e
+INSTALL_DIR=\"$INSTALL_DIR\"
+cd \"\$INSTALL_DIR\"
+if [ -n \"\${VIRTUAL_ENV:-}\" ] && command -v ycs >/dev/null 2>&1; then
+  exec ycs \"\$@\"
+fi
+exec uv run ycs \"\$@\"
+"
+
+for _shim_name in ycs ycsctl; do
+  _shim_path="$_YCS_LOCAL_BIN/$_shim_name"
+  # pyproject.scripts 里两个名字完全等价，所以这里 shim 也完全一样；
+  # 以后若需改名只需循环里加名字即可。
+  printf '%s\n' "$_shim_content" > "$_shim_path"
+  chmod +x "$_shim_path"
+done
+log_o "全局命令就绪：ycs（交互菜单首选）/ ycsctl（脚本友好）。试试："
+log_o "    ycs           # 直接弹交互菜单（不用记命令）"
+log_o "    ycs check     # 配置自检（脚本/CI 友好）"
+log_o "    ycsctl kill   # 紧急停机+全平"
+
+# ---------------------------------------------------------------------------
 # 7.5) 真实 OKX 历史 K 线 Fixtures —— 用户 2026-08-29 明确：跳过
 #   「历史数据+pytest 有点多余，抓紧上实盘」，因此 install.sh 不再
 #   要求部署 tests/fixtures/market_data/ 下的 18 个 CSV.GZ，也不再跑

@@ -96,10 +96,13 @@ def _print_err(msg: str) -> None:
 def cmd_help() -> int:
     print(f"""{APP_NAME_CN} · 管理命令行工具 v{__version__}
 用法：
-  ycsctl <命令> [选项]
+  ycs                     直接呼出【交互式菜单】（不记命令时首选）
+  ycsctl <命令> [选项]    单命令模式（脚本/CI 友好，等价原 ycsctl）
+  ycsctl menu             同 ycs：呼出交互式菜单
 
 可用命令：
   help, -h, --help       显示本帮助
+  menu                   【推荐】呼出数字选项交互式菜单（不用记命令）
   version                显示版本号
   check [--json] [--config PATH]   配置自检：密钥占位 / 运行模式 / 依赖
   status                 查询服务运行状态（systemctl status ycs）
@@ -116,8 +119,205 @@ def cmd_help() -> int:
   · 所有子命令优先在 /workspace 项目根目录查找配置与脚本
   · install / start / stop / restart 需要 root（自动 sudo 交互，若 sudo 需要密码时请前置 sudo）
   · 非 root 容器（未装 systemd）下 start/stop/restart 会给出友好提示
+  · 忘命令 → 直接敲 ycs 回车走菜单
 """)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 交互式菜单（ycs / ycsctl menu / ycsctl 无参数 → 都进这里）
+# ---------------------------------------------------------------------------
+def _c_red(s: str) -> str:   return f"\033[1;31m{s}\033[0m"
+def _c_green(s: str) -> str: return f"\033[1;32m{s}\033[0m"
+def _c_yellow(s: str) -> str: return f"\033[1;33m{s}\033[0m"
+def _c_bold(s: str) -> str:  return f"\033[1m{s}\033[0m"
+def _c_dim(s: str) -> str:   return f"\033[2m{s}\033[0m"
+
+
+def _is_tty() -> bool:
+    return hasattr(sys.stdin, "isatty") and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+# 菜单项：(key, emoji+标题, 帮助子提示, 执行函数返回 argv list)
+# 说明：返回 argv 给 main() 递归调用，保持"单命令模式 / 菜单模式"同一套命令执行链路，
+#      避免 kill/check/install 等逻辑重复实现两遍。
+def _build_menu() -> list[tuple[str, str, str, list[str] | None]]:
+    return [
+        # A. 启动/停止/状态
+        ("1",  "🚀 启动 ycs 服务 (start)",              "systemctl start ycs（需要 sudo）",        ["start"]),
+        ("2",  "⏹ 停止 ycs 服务 (stop)",               "systemctl stop ycs（需要 sudo）",         ["stop"]),
+        ("3",  "🔄 重启 ycs 服务 (restart)",           "修改 config.yaml 后必须先重启",           ["restart"]),
+        ("4",  "💡 查询服务状态 (status)",              "systemctl status ycs + 主进程/端口速览",  ["status"]),
+        ("",   None, None, None),
+        # B. 诊断 / 日志 / 配置
+        ("5",  "🛡 配置自检 (check)",                   "输出 纸盘/实盘 + 占位密钥警告 + 退出码区分致命",  ["check"]),
+        ("6",  "📜 最近 200 行日志 (logs -n 200)",      "journalctl -u ycs -n 200",                ["logs", "-n", "200"]),
+        ("7",  "👁 实时跟随日志 (logs -f)",             "Ctrl+C 退出（journalctl -f）",            ["logs", "-f"]),
+        ("8",  "📂 查看 config.yaml (config show)",     "打印配置内容；config path 只显示文件路径", ["config", "show"]),
+        ("",   None, None, None),
+        # C. 更新/安装
+        ("9",  "⬆️ VPS 更新代码 + 重启 (restart)",      "需要先跑 install.sh，这里是改完 config/代码后重启", ["restart"]),
+        ("a",  "📦 安装 systemd 服务 (install)",       "调用 deploy/install_systemd.sh（首次部署）", ["install"]),
+        ("b",  "🗑 卸载 systemd 服务 (uninstall)",      "停止+禁用+删除 unit（需要 sudo）",         ["uninstall"]),
+        ("",   None, None, None),
+        # D. 紧急 & 帮助（顶部红条）
+        (_c_red("k"), _c_red("🔴【紧急】一键 Kill-Switch 停机+全平 (kill)"),
+                "三通道：/api/kill → EMERGENCY_HALT → systemctl stop",     ["kill"]),
+        ("h",  "❔ 显示完整帮助 (help)",               "所有子命令 + 选项详解",                    ["help"]),
+        ("v",  "ℹ️ 版本号 (version)",                  __version__,                              ["version"]),
+        ("",   None, None, None),
+        ("q",  "✖️ 退出菜单",                         "退出（Ctrl+C / Ctrl+D 也可以）",           None),
+    ]
+
+
+def interactive_cmd_menu() -> int:
+    """交互式 TUI 菜单：用户直接敲『ycs』或『ycsctl menu』就进这里。
+
+    特性：
+      · 输入数字/字母 → 对应子命令通过 main([argv]) 同一链路执行，保证菜单与命令行等价
+      · 执行完一次子命令后回到主菜单（方便反复 status/logs）
+      · 支持 Ctrl+C / Ctrl+D / q 退出
+      · 非 TTY 时（例如有人用 ycsctl < input.txt 或 | 管道）自动降级为 help，避免卡死
+    """
+    if not _is_tty():
+        print("[info] 非交互环境（stdin/stdout 非 TTY），菜单模式降级为直接打印 help。")
+        print("[hint] 走单命令：ycsctl check / ycsctl status / ycsctl kill …")
+        return cmd_help()
+
+    # 清屏（兼容 Windows/Unix）
+    def _clear() -> None:
+        sys.stdout.write("\033[2J\033[H" if os.name != "nt" else "\x1bc")
+        sys.stdout.flush()
+
+    last_cmd_rc: int | None = None
+    last_cmd_summary: str = ""
+    while True:
+        try:
+            _clear()
+            # 顶部标题条
+            title = (
+                f"{_c_bold(APP_NAME_CN)} · {_c_bold('交互式菜单')}   "
+                f"{_c_dim(f'v{__version__}  项目根: {PROJECT_ROOT}')}"
+            )
+            print(title)
+            print(_c_dim("─" * max(80, len(title) - 20)))
+            if last_cmd_summary:
+                color = _c_green if last_cmd_rc == 0 else _c_red
+                print(f"  {color('上次执行：' + last_cmd_summary)}  →  exit={last_cmd_rc}")
+                print(_c_dim("─" * 80))
+
+            # 分组打印
+            print(_c_yellow("  A. 服务管理") + _c_dim("        (start/stop/restart/status)"))
+            for k, title, hint, _ in _build_menu()[:5]:
+                if title is None:
+                    print()
+                    print(_c_yellow("  B. 诊断 & 日志") + _c_dim("       (check/logs/config)"))
+                    continue
+                if title and (k in "1234"):
+                    pass
+                if title and k in ("5","6","7","8"):
+                    pass
+                if title is None:
+                    continue
+                # 不按 A/B/C 分段了，直接用空行切
+            # —— 上面的 for 仅为"空行+分组标题"打印占位；下面统一全表打印
+            print()
+            print(_c_yellow("  ┌──────────────────────────────────────────────────────────────────────┐"))
+            idx_map: dict[str, list[str] | None] = {}
+            current_group = ""
+            rows = _build_menu()
+            for k, title, hint, target_argv in rows:
+                if title is None:
+                    # 空行分隔
+                    print("  ├──────────────────────────────────────────────────────────────────────┤")
+                    continue
+                idx_map[k] = target_argv
+                kk = _c_red(k) if k.lower() == "k" else _c_green(k.rjust(2))
+                right = _c_dim(f"[{hint}]") if hint else ""
+                print(f"  │ {kk}. {title:<58} {right} │")
+            print("  └──────────────────────────────────────────────────────────────────────┘")
+            print()
+
+            prompt_header = (
+                _c_bold("  请选择编号/字母 ")
+                + _c_dim("(q 退出；回车重刷菜单；输入对应字母/数字后回车)")
+                + _c_bold(" > ")
+            )
+            try:
+                choice = input(prompt_header).strip()
+            except EOFError:
+                print()
+                print("👋 再见（Ctrl+D）")
+                return 0
+
+            if choice in ("", "\n"):
+                # 刷新
+                continue
+            if choice.lower() in ("q", "quit", "exit", "x"):
+                print("👋 再见")
+                return 0
+
+            if choice not in idx_map:
+                last_cmd_rc = 2
+                last_cmd_summary = f"输入 {choice!r} 不在选项里（请输入菜单左列的数字/字母，如 1/5/k/q）"
+                continue
+
+            target_argv = idx_map[choice]
+            if target_argv is None:
+                # q 退出分支（已在上文处理过；这里以防 idx_map["q"]=None 兜底）
+                print("👋 再见")
+                return 0
+
+            # 紧急 kill 二次确认
+            if len(target_argv) >= 1 and target_argv[0] == "kill":
+                confirm = input(
+                    _c_red("  ⚠️ 即将执行 kill：撤所有挂单+市价全平+熔断24h，输入 YES 继续 > ")
+                ).strip()
+                if confirm != "YES":
+                    last_cmd_rc = 1
+                    last_cmd_summary = "KILL-SWITCH 已取消（未输入 YES）"
+                    continue
+                last_cmd_summary = "执行 ycsctl kill（紧急停机+全平）"
+            elif len(target_argv) >= 1 and target_argv[0] == "install":
+                confirm = input(
+                    _c_yellow("  ⚠️  即将执行 install：部署/覆盖 systemd unit，输入 y 继续 > ")
+                ).strip()
+                if confirm.lower() not in ("y", "yes"):
+                    last_cmd_rc = 1
+                    last_cmd_summary = "install 已取消"
+                    continue
+                last_cmd_summary = "执行 ycsctl install（部署 systemd 服务）"
+            elif len(target_argv) >= 1 and target_argv[0] == "uninstall":
+                confirm = input(
+                    _c_red("  ⚠️  即将执行 uninstall：停止+卸载 systemd unit，输入 YES 继续 > ")
+                ).strip()
+                if confirm != "YES":
+                    last_cmd_rc = 1
+                    last_cmd_summary = "uninstall 已取消"
+                    continue
+                last_cmd_summary = "执行 ycsctl uninstall（卸载 systemd 服务）"
+            else:
+                last_cmd_summary = f"执行 ycsctl {' '.join(target_argv)}"
+
+            print(_c_dim("─" * 80))
+            print(_c_bold(f"  → $ ycsctl {' '.join(target_argv)}"))
+            print(_c_dim("─" * 80))
+            # 递归调用 main：复用 argparse + 同一套 cmd_* 实现
+            try:
+                rc = main(target_argv)
+            except SystemExit as se:
+                rc = int(se.code) if se.code is not None else 0
+            last_cmd_rc = rc
+            print()
+            # 执行完后等一下，让用户看输出
+            wait = input(_c_dim("  回车返回菜单 / q 退出 > ")).strip()
+            if wait.lower() in ("q", "quit", "exit"):
+                print("👋 再见")
+                return 0
+        except KeyboardInterrupt:
+            print()
+            print("👋 再见（Ctrl+C）")
+            return 0
 
 
 def cmd_version() -> int:
@@ -444,7 +644,7 @@ def cmd_kill(args: "argparse.Namespace") -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ycsctl",
-        description=f"{APP_NAME_CN} · 管理命令行工具",
+        description=f"{APP_NAME_CN} · 管理命令行工具 —— 直接 ycs（或 ycsctl menu）进交互式菜单，不用记命令",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
@@ -454,6 +654,10 @@ def build_parser() -> argparse.ArgumentParser:
     # help
     p_help = sub.add_parser("help", help="显示帮助")
     p_help.set_defaults(func=lambda *a, **k: cmd_help())
+
+    # menu（交互式）
+    p_menu = sub.add_parser("menu", help="【推荐】交互式菜单：ycs / ycsctl menu")
+    p_menu.set_defaults(func=lambda *a, **k: interactive_cmd_menu())
 
     # version
     p_ver = sub.add_parser("version", help="显示版本号")
@@ -514,9 +718,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
 
-    # 无参数、或 -h/--help/help → 直接帮助
+    # 无参数 → 直接进交互式菜单（满足：直接 ycs 回车 弹菜单）
     if not argv:
-        return cmd_help()
+        return interactive_cmd_menu()
     if argv[0] in ("-h", "--help", "help"):
         return cmd_help()
     if argv[0] in ("-V", "--version"):

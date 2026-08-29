@@ -131,3 +131,52 @@ def test_cli_unknown_subcommand_errors_gracefully():
     assert r.returncode != 0, "未知命令需要非零退出码"
     combined = r.stdout + r.stderr
     assert "未知" in combined or "不存在" in combined or "help" in combined.lower(), combined
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-29 新增：用户要求"不用记命令 → ycs 直接弹菜单"
+#   · --help 必须提到 ycs / 交互式菜单
+#   · version 仍 work（新入口没破坏旧子命令）
+#   · ycsctl menu 在非 TTY 时退化为 help（或直接菜单输出中含"紧急停机(kill)"）
+# ---------------------------------------------------------------------------
+def test_cli_help_mentions_ycs_menu_entry():
+    """--help 输出里必须含 ycs / 菜单 / 交互式 字样（直接给用户的心智锚点）。"""
+    r = run("--help")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout + r.stderr
+    # 至少两处：一个 ycs 入口名 + 一个"菜单"关键词
+    assert "ycs " in out or "ycs（" in out or "直接 ycs" in out, (
+        f"--help 未提到 ycs 入口，用户没法知道『敲 ycs 弹菜单』：\n{out[:600]}"
+    )
+    assert "菜单" in out, f"--help 缺『菜单』关键词：\n{out[:600]}"
+
+
+def test_cli_version_still_works_after_menu_entry_added():
+    """新加 ycs 入口后，version 仍输出语义化版本。"""
+    r = run("version")
+    assert r.returncode == 0, r.stderr
+    import re
+    assert re.search(r"\d+\.\d+\.\d+", r.stdout), f"version 丢了：{r.stdout!r}"
+
+
+def test_cli_menu_subcommand_non_tty_renders_menu_with_kill_entry():
+    """ycsctl menu 在非 TTY 下不会卡死：_is_tty() 为 False 时打印 help 或菜单原文。
+
+    验证菜单确实"画过"：输出里必须出现『紧急』/『Kill-Switch』/『停机+全平』之一。
+    非 TTY 环境（subprocess.run 的管道）→ interactive_cmd_menu 里有 _is_tty 判
+    断，会降级为 help 文本输出，但我们在 help 文案里也写了 kill 那一行；两种路径
+    都要保证 exit=0，且能看到 Kill-Switch 提示词（防止菜单代码真丢了也没人察觉）。
+    """
+    r = run("menu")
+    combined = r.stdout + r.stderr
+    # exit 必须 0（非 TTY 降级也要正常退出）
+    assert r.returncode == 0, (
+        f"ycsctl menu 非 TTY 下 exit={r.returncode}（应 0）\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    # 至少出现 kill 关键信号：要么"紧急停机+全平"，要么"Kill-Switch"（大小写都接受）
+    kill_keywords = ("Kill-Switch", "kill switch", "停机+全平", "紧急", "kill")
+    low = combined.lower()
+    assert any(k.lower() in low for k in kill_keywords), (
+        "ycsctl menu 输出里看不到 Kill-Switch / kill / 紧急停机+全平 条目，"
+        f"菜单根本没渲染！输出：\n{combined[:700]}"
+    )

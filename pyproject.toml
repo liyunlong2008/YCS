@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "yunlong"
 version = "0.1.0"
-description = "YCS"
+description = "YCS · 云龙挑战赛（ETH 永续自动交易系统）"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +17,26 @@ dependencies = [
     "pyyaml>=6.0.3",
     "uvicorn[standard]>=0.52.4",
 ]
+
+[project.scripts]
+# 用户指令：命令记不住 → 直接 ycs 回车弹交互式菜单。
+# ycs / ycsctl 两个命令名等价，都是 deploy/ycsctl.py:main 入口。
+# 区别仅在用户心智：
+#   · ycs     → 默认想交互（无参数=菜单）
+#   · ycsctl  → CLI/脚本模式，但 `ycsctl menu` 也能进菜单
+ycs = "deploy.ycsctl:main"
+ycsctl = "deploy.ycsctl:main"
+
+[tool.uv]
+# 让 [project.scripts] 的 ycs / ycsctl 入口真正被安装到 .venv/bin。
+# 否则 `uv sync` 会警告"未打包→跳过入口"，`uv run ycs` 找不到命令。
+package = true
+
+[tool.setuptools]
+# 显式列出 packages，因为 deploy/ 目录缺少 __init__.py（它只是部署脚本，不是 runtime package），
+# 但入口点 `deploy.ycsctl:main` 需要 setuptools 把 deploy 当成 package。添加空 deploy/__init__.py 也行，
+# 这里直接在 pyproject 里声明最省事（后续若真要 import deploy.* 也已经满足）。
+packages = ["app", "deploy"]
 
 [dependency-groups]
 dev = [
