@@ -225,7 +225,10 @@ log_o ".venv 就绪"
 #   YCS_ALLOW_SYNTH=1        OKX 真拿不到时应急兜底合成（不推荐）
 # ---------------------------------------------------------------------------
 hr
-: "${YCS_SKIP_FIXTURES:=0}"
+# 默认 YCS_SKIP_FIXTURES=1：真实 K 线 fixtures 随仓库一起 commit/push，git clone 下来就有，
+# 部署时默认直接用，省网络时间也避免 VPS 被封 OKX 时部署挂。
+# 需要在 VPS 上直接重拉最新真实数据时才传 YCS_SKIP_FIXTURES=0。
+: "${YCS_SKIP_FIXTURES:=1}"
 : "${YCS_FORCE_FIXTURES:=0}"
 : "${YCS_ALLOW_SYNTH:=0}"
 
