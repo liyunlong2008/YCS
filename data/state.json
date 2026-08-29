@@ -1,5 +1,5 @@
 {
-  "status": "RUNNING",
+  "status": "ERROR",
   "started_at": null,
   "balance": {
     "total": 1000.0,
