@@ -221,63 +221,43 @@ uv sync || die "uv sync 失败，常见原因：网络（配置 HTTP_PROXY=host:
 log_o ".venv 就绪"
 
 # ---------------------------------------------------------------------------
-# 7.5) 真实 OKX 历史 K 线 Fixtures
-#
-# 用户 2026-08-29 明确：「不需要备用」，不允许任何合成兜底，
-# 真实切片 fixtures 必须在本地用 deploy/pull_real_okx_klines.py（代理 127.0.0.1:10808）
-# 拉完后 commit 到仓库，git clone / git pull 下来直接用，体积 < 1MB。
-#
-# 环境变量：
-#   YCS_SKIP_FIXTURES=1      默认跳过（fixtures 已随仓库一起，99.9% 场景用这个）
-#   YCS_SKIP_FIXTURES=0      VPS 上自己拉（要求 VPS 也能直连或代理 OKX）
-#
-#   代理：pull_real_okx_klines.py 默认读 OKX_PROXY=http://127.0.0.1:10808，
-#         VPS 自己拉时可传 OKX_PROXY=http://<host>:<port> 覆盖。
+# 7.5) 真实 OKX 历史 K 线 Fixtures —— 用户 2026-08-29 明确：跳过
+#   「历史数据+pytest 有点多余，抓紧上实盘」，因此 install.sh 不再
+#   要求部署 tests/fixtures/market_data/ 下的 18 个 CSV.GZ，也不再跑
+#   deploy/pull_real_okx_klines.py。若后续确实需要离线回测再按需引入。
 # ---------------------------------------------------------------------------
 hr
-: "${YCS_SKIP_FIXTURES:=1}"
-
-if [ "$YCS_SKIP_FIXTURES" -eq 1 ]; then
-  log_w "YCS_SKIP_FIXTURES=1 → 跳过真实 OKX 历史 K 线拉取（随 git 仓库 commit，已 clone 下来自动可用）"
-else
-  FIX_ARGS=()
-  # 如果外部传了 OKX_PROXY，脚本会自动读；显式再传 --proxy 也可以
-  if [ -n "${OKX_PROXY:-}" ]; then
-    FIX_ARGS+=("--proxy" "$OKX_PROXY")
-  fi
-  log_i "拉取真实 OKX 历史 K 线 Fixtures → deploy/pull_real_okx_klines.py ${FIX_ARGS[*]:-（默认代理 127.0.0.1:10808）}"
-  if uv run python deploy/pull_real_okx_klines.py "${FIX_ARGS[@]}"; then
-    log_o "Fixtures 就绪"
-  else
-    die "真实 OKX Fixtures 拉取失败。\n" \
-        "" \
-        "修复方法（推荐，用户明确说不需要备用）：" \
-        "  1) 本地配好 127.0.0.1:10808 代理" \
-        "  2) uv run python deploy/pull_real_okx_klines.py" \
-        "  3) uv run pytest tests/test_stage8_market_fixtures.py tests/test_stage9_no_backup.py" \
-        "  4) git add tests/fixtures/market_data/*.csv.gz && git commit && git push" \
-        "  5) 再到 VPS 执行 install.sh（默认 YCS_SKIP_FIXTURES=1 会用仓库里带的文件，不必在 VPS 重拉）" \
-        "" \
-        "仅当你确实想在 VPS 上直接拉时：" \
-        "  · 确认 VPS 直连或代理 OKX：export OKX_PROXY=http://<host>:<port>" \
-        "  · YCS_SKIP_FIXTURES=0 OKX_PROXY=... bash install.sh"
-  fi
-fi
+log_w "Fixtures：已按用户要求 SKIP（不部署 18×真实 OKX K 线，不跑 stage8/stage9）"
 
 # ---------------------------------------------------------------------------
-# 8) pytest（生产环境默认必跑，避免 bug 版本自动上线）
+# 8) pytest（冒烟集：只跑风控/dashboard/ycsctl/config/config_ignore/core
+#    基础闭环等必须过的子集；其它 stage 不再阻塞实盘部署）
 # ---------------------------------------------------------------------------
 hr
+PYTEST_DEFAULT_TARGETS=(
+  "tests/test_stage1_core.py"
+  "tests/test_stage1_broker.py"
+  "tests/test_stage2_order_manager.py"
+  "tests/test_stage2_risk_pm.py"
+  "tests/test_stage4_closed_loop.py"
+  "tests/test_stage5_safety_and_dashboard.py"
+  "tests/test_stage6_ycsctl.py"
+  "tests/test_stage10_risk_controls_and_diag.py"
+  "tests/test_stage11_config_yaml_ignore.py"
+  "tests/test_stage12_diag_bugfixes.py"
+  "tests/test_stage1to3_integrated.py"
+  "tests/test_stage7_install_sh.py"
+)
 if [ "$YCS_SKIP_TEST" -eq 1 ]; then
   log_w "YCS_SKIP_TEST=1 → 跳过 pytest（不推荐）"
 else
-  log_i "运行 pytest 全量套件…"
-  if uv run pytest tests/ -q --no-header; then
-    log_o "pytest 全部通过"
+  log_i "运行 pytest 风控+诊断冒烟子集…"
+  if uv run pytest "${PYTEST_DEFAULT_TARGETS[@]}" -q --no-header; then
+    log_o "pytest 风控/诊断子集全部通过"
   else
-    die "pytest 存在失败用例，已中止部署以保护 VPS。" \
-        "· 若确认为环境问题（如 systemd 缺失）：YCS_SKIP_TEST=1 bash install.sh" \
-        "· 若确认为代码问题，请先修复后 push 到仓库再重跑。"
+    die "pytest 子集失败，已中止部署（避免 bug 版本进实盘）。" \
+        "· 确认为环境问题（如 systemd 缺失 / 代理不可达）：YCS_SKIP_TEST=1 bash install.sh" \
+        "· 确认为代码问题：先修复 push 到仓库，再到 VPS 重跑 install.sh。"
   fi
 fi
 
