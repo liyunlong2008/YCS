@@ -55,7 +55,7 @@ def test_eighteen_fixture_files_exist():
                 missing.append(str(p.relative_to(FIXTURES_ROOT.parent.parent)))
     assert not missing, (
         f"缺失 {len(missing)} 个 fixture 文件。\n"
-        f"请先执行：uv run python deploy/fetch_market_fixtures.py\n"
+        f"请先执行：uv run python deploy/pull_real_okx_klines.py（本地配代理 127.0.0.1:10808，跑完 commit 到仓库）\n"
         + "\n".join(missing)
     )
 
@@ -67,7 +67,7 @@ def test_eighteen_fixture_files_exist():
 @pytest.mark.parametrize("tf", TIMEFRAMES)
 def test_fixture_row_count_order_ohlcv(scene: str, tf: str):
     p = _path(scene, tf)
-    assert p.is_file(), f"缺失 {p.name} (执行 fetch_market_fixtures.py 生成)"
+    assert p.is_file(), f"缺失 {p.name} (执行 deploy/pull_real_okx_klines.py 生成，本地配代理 127.0.0.1:10808)"
     rows = _read_rows(p)
     assert len(rows) == EXPECTED_ROWS, f"{p.name} 行数 {len(rows)} != {EXPECTED_ROWS}"
     cols = {"timestamp", "open", "high", "low", "close", "volume"}

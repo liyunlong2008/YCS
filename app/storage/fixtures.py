@@ -16,10 +16,10 @@ TIMEFRAMES_LITERAL = Literal["1m", "5m", "15m", "1h", "4h", "1d"]
 # 仓库内默认 fixtures 根目录
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures" / "market_data"
 
-# 合成锚点（与 deploy/fetch_market_fixtures.py 中 GBM 合成器一致）
+# 历史占位锚点（仅用于 detect_fixture_source 判别真实/占位小文件；真实 OKX 历史不会命中）
 _SYNTH_START_TS_MS = 1767225600_000  # 2026-01-01 00:00:00 UTC
-_SYNTH_BASE_PRICE = 2000.0            # 合成首 bar open/close 围绕的锚
-_SYNTH_START_OPEN_EPS = 0.0005        # 合成首 bar open 相对 BASE_PRICE 的扰动上限
+_SYNTH_BASE_PRICE = 2000.0            # 占位首 bar open/close 围绕的锚
+_SYNTH_START_OPEN_EPS = 0.0005        # 占位首 bar open 相对 BASE_PRICE 的扰动上限
 
 # 判定「真实 OKX 历史」必需同时满足：
 #   1) 首根时间戳早于今天 UTC 0 点（真实数据不可能用未来日期）
@@ -117,7 +117,7 @@ def load_fixture(
     if not p.is_file():
         raise FileNotFoundError(
             f"fixture 文件不存在：{p}\n"
-            "请先执行：uv run python deploy/fetch_market_fixtures.py"
+            "请先执行：uv run python deploy/pull_real_okx_klines.py（本地配代理 127.0.0.1:10808 跑完 commit 到仓库）"
         )
 
     out: list[list] = []

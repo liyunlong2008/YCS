@@ -172,8 +172,7 @@ def main() -> int:
 
     print("")
     print("==== 场景 1D 自检（与 pytest stage8 一致） ====")
-    # 读 1D 校验阈值
-    import numpy as np  # 仅这里用一下，算 pct/amp
+    # 读 1D 校验阈值（纯 Python，不用 numpy/pandas，精简依赖）
     scene_check = {"trend_up": +20.0, "trend_down": -15.0, "range_amp": 8.0}
     all_pass = True
     for scene in SCENES:

@@ -217,43 +217,46 @@ uv sync || die "uv sync 失败，常见原因：网络（配置 HTTP_PROXY=host:
 log_o ".venv 就绪"
 
 # ---------------------------------------------------------------------------
-# 7.5) 真实 OKX 历史 K 线 Fixtures（用户 2026-08-29 要求"一定要真实历史 K"，默认强制真实）
+# 7.5) 真实 OKX 历史 K 线 Fixtures
+#
+# 用户 2026-08-29 明确：「不需要备用」，不允许任何合成兜底，
+# 真实切片 fixtures 必须在本地用 deploy/pull_real_okx_klines.py（代理 127.0.0.1:10808）
+# 拉完后 commit 到仓库，git clone / git pull 下来直接用，体积 < 1MB。
 #
 # 环境变量：
-#   YCS_SKIP_FIXTURES=1      完全跳过（fixtures 目录已自备真实文件 / git 仓库已附带）
-#   YCS_FORCE_FIXTURES=1     --force：覆盖已有文件重拉（更新到最新历史）
-#   YCS_ALLOW_SYNTH=1        OKX 真拿不到时应急兜底合成（不推荐）
+#   YCS_SKIP_FIXTURES=1      默认跳过（fixtures 已随仓库一起，99.9% 场景用这个）
+#   YCS_SKIP_FIXTURES=0      VPS 上自己拉（要求 VPS 也能直连或代理 OKX）
+#
+#   代理：pull_real_okx_klines.py 默认读 OKX_PROXY=http://127.0.0.1:10808，
+#         VPS 自己拉时可传 OKX_PROXY=http://<host>:<port> 覆盖。
 # ---------------------------------------------------------------------------
 hr
-# 默认 YCS_SKIP_FIXTURES=1：真实 K 线 fixtures 随仓库一起 commit/push，git clone 下来就有，
-# 部署时默认直接用，省网络时间也避免 VPS 被封 OKX 时部署挂。
-# 需要在 VPS 上直接重拉最新真实数据时才传 YCS_SKIP_FIXTURES=0。
 : "${YCS_SKIP_FIXTURES:=1}"
-: "${YCS_FORCE_FIXTURES:=0}"
-: "${YCS_ALLOW_SYNTH:=0}"
 
 if [ "$YCS_SKIP_FIXTURES" -eq 1 ]; then
-  log_w "YCS_SKIP_FIXTURES=1 → 跳过真实 OKX 历史 K 线拉取（依赖外部已有 fixtures/仓库自带）"
+  log_w "YCS_SKIP_FIXTURES=1 → 跳过真实 OKX 历史 K 线拉取（随 git 仓库 commit，已 clone 下来自动可用）"
 else
   FIX_ARGS=()
-  [ "$YCS_FORCE_FIXTURES" -eq 1 ] && FIX_ARGS+=("--force")
-  [ "$YCS_ALLOW_SYNTH"   -eq 1 ] && FIX_ARGS+=("--allow-synth")
-
-  log_i "拉取真实 OKX 历史 K 线 Fixtures → deploy/fetch_market_fixtures.py ${FIX_ARGS[*]:-（仅缺失补拉）}"
-  if uv run python deploy/fetch_market_fixtures.py "${FIX_ARGS[@]}"; then
+  # 如果外部传了 OKX_PROXY，脚本会自动读；显式再传 --proxy 也可以
+  if [ -n "${OKX_PROXY:-}" ]; then
+    FIX_ARGS+=("--proxy" "$OKX_PROXY")
+  fi
+  log_i "拉取真实 OKX 历史 K 线 Fixtures → deploy/pull_real_okx_klines.py ${FIX_ARGS[*]:-（默认代理 127.0.0.1:10808）}"
+  if uv run python deploy/pull_real_okx_klines.py "${FIX_ARGS[@]}"; then
     log_o "Fixtures 就绪"
   else
-    # 若未允许合成但实际 OKX 外网不通 → 给出明确指引
-    if [ "$YCS_ALLOW_SYNTH" -eq 1 ]; then
-      die "Fixtures 生成失败（--allow-synth 已启用仍失败），请检查 VPS 磁盘/权限/网络代理配置。"
-    else
-      die "真实 OKX Fixtures 拉取失败，默认不允许合成兜底（用户要求真实历史 K）。" \
-          "" \
-          "修复方法二选一：" \
-          "  A) 确认 VPS 能直连或代理到 www.okx.com（最推荐）：" \
-          "       HTTPS_PROXY=http://<host>:<port> GIT_REPO=... bash install.sh" \
-          "  B) VPS 上 OKX 确实被封时应急：传 YCS_ALLOW_SYNTH=1（会降级为确定性合成，pytest 仍过但非真实）。"
-    fi
+    die "真实 OKX Fixtures 拉取失败。\n" \
+        "" \
+        "修复方法（推荐，用户明确说不需要备用）：" \
+        "  1) 本地配好 127.0.0.1:10808 代理" \
+        "  2) uv run python deploy/pull_real_okx_klines.py" \
+        "  3) uv run pytest tests/test_stage8_market_fixtures.py tests/test_stage9_no_backup.py" \
+        "  4) git add tests/fixtures/market_data/*.csv.gz && git commit && git push" \
+        "  5) 再到 VPS 执行 install.sh（默认 YCS_SKIP_FIXTURES=1 会用仓库里带的文件，不必在 VPS 重拉）" \
+        "" \
+        "仅当你确实想在 VPS 上直接拉时：" \
+        "  · 确认 VPS 直连或代理 OKX：export OKX_PROXY=http://<host>:<port>" \
+        "  · YCS_SKIP_FIXTURES=0 OKX_PROXY=... bash install.sh"
   fi
 fi
 
