@@ -180,3 +180,71 @@ def test_cli_menu_subcommand_non_tty_renders_menu_with_kill_entry():
         "ycsctl menu 输出里看不到 Kill-Switch / kill / 紧急停机+全平 条目，"
         f"菜单根本没渲染！输出：\n{combined[:700]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-29 影子模式（VPS 首发专用）
+#   · ycsctl check 必须输出"实盘(影子)"/"纸盘(影子)"三态识别
+#   · 影子模式有专属提示：「影子模式：不会真发订单，放心联调」
+#   · 影子模式 + live=true + 占位值 = 允许（exit=0，影子不需要真实交易私有 API）
+# ---------------------------------------------------------------------------
+class Test_CheckShadowMode:
+    BASE_PAPER = (
+        "okx:\n  api_key: real-a\n  secret: real-b\n  passphrase: real-c\n"
+        "ai:\n  provider: deepseek\n  api_key: sk-real\n  model: deepseek-chat\n"
+    )
+
+    def _cfg(self, tmp_path, *, live: bool, shadow: bool, placeholder_okx: bool):
+        cfg = tmp_path / "config.yaml"
+        okx_block = (
+            "okx:\n  api_key: YOUR_OKX_API_KEY\n  secret: YOUR_OKX_API_SECRET\n  passphrase: YOUR_OKX_PASSPHRASE\n"
+            if placeholder_okx else
+            "okx:\n  api_key: real-a\n  secret: real-b\n  passphrase: real-c\n"
+        )
+        cfg.write_text(
+            okx_block
+            + "ai:\n  provider: deepseek\n  api_key: sk-real\n  model: deepseek-chat\n"
+            + f"trading:\n  live: {'true' if live else 'false'}\n  symbol: ETH-USDT-SWAP\n"
+            + "risk_limits:\n  shadow_mode: " + ("true" if shadow else "false") + "\n"
+            + "  live_max_equity_usdt: 15.0\n  live_max_daily_loss_usdt: 3.0\n"
+            + "  live_max_single_order_usdt: 2.0\n  position_change_pct: 0.10\n"
+            + "  kill_switch_token: dummy\n",
+            encoding="utf-8",
+        )
+        return cfg
+
+    def test_check_shadow_true_live_true_shows_shadow_label(self, tmp_path):
+        """shadow=true + live=true → 运行模式应含『实盘(影子)』或『影子』二字。"""
+        cfg = self._cfg(tmp_path, live=True, shadow=True, placeholder_okx=True)
+        r = run("check", "--config", str(cfg))
+        out = r.stdout + r.stderr
+        assert "影子" in out, f"影子模式下 check 输出缺『影子』：\n{out[:600]}"
+        assert ("实盘" in out and "影子" in out) or "实盘(影子" in out or "实盘模式(影子" in out, (
+            f"实盘+影子 应输出 实盘(影子)，实际：\n{out[:600]}"
+        )
+
+    def test_check_shadow_true_paper_false_shows_paper_shadow_label(self, tmp_path):
+        cfg = self._cfg(tmp_path, live=False, shadow=True, placeholder_okx=False)
+        r = run("check", "--config", str(cfg))
+        out = r.stdout + r.stderr
+        assert "影子" in out, f"纸盘+影子 输出缺『影子』：\n{out[:600]}"
+
+    def test_check_shadow_tip_present_when_shadow_true(self, tmp_path):
+        """影子模式专属提示：含『不会真发』或『放心联调』或『影子模式』之一。"""
+        cfg = self._cfg(tmp_path, live=True, shadow=True, placeholder_okx=True)
+        r = run("check", "--config", str(cfg))
+        out = r.stdout + r.stderr
+        assert any(kw in out for kw in ("不会真发", "放心联调", "影子模式", "不真下")), (
+            f"影子模式缺专属提示：\n{out[:600]}"
+        )
+
+    def test_check_shadow_true_live_true_placeholder_okx_allows_exit_zero(self, tmp_path):
+        """影子模式 + live=true：OKX 占位值是允许的（因为不会真下单）。exit 必须 = 0。
+        这是 VPS 首发的核心行为：用户先拿占位 API Key，跑影子模式观察 6 小时。
+        """
+        cfg = self._cfg(tmp_path, live=True, shadow=True, placeholder_okx=True)
+        r = run("check", "--config", str(cfg))
+        assert r.returncode == 0, (
+            f"影子模式下即使 OKX 是占位值也应 exit=0（不会真发），实际={r.returncode}\n"
+            f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+        )

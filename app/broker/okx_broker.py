@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import time
+from typing import Any, Optional
 
 import ccxt.pro as ccxt_pro
 from loguru import logger
@@ -20,6 +21,7 @@ from ..core.constants import (
     PositionSide,
     SYMBOL,
 )
+from ..core.safety import should_block_real_orders
 from .base import Balance, Broker, Order, Position
 
 
@@ -64,14 +66,32 @@ def _map_position_side(side: Optional[str], contracts: float) -> PositionSide:
 
 
 class OKXBroker(Broker):
-    """OKX 永续合约 Broker。通过 ccxt.pro.okx 异步访问。"""
+    """OKX 永续合约 Broker。通过 ccxt.pro.okx 异步访问。
 
-    def __init__(self, symbol: str = SYMBOL, *, okx: OKXConfig) -> None:
+    注意：影子模式下 ShadowBroker 已在 factory 层拦截写路径。
+    这里额外在 place_order/cancel_order 第一行放 should_block_real_orders 闸门
+    （双保险：防止有人绕过 factory 直接 new OKXBroker + 配置 shadow_mode 时误发单）。
+    """
+
+    # 允许运行时通过实例属性覆盖 shadow_mode 判断（默认 False，由 outer 包装器保证）。
+    # 真的要让 OKXBroker 自己也能拦：就从 config 注入——这里提供 setter 方便。
+    def __init__(
+        self,
+        symbol: str = SYMBOL,
+        *,
+        okx: OKXConfig,
+        shadow_mode: bool = False,
+    ) -> None:
         self.symbol = symbol
         self._cfg = okx
+        self._shadow_mode = bool(shadow_mode)
         # 懒初始化：便于测试时注入 Fake exchange
         self._exchange: Optional[ccxt_pro.okx] = None
-        logger.info("OKXBroker 初始化完成: symbol={}", symbol)
+        logger.info("OKXBroker 初始化完成: symbol={} shadow={}", symbol, self._shadow_mode)
+
+    def set_shadow_mode(self, value: bool) -> None:
+        """实盘前可随时切：True=闸门拦截所有下单/撤单。"""
+        self._shadow_mode = bool(value)
 
     # ------------------------------------------------------------------
     # 内部：确保 ccxt 客户端
@@ -186,8 +206,43 @@ class OKXBroker(Broker):
         return out
 
     # ------------------------------------------------------------------
-    # 交易（阶段 2 实现）
+    # 交易（阶段 2 实现 · 带 A7 影子闸门双保险）
     # ------------------------------------------------------------------
+    def _shadow_filled_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        type: OrderType,
+        amount: float,
+        price: float,
+        client_order_id: Optional[str],
+    ) -> Order:
+        """影子闸门触发时：返回一张"影子 FILLED 订单"（与 ShadowBroker 语义一致）。"""
+        ts = int(time.time() * 1000)
+        cid = client_order_id or f"YCS-SHADOW-OKX-{ts}-{id(self) & 0xffff:04x}"
+        avg_fill = float(price) if price and type != OrderType.MARKET else (
+            float(price) if price else 0.0
+        )
+        logger.warning(
+            "[SHADOW GATE OKXBroker] shadow_mode=True → 拦截真实下单："
+            "symbol={} side={} type={} amount={} price={} cid={}",
+            symbol, side.value, type.value, amount, price, cid,
+        )
+        return Order(
+            client_order_id=cid,
+            order_id=cid,
+            symbol=symbol,
+            side=side,
+            type=type,
+            price=float(price),
+            amount=float(amount),
+            filled=float(amount),
+            avg_fill_price=avg_fill,
+            status=OrderStatus.FILLED,
+            created_at=ts,
+            updated_at=ts,
+        )
+
     async def place_order(
         self,
         symbol: str,
@@ -197,7 +252,90 @@ class OKXBroker(Broker):
         price: float = 0.0,
         client_order_id: Optional[str] = None,
     ) -> Order:
-        raise NotImplementedError("阶段 2 实现：OKXBroker.place_order")
+        # A7 双保险：即使外层 ShadowBroker 被绕过，这里也不会真发单
+        if should_block_real_orders(shadow_mode=self._shadow_mode):
+            return self._shadow_filled_order(symbol, side, type, amount, price, client_order_id)
+        if amount <= 0:
+            raise ValueError("下单数量必须为正")
+
+        ex = self._ensure_client()
+        side_str = "buy" if side == OrderSide.BUY else "sell"
+        type_str = {
+            OrderType.LIMIT: "limit",
+            OrderType.MARKET: "market",
+            OrderType.STOP: "stop",
+        }.get(type, "limit")
+
+        params: dict[str, Any] = {}  # type: ignore[name-defined]  # Any 下面再导入
+        if client_order_id:
+            params["clientOrderId"] = client_order_id
+        # OKX ccxt：限价单传 price；市价单不传/可为 0
+        kwargs: dict[str, Any] = {}
+        if type == OrderType.LIMIT and price:
+            kwargs["price"] = float(price)
+        if params:
+            kwargs["params"] = params
+
+        try:
+            raw = await ex.create_order(
+                symbol=symbol,
+                type=type_str,
+                side=side_str,
+                amount=float(amount),
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("OKX place_order 失败: symbol={} side={} type={} amount={} err={}",
+                         symbol, side.value, type.value, amount, exc)
+            ts = int(time.time() * 1000)
+            return Order(
+                client_order_id=client_order_id or "",
+                order_id="",
+                symbol=symbol,
+                side=side,
+                type=type,
+                price=float(price),
+                amount=float(amount),
+                filled=0.0,
+                avg_fill_price=0.0,
+                status=OrderStatus.ERROR,
+                created_at=ts,
+                updated_at=ts,
+            )
+        raw = raw or {}
+        _amt = float(raw.get("amount") or raw.get("filled") or amount)
+        _filled = float(raw.get("filled") or 0)
+        return Order(
+            client_order_id=str(raw.get("clientOrderId") or client_order_id or ""),
+            order_id=str(raw.get("id") or ""),
+            symbol=raw.get("symbol") or symbol,
+            side=_CCXT_SIDE_TO_LOCAL.get(str(raw.get("side")), side),
+            type=_CCXT_TYPE_TO_LOCAL.get(str(raw.get("type")), type),
+            price=float(raw.get("price") or price or 0),
+            amount=_amt,
+            filled=_filled,
+            avg_fill_price=float(raw.get("average") or 0),
+            status=_map_order_status(
+                str(raw.get("status") or ""),
+                _filled,
+                _amt,
+            ),
+            created_at=int(raw.get("timestamp") or time.time() * 1000),
+            updated_at=int(raw.get("lastUpdateTimestamp") or raw.get("timestamp") or time.time() * 1000),
+        )
 
     async def cancel_order(self, symbol: str, client_order_id: str) -> bool:
-        raise NotImplementedError("阶段 2 实现：OKXBroker.cancel_order")
+        # A7 双保险：影子模式直接返回 True（不真发撤单）
+        if should_block_real_orders(shadow_mode=self._shadow_mode):
+            logger.warning("[SHADOW GATE OKXBroker] shadow_mode=True → 拦截真实撤单 cid={}",
+                           client_order_id)
+            return True
+        if not client_order_id:
+            return False
+        ex = self._ensure_client()
+        try:
+            await ex.cancel_order(id=None, symbol=symbol, params={"clientOrderId": client_order_id})
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("OKX cancel_order 失败: cid={} err={}", client_order_id, exc)
+            return False

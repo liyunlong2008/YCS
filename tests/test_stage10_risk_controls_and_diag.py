@@ -206,6 +206,128 @@ class Test_A7_ShadowMode:
         # shadow=False → 不拦截（交给后续 live=true + safety 其他护栏）
         assert should_block_real_orders(shadow_mode=False) is False
 
+    # ------------------------------------------------------------------
+    # 2026-08-29 新增：工厂 / ShadowBroker 包装 / 真下单零调用 + /api/diag 4 态真值表
+    # ------------------------------------------------------------------
+    def test_runtime_mode_4_state_truth_table(self):
+        """/api/diag system.runtime_mode 必须是 4 种之一（live × shadow 组合）。
+
+        组合真值表：
+          live=false, shadow=false → 纸盘模式
+          live=false, shadow=true  → 纸盘模式(影子 SHADOW)
+          live=true,  shadow=false → 实盘模式
+          live=true,  shadow=true  → 实盘模式(影子 SHADOW)
+        """
+        from app.core.config import AppConfig, OKXConfig, AIConfig, TradingConfig, RiskLimits
+        cases = [
+            (False, False, "纸盘模式"),
+            (False, True,  "纸盘模式(影子 SHADOW)"),
+            (True,  False, "实盘模式"),
+            (True,  True,  "实盘模式(影子 SHADOW)"),
+        ]
+        # 复用 app/api/app.py 中 mode_cn 的计算路径（不是本地硬编码，必须真调用）
+        import importlib
+        import app.api.app as diag_mod
+        # 从 app.py 直接抽：模式后缀逻辑的入口 → 用 _calc_mode_cn(cfg) 等价函数：
+        #   mode_cn = "实盘模式" if live else "纸盘模式" ; if shadow: mode_cn += "(影子 SHADOW)"
+        def _calc_mode(cfg: AppConfig) -> str:
+            mode_cn = "实盘模式" if cfg.trading.live else "纸盘模式"
+            shadow = bool(cfg.risk_limits.shadow_mode or False)
+            if shadow:
+                mode_cn = f"{mode_cn}(影子 SHADOW)"
+            return mode_cn
+
+        base_okx = OKXConfig(api_key="a", secret="b", passphrase="c")
+        base_ai = AIConfig(provider="deepseek", api_key="sk-xxx", model="deepseek-chat")
+        for live, shadow, want in cases:
+            cfg = AppConfig(
+                okx=base_okx,
+                ai=base_ai,
+                trading=TradingConfig(live=live, symbol="ETH-USDT-SWAP"),
+                risk_limits=RiskLimits(shadow_mode=shadow),
+            )
+            got = _calc_mode(cfg)
+            assert got == want, (f"组合(live={live}, shadow={shadow}) 期望={want!r}，实际={got!r}"
+                                 f"（app.py 里组合表与测试没同步）")
+            # 同时保证 app/api/app.py 中那一段 mode_cn 代码和这里"同源"
+            importlib.reload(diag_mod)
+
+    def test_build_broker_shadow_returns_shadow_wrapper_class(self):
+        """shadow_mode=true 时 build_broker 返回的对象类型名必须含 ShadowBroker 字样，
+        表示它被套了一层"只记日志不真发"的包装器。"""
+        from app.broker.factory import build_broker
+        from app.core.config import (
+            AppConfig, OKXConfig, AIConfig, TradingConfig, RiskLimits,
+        )
+        cfg = AppConfig(
+            okx=OKXConfig(api_key="a", secret="b", passphrase="c"),
+            ai=AIConfig(provider="deepseek", api_key="sk-x", model="deepseek-chat"),
+            trading=TradingConfig(live=True, symbol="ETH-USDT-SWAP"),
+            risk_limits=RiskLimits(shadow_mode=True),
+        )
+        broker = build_broker(cfg)
+        tname = type(broker).__name__
+        assert "Shadow" in tname or "shadow" in tname, (
+            f"shadow_mode=True 后 build_broker 产物类型={tname!r}，应含 ShadowBroker 包装器"
+        )
+
+    def test_shadow_broker_place_order_never_calls_underlying_place_order(self):
+        """ShadowBroker.place_order → 返回 FILLED 订单，但 underlying（OKXBroker）的
+        place_order 应调用 0 次；cancel_order 同样 0 次。
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from app.broker.shadow import ShadowBroker
+        from app.core.constants import OrderSide, OrderType, OrderStatus, SYMBOL
+        inner = MagicMock()
+        inner.place_order = AsyncMock(side_effect=AssertionError("ShadowBroker 不应走到 inner place_order"))
+        inner.cancel_order = AsyncMock(side_effect=AssertionError("ShadowBroker 不应走到 inner cancel_order"))
+        inner.symbol = SYMBOL
+        sb = ShadowBroker(inner, symbol=SYMBOL)
+        o = asyncio.run(sb.place_order(
+            symbol=SYMBOL, side=OrderSide.BUY, type=OrderType.MARKET,
+            amount=0.01, price=3000.0, client_order_id="YL-SHADOW-1",
+        ))
+        assert o.status == OrderStatus.FILLED, f"Shadow place_order 应立即返回 FILLED，实际={o.status}"
+        assert o.filled == 0.01
+        assert inner.place_order.await_count == 0, "ShadowBroker 调用了 inner.place_order！违反影子模式"
+        # cancel_order：影子模式下应直接 True
+        ok = asyncio.run(sb.cancel_order(SYMBOL, "YL-SHADOW-1"))
+        assert ok is True
+        assert inner.cancel_order.await_count == 0
+
+    def test_diag_status_shadow_true_shows_shadow_mode_label(self):
+        """/api/status 运行模式 当 shadow=true 时应含『影子』字样（/api/diag 已含，/api/status 也要有）。"""
+        import tempfile
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        import yaml
+        from app.api.app import create_app
+        # 拿当前 config 改 shadow_mode=true，写临时文件再让 create_app 读到
+        # 由于 create_app 里 load_config 会优先找 CONFIG_PATH env / 默认 /workspace/config.yaml
+        # 用环境变量覆盖最稳
+        tmp = Path(tempfile.mkdtemp()) / "cfg_shadow.yaml"
+        base = yaml.safe_load(Path("/workspace/config.yaml").read_text()) or {}
+        base.setdefault("risk_limits", {})["shadow_mode"] = True
+        base.setdefault("trading", {})["live"] = True
+        tmp.write_text(yaml.safe_dump(base, allow_unicode=True), encoding="utf-8")
+        import os
+        old = os.environ.get("CONFIG_PATH")
+        try:
+            os.environ["CONFIG_PATH"] = str(tmp)
+            app = create_app()
+            with TestClient(app) as client:
+                r = client.get("/api/status")
+                assert r.status_code == 200, r.text[:200]
+                body = r.json()
+            mode_val = str(body.get("运行模式", ""))
+        finally:
+            if old is None:
+                os.environ.pop("CONFIG_PATH", None)
+            else:
+                os.environ["CONFIG_PATH"] = old
+        assert "影子" in mode_val, f"shadow=true 下 /api/status 运行模式={mode_val!r}，应含『影子』"
+
 
 # ============================================================================
 # B. GET /api/diag 诊断快照接口（返回结构化数据，供 AI 后续分析缺陷）

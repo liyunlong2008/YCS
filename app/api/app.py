@@ -149,11 +149,24 @@ def create_app(
     """构建 FastAPI 应用。
 
     Args:
-        config_path: 配置文件路径（预留，单测可不传）
+        config_path: 配置文件路径。None 时按 app.core.config.default_config_path 规则解析：
+            1) $CONFIG_PATH env > 2) <项目根>/config.yaml。
         runtime: 可选预填充 runtime 字典（单测 / 离线调用使用）
         on_startup: 可选启动期同步回调列表（lifespan 启动时调用）
-        on_shutdown: 可选关闭期同步回调列表（lifespan 关闭时调用）
+        on_shutdown: 可选关闭期同步回调列表（lifespan 关闭期调用）
     """
+
+    # ---- 配置加载：优先显式参数 > $CONFIG_PATH env > 项目根默认 ----
+    cfg: Any | None = None
+    try:
+        from ..core.config import load_config  # noqa: PLC0415
+        cfg = load_config(config_path)
+    except FileNotFoundError:
+        cfg = None
+    except Exception as exc:  # noqa: BLE001
+        from loguru import logger  # noqa: PLC0415
+        logger.warning("create_app 加载配置失败：{}（降级为无 config 骨架模式）", exc)
+        cfg = None
 
     @asynccontextmanager
     async def _lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
@@ -190,7 +203,7 @@ def create_app(
     # 全局 runtime：run.py / 测试用例 会注入 controller
     # ------------------------------------------------------------------
     app.state.runtime: dict[str, Any] = {
-        "config": None,
+        "config": cfg,        # create_app 时加载好的 AppConfig（Dashboard 骨架用）
         "broker": None,
         "ai": None,
         "risk": None,
@@ -471,8 +484,44 @@ def create_app(
     # ------------------------------------------------------------------
     @app.get("/api/status", summary="系统总览（运行模式/状态/AI/风控）")
     async def api_status(request: Request) -> dict:
-        ctl = _get_controller(request)
-        return ctl.get_status_dict()
+        ctl = request.app.state.runtime.get("controller")
+        if ctl is not None:
+            return ctl.get_status_dict()
+
+        # 兜底：Controller 尚未初始化（如：仅 create_app 跑骨架、或前端刚打开 Dashboard）。
+        # 仍保证"运行模式"字段可被监控脚本 / 自检读到——这是影子模式判定的关键入口。
+        cfg = request.app.state.runtime.get("config")
+        mode_cn = "纸盘模式"
+        shadow = False
+        if cfg is not None and hasattr(cfg, "trading"):
+            mode_cn = "实盘模式" if bool(getattr(cfg.trading, "live", False)) else "纸盘模式"
+        if cfg is not None and hasattr(cfg, "risk_limits"):
+            shadow = bool(getattr(cfg.risk_limits, "shadow_mode", False))
+        if shadow:
+            mode_cn = f"{mode_cn}(影子 SHADOW)"
+        return {
+            "运行模式": mode_cn,
+            "系统状态": "未初始化（等待 run.py 注入 TradingController）",
+            "启动时间": None,
+            "账户余额总权益": 0.0,
+            "可用保证金": 0.0,
+            "未实现盈亏": 0.0,
+            "累计交易次数": 0,
+            "盈利次数": 0,
+            "亏损次数": 0,
+            "累计收益率(%)": 0,
+            "最近AI判断": {
+                "市场状态": "暂无",
+                "置信度": 0,
+                "理由": "Controller 未初始化",
+                "时间": None,
+            },
+            "风控状态": {
+                "连续亏损次数": 0,
+                "熔断冷却至(秒时间戳)": 0,
+                "是否允许开仓": "否",
+            },
+        }
 
     @app.get("/api/balance", summary="账户余额（USDT）")
     async def api_balance(request: Request) -> dict:

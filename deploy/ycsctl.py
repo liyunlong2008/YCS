@@ -332,6 +332,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     mode_cn = "未知"
     live = False
+    shadow = False  # A7. 影子模式（总开关）
     problems: list[str] = []
     warns: list[str] = []
     oks: list[str] = []
@@ -361,16 +362,24 @@ def cmd_check(args: argparse.Namespace) -> int:
         okx = raw.get("okx") or {}
         ai = raw.get("ai") or {}
         trading = raw.get("trading") or {}
+        risk_limits = raw.get("risk_limits") or {}
         live = bool(trading.get("live", False))
+        shadow = bool(risk_limits.get("shadow_mode", False))
+        # 四态：live × shadow → 纸盘 / 纸盘(影子 SHADOW) / 实盘 / 实盘(影子 SHADOW)
         mode_cn = "实盘" if live else "纸盘"
+        if shadow:
+            mode_cn = f"{mode_cn}(影子 SHADOW)"
 
-        # ---- 2. 安全自检（复用 app.core.safety 模块）----
-        try:
-            sys.path.insert(0, str(PROJECT_ROOT))
-            from app.core.safety import validate_runtime_credentials  # type: ignore
-        except Exception as exc:
-            warns.append(f"无法加载 app.core.safety（{type(exc).__name__}:{exc}），改用轻量占位判定")
-            validate_runtime_credentials = None  # type: ignore
+        # ---- 2. 占位值判定 + 影子模式专属放行
+        def _is_placeholder(s: str) -> bool:
+            s = (s or "").strip()
+            if not s:
+                return True
+            if s.upper().startswith("YOUR_"):
+                return True
+            if s.lower() in {"xxx", "todo", "changeme", "placeholder"}:
+                return True
+            return False
 
         checks = {
             "okx.api_key":    str(okx.get("api_key", "") or ""),
@@ -378,34 +387,65 @@ def cmd_check(args: argparse.Namespace) -> int:
             "okx.passphrase": str(okx.get("passphrase", "") or ""),
             "ai.api_key":     str(ai.get("api_key", "") or ""),
         }
+        placeholder_keys = [n for n, v in checks.items() if _is_placeholder(v)]
 
-        if validate_runtime_credentials is not None:
+        # 影子模式 + live=true：OKX 占位值仅 WARN，不 FATAL（不真发单）
+        if placeholder_keys:
+            # OKX 类占位 → shadow 下都只 WARN
+            okx_placeholders = [n for n in placeholder_keys if n.startswith("okx.")]
+            # AI 类占位 → 任何模式都是 WARN（AI 有离线兜底模型）
+            ai_placeholders = [n for n in placeholder_keys if n.startswith("ai.")]
+
+            if live and not shadow:
+                # 真正实盘：OKX 占位 → FATAL；AI 占位只 WARN
+                if okx_placeholders:
+                    problems.append(
+                        "实盘模式（无影子）下 OKX 密钥仍是占位值，绝不允许真发单："
+                        + ", ".join(okx_placeholders)
+                    )
+                if ai_placeholders:
+                    warns.append(f"[离线兜底可接受] 占位 AI 密钥：{', '.join(ai_placeholders)}")
+            else:
+                # 纸盘 或 影子：所有占位仅 WARN
+                if shadow and okx_placeholders:
+                    warns.append(
+                        "[影子模式 OK · 不会真下] OKX 占位值："
+                        + ", ".join(okx_placeholders)
+                        + "（如需观察真实账户/行情，请填真实只读密钥）"
+                    )
+                elif okx_placeholders:
+                    warns.append(f"[纸盘可接受] 占位：{', '.join(okx_placeholders)}")
+                if ai_placeholders:
+                    warns.append(f"[离线兜底可接受] 占位 AI 密钥：{', '.join(ai_placeholders)}")
+
+        # ---- 可选：尝试用 validate_runtime_credentials 增强（当前 v1 不依赖，兼容保留）----
+        try:
+            sys.path.insert(0, str(PROJECT_ROOT))
+            from app.core.safety import validate_runtime_credentials  # type: ignore
+        except Exception:
+            validate_runtime_credentials = None  # type: ignore
+
+        if validate_runtime_credentials is not None and not shadow and live:
+            # 只有真正"无影子的实盘"才走严格 FATAL 闸门；影子/纸盘 走上面轻量判定
             try:
                 ok_flag = validate_runtime_credentials(
-                    live=live,
+                    live=True,
                     okx_api_key=checks["okx.api_key"],
                     okx_secret=checks["okx.secret"],
                     okx_passphrase=checks["okx.passphrase"],
                     ai_api_key=checks["ai.api_key"],
                 )
-                if ok_flag:
-                    oks.append("安全自检通过（占位值仅纸盘警告）")
+                if ok_flag and not placeholder_keys:
+                    oks.append("安全自检通过（实盘非影子严格模式：无占位）")
             except RuntimeError as exc:
+                # 双重保险：理论上前面占位 FATAL 已进 problems，这里重复捕获也 OK
                 problems.append(f"安全自检拦截（实盘）：{exc}")
-        else:
-            # 轻量回退：只判断 YOUR_ 开头 / 空
-            placeholder_keys = []
-            for name, val in checks.items():
-                s = (val or "").strip()
-                if not s or s.upper().startswith("YOUR_") or s.lower() in {"xxx", "todo", "changeme", "placeholder"}:
-                    if not live and name.startswith("okx."):
-                        warns.append(f"[纸盘可接受] {name}=占位值")
-                    else:
-                        placeholder_keys.append(name)
-            if placeholder_keys:
-                (problems if live else warns).append(
-                    f"以下密钥为占位/空值：{', '.join(placeholder_keys)}"
-                )
+        elif not placeholder_keys:
+            oks.append("密钥自检通过（无占位值）")
+
+        # ---- 影子模式专属提示（强制加一条 OK / 提示行，保证一眼可见）----
+        if shadow:
+            oks.append("影子模式：已开启，下单/撤单会被记录但不会真发到交易所，放心联调")
 
         # ---- 3. 其它依赖检查 ----
         for dep, hint in (
@@ -425,6 +465,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     result_obj = {
         "配置文件": str(cfg_path),
         "运行模式": mode_cn,
+        "影子模式": shadow,
         "结论": "通过" if not problems else "未通过",
         "严重问题": problems,
         "警告": warns,
@@ -440,6 +481,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(header)
         print(f"  配置文件 : {result_obj['配置文件']}")
         print(f"  运行模式 : {result_obj['运行模式']}")
+        if shadow:
+            print(f"  影子开关 : {'✅ 已开启（下单/撤单不真发）'}")
         print(f"  结   论  : {'✅ 通过' if not problems else '❌ 未通过'}")
         for title, items, tag in (
             ("严重问题", problems, "FATAL"),
@@ -453,7 +496,17 @@ def cmd_check(args: argparse.Namespace) -> int:
                 for it in items:
                     print(f"     · {it}")
         print(header)
-        if not problems and not live:
+        if shadow:
+            # 影子专属页脚提示
+            tips = [
+                "🟡【影子模式】当前不会真发任何订单，放心联调 6-12 小时观察：",
+                "   · 日志 grep SHADOW 可核对影子成交序列",
+                "   · Dashboard /api/diag → system.runtime_mode = 实盘模式(影子 SHADOW)",
+                "   · 观察 OK 后：shadow_mode=false 即可切真做实盘（别忘了再跑一次 ycs check）",
+            ]
+            for t in tips:
+                print("  " + t)
+        elif not problems and not live:
             print("  💡 纸盘模式：占位密钥不会阻止启动；如需实盘，请填入真实凭证并切换 live=true。")
         elif problems and live:
             print("  💡 实盘模式：请修正以上 FATAL 项后再次执行 `ycsctl check` 验证。", file=_sys.stderr)

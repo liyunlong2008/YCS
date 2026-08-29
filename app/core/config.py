@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 from typing import Literal, Optional, Tuple
@@ -64,11 +65,23 @@ class AppConfig(BaseModel):
     risk_limits: RiskLimits = Field(default_factory=RiskLimits)
 
 
-def load_config(config_path: str | Path) -> AppConfig:
+def default_config_path() -> Path:
+    """返回默认 config.yaml 绝对路径（允许 $CONFIG_PATH 环境变量覆盖）。
+
+    优先级：
+      1. 显式参数 > 2. $CONFIG_PATH > 3. <项目根>/config.yaml
+    """
+    env_v = os.environ.get("CONFIG_PATH")
+    if env_v:
+        return Path(env_v).resolve()
+    return (Path(__file__).resolve().parent.parent.parent / "config.yaml").resolve()
+
+
+def load_config(config_path: str | Path | None = None) -> AppConfig:
     """从 YAML 文件加载并校验配置。
 
     Args:
-        config_path: config.yaml 路径。
+        config_path: config.yaml 路径。None 时按 default_config_path() 规则解析。
 
     Returns:
         校验后的 AppConfig 实例。
@@ -77,7 +90,7 @@ def load_config(config_path: str | Path) -> AppConfig:
         FileNotFoundError: 配置文件不存在。
         ValidationError: 配置字段缺失或非法。
     """
-    path = Path(config_path)
+    path = Path(config_path) if config_path else default_config_path()
     if not path.exists():
         raise FileNotFoundError(f"配置文件不存在: {path}")
 

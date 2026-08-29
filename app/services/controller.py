@@ -125,11 +125,15 @@ class TradingController:
         except ValueError:
             sys_status = SystemStatus.STOPPED
         mode = self.config.trading.mode
+        # A7. 影子模式后缀：与 /api/diag runtime_mode 保持一致的中文心智
+        mode_cn = _ZH_RUN_MODE.get(mode, str(mode))
+        if bool(getattr(self.config.risk_limits, "shadow_mode", False)):
+            mode_cn = f"{mode_cn}(影子 SHADOW)"
         ai_block = self._last_ai_block()
         stats = st.get("stats") or {}
 
         return {
-            "运行模式": _ZH_RUN_MODE.get(mode, str(mode)),
+            "运行模式": mode_cn,
             "系统状态": _ZH_SYSTEM_STATUS.get(sys_status, str(status_raw)),
             "启动时间": st.get("started_at") or None,
             "账户余额总权益": st.get("balance", {}).get("total", 0.0),
