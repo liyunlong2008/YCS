@@ -63,15 +63,69 @@ def test_cli_version_prints_semver():
 
 
 # ---------------------------------------------------------------------------
-# RED 3：check 子命令（基于项目根 config.yaml 默认占位 + live=false → 通过，无 exit≠0）
+# RED 3：check 子命令（隔离临时 config：live=false + 全占位 → check 仅 WARNING，exit=0）
 # ---------------------------------------------------------------------------
-def test_cli_check_paper_with_placeholders_is_warn_ok():
-    """默认 config.yaml live=false，OKX/AI 都是占位 → check 仅 WARNING，exit=0"""
-    r = run("check")
-    assert r.returncode == 0, f"预期 exit=0 实际={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+def test_cli_check_paper_with_placeholders_is_warn_ok(tmp_path: Path):
+    """写一份 live=false、OKX/AI 全占位的 config.yaml（tmp_path 隔离）→ check 仅 WARNING，exit=0
+       并且输出里有『纸盘/PAPER/paper』字样。
+
+       ⚠️ 注：不能再依赖项目根 config.yaml 默认占位模板——服务器 / 本地真实 config 可能已被用户
+            改成 live=true+shadow_mode=true，断言就会误报 FAIL（VPS 上真实复现过）。
+    """
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "okx:\n"
+        "  api_key: YOUR_OKX_API_KEY\n"
+        "  secret: YOUR_OKX_API_SECRET\n"
+        "  passphrase: YOUR_OKX_PASSPHRASE\n"
+        "  sandbox: false\n"
+        "  options: { defaultType: swap, recvWindow: 10000 }\n"
+        "ai:\n"
+        "  provider: deepseek\n"
+        "  api_key: YOUR_AI_API_KEY\n"
+        "  model: deepseek-chat\n"
+        "  base_url: ''\n"
+        "trading:\n"
+        "  live: false\n"
+        "  symbol: ETH-USDT-SWAP\n"
+        "  leverage: 5\n"
+        "  base_order_usdt: 1.0\n"
+        "  safety_order_usdt: 1.0\n"
+        "  max_safety_orders: 3\n"
+        "  price_deviation_pct: 0.3\n"
+        "  tp_pct: 1.0\n"
+        "  sl_pct: 2.0\n"
+        "risk_limits:\n"
+        "  live_max_equity_usdt: 15.0\n"
+        "  live_max_daily_loss_usdt: 3.0\n"
+        "  live_max_single_order_usdt: 2.0\n"
+        "  max_position_notional_usdt: 12.0\n"
+        "  kill_switch_token: YOUR_KILL_SWITCH_TOKEN_32CHARS_RANDOM\n"
+        "  kill_panic_flatten: true\n"
+        "  kill_http_timeout_s: 3\n"
+        "  emergency_halt_file: data/EMERGENCY_HALT\n"
+        "  shadow_mode: false\n"
+        "server:\n"
+        "  host: 127.0.0.1\n"
+        "  port: 8000\n"
+        "  ui_port: 8080\n"
+        "logging:\n"
+        "  level: INFO\n"
+        "  file: logs/app.log\n"
+        "storage:\n"
+        "  journal_dir: data/journal\n"
+        "  ledger_file: data/ledger.jsonl\n",
+        encoding="utf-8",
+    )
+    r = run("check", "--config", str(cfg))
+    assert r.returncode == 0, (
+        f"预期 exit=0 实际={r.returncode}\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
     combined = r.stdout + r.stderr
-    # 能看到模式=纸盘，且命中占位警告
-    assert "纸盘" in combined or "PAPER" in combined or "paper" in combined.lower()
+    # 纸盘模式 + 占位警告 两个关键信息（纸盘关键字即可）
+    assert "纸盘" in combined or "PAPER" in combined or "paper" in combined.lower(), (
+        f"live=false+占位 时应输出『纸盘/PAPER/paper』关键字，但输出前 600 字为：\n{combined[:600]}"
+    )
 
 
 def test_cli_check_live_with_placeholders_exits_nonzero(tmp_path: Path):
