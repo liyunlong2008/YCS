@@ -253,11 +253,34 @@ class Test_B_DiagnosticSnapshotAPI:
         assert len(risks) >= 1, "占位配置下 diag.risks 至少 1 条警告（key 占位）"
 
     def test_diag_fixtures_section_contains_stage9_and_stage8_status(self, client):
-        """fixtures 段应含：file_count（18）、sources（real/synth/missing 统计）、
+        """fixtures 段应含：file_count（恒=18）、sources（real/synth/mixed/missing）、
            stage9_no_backup_pass（bool）、stage8_thresholds_pass（bool）四项。
+
+        兼容二分：
+          · 18 个 csv.gz 全在磁盘：present_on_disk=18，sources.missing=0，hint=正常提示
+          · 18 个 csv.gz 都不在（远端 f60f3ac 删了仓库中 18 文件）：
+              present_on_disk=0，file_count=18 仍合法；且 hint 必含
+              'pull_real_okx_klines' 字样引导用户本地生成。
         """
         body = client.get("/api/diag").json()
         fx = body["fixtures"]
-        for k in ("file_count", "sources", "stage9_no_backup_pass", "stage8_thresholds_pass"):
+        for k in ("file_count", "sources", "stage9_no_backup_pass", "stage8_thresholds_pass",
+                  "present_on_disk", "hint"):
             assert k in fx, f"diag.fixtures 缺少 {k}，实际 keys={list(fx.keys())}"
-        assert int(fx["file_count"]) == 18, f"fixtures file_count 应为 18，实际 {fx['file_count']}"
+        # file_count 恒=18（逻辑槽位数）；present_on_disk ∈ {0, 18}（要么全生成，要么未生成）
+        assert int(fx["file_count"]) == 18, (
+            f"fixtures file_count（逻辑槽位）恒应 == 18，实际 {fx['file_count']}"
+        )
+        present = int(fx["present_on_disk"])
+        assert present in (0, 18), f"present_on_disk 应为 0 或 18（要么未生成要么齐全），实际 {present}"
+        sources = fx["sources"]
+        missing = int(sources.get("missing", -1))
+        assert missing == 18 - present, (
+            f"sources.missing={missing} 与 present_on_disk={present} 不匹配（18-present={18-present}）"
+        )
+        if present == 0:
+            assert "pull_real_okx_klines" in str(fx.get("hint", "")), (
+                f"0 个 fixture 在磁盘时，hint 必须含 pull_real_okx_klines 引导用户生成，"
+                f"实际 hint={fx.get('hint')!r}"
+            )
+

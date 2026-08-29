@@ -192,19 +192,34 @@ class Test_3_ProjectRootResolve:
 # ============================================================================
 class Test_4_FixtureSourcesPerFile:
     def test_diag_fixtures_sources_sum_matches_file_count(self):
-        """sources.values().sum() 必须 == file_count（逐文件分类的直接信号）。
-           若仍只是抽样 3，sum=3 ≠ file_count=18 → fail。"""
+        """sources.values().sum() 必须 == fixtures.file_count（逐文件分类槽位数恒=18 信号）。
+
+        兼容二分：
+          · 18 个 csv.gz 存在：file_count=18，sources 四桶和=18（其中 missing=0）
+          · 18 个 csv.gz 不存在（远端删干净未生成）：file_count=18，sources 四桶和=18
+            （其中 missing=18）——这里 classify_all 恒按 18 个逻辑槽位统计，保证 0=18 不会错。
+        若仍只是抽样 3 场景×1d → sources.sum=3 ≠ 18 → fail。"""
         from fastapi.testclient import TestClient
         from app.api.app import create_app
         app = create_app()
         with TestClient(app) as client:
             fx = client.get("/api/diag").json()["fixtures"]
+        # file_count（逻辑槽位）恒=18
+        slots = int(fx.get("file_count", -1))
         total = sum(int(v) for v in fx.get("sources", {}).values())
-        assert total == int(fx.get("file_count", -1)), (
-            f"sources 总和 {total} ≠ file_count {fx.get('file_count')}。"
-            " 当前应按 18 个 fixture 文件各自归类（不能只抽样 3 个场景 ×1 次），"
-            " 以便准确判断用户机器上究竟多少还是旧 synthetic/多少真实 OKX。"
+        assert slots == 18, f"file_count（逻辑槽位 18）= {slots}，应恒=18"
+        assert total == slots, (
+            f"sources 总和 {total} ≠ file_count(逻辑槽位) {slots}。"
+            " 当前应按 18 个 fixture 槽位各自归类（缺的算 missing，不要只抽样 3 个场景），"
+            " 以便准确判断用户机器上究竟多少还是旧 synthetic/多少真实 OKX/多少未生成。"
         )
+        # 额外：若磁盘有 present_on_disk 个文件，应与 (18 - sources.missing) 对齐
+        if "present_on_disk" in fx:
+            present = int(fx["present_on_disk"])
+            missing = int(fx["sources"].get("missing", 0))
+            assert present + missing == slots, (
+                f"present_on_disk({present}) + missing({missing}) != slots({slots})"
+            )
 
 
 # ============================================================================

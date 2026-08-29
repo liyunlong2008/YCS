@@ -112,10 +112,18 @@ def classify_single_fixture_file(
 def classify_all_fixture_files(
     root: Path | None = None,
 ) -> dict[FIXTURE_SOURCE_LITERAL, int]:
-    """逐文件分类 fixtures 目录下全部 3×6=18 个 CSV.GZ。返回 dict[str, int]；
-       key ∈ {real_okx, synthetic_gbm, mixed, missing}；sum(values) 恒 == 18。
-       缺文件算到 missing；多的"不知名"csv.gz 不计入 18（但单独记录到 extra，
-       这里 API 简化：只输出四个分类 bucket）。
+    """逐文件分类 fixtures 目录下全部 3×6=18 个 CSV.GZ（逻辑全量）。
+
+    返回 dict[str, int]；key ∈ {real_okx, synthetic_gbm, mixed, missing}。
+    sum(values) 恒 == EXPECTED_FIXTURE_COUNT == 18。
+
+    v2 语义说明：
+      · 即使远端 f60f3ac 把 18 个 csv.gz 从仓库删除（git 已追踪 = 0 个文件在磁盘），
+        这里 missing=n 仍计入总和，保证 classify_all 的"18 个逻辑槽位"不变。
+      · 下游 /api/diag 用的『实际磁盘文件数』是 file_count（= 18 - missing），
+        sources_sum(=18) 只用来做"逻辑完整性"检查（恒等于 18 说明 3×6 全覆盖）。
+      · 如需『仅统计存在文件的 sources 桶（sum=file_count）』，调用方自行用
+        不含 missing 键的 3 个桶相加即可。
     """
     root = Path(root) if root else DEFAULT_ROOT
     stats: dict[FIXTURE_SOURCE_LITERAL, int] = {
@@ -130,6 +138,17 @@ def classify_all_fixture_files(
             cls = classify_single_fixture_file(p, scene=scene, timeframe=tf)
             stats[cls] += 1
     return stats
+
+
+def count_fixture_files_on_disk(root: Path | None = None) -> int:
+    """仅统计 root 目录下实际存在的 18 个 fixture 文件数（不含不知名 csv.gz）。"""
+    root = Path(root) if root else DEFAULT_ROOT
+    total = 0
+    for scene in ALL_SCENES:
+        for tf in ALL_TIMEFRAMES:
+            if (root / fixture_filename(scene, tf)).is_file():
+                total += 1
+    return total
 
 
 TF_SECONDS_MS = {
