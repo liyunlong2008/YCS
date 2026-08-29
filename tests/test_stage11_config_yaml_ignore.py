@@ -15,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path("/workspace")
+# 项目根：按当前测试文件所在目录向上两级（tests/*.py → parent.parent = 项目根）
+# 不再硬编码 /workspace：兼容 VPS /opt/ycs、本地 Windows、容器任意 INSTALL_DIR
+REPO = Path(__file__).resolve().parent.parent
 
 
 # ============================================================================

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""tests/conftest.py —— 最小配置：仅把 /workspace 注入 sys.path。
+"""tests/conftest.py —— 最小配置：仅把项目根目录（tests/ 的父目录）注入 sys.path。
 
 说明：
   2026-08-29 用户明确「历史数据+pytest 多余，抓紧上实盘」。

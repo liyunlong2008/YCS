@@ -19,7 +19,9 @@ from types import SimpleNamespace
 
 import pytest
 
-REPO = Path("/workspace")
+# 项目根：按当前测试文件位置推导（tests/*.py → parent.parent = 项目根）
+# 不再硬编码 /workspace：兼容 VPS /opt/ycs、本地 Windows、容器任意 INSTALL_DIR
+REPO = Path(__file__).resolve().parent.parent
 
 
 # ============================================================================
@@ -133,7 +135,7 @@ class Test_2_PaperBrokerPureLocal:
 # ============================================================================
 class Test_3_ProjectRootResolve:
     def test_project_root_from_api_app_equals_repo(self):
-        """api/app.py 里 project_root（不管当前用 parent*几次）最终要等于 /workspace。"""
+        """api/app.py 里 project_root（不管当前用 parent*几次）最终要等于项目根 REPO（由 test 所在位置动态推导，不再硬编码 /workspace）。"""
         sys.path.insert(0, str(REPO))
         # 直接 import 实现里辅助函数
         from app.api import app as api_app_mod

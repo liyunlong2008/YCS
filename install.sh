@@ -299,6 +299,11 @@ if [ "$YCS_SKIP_TEST" -eq 1 ]; then
   log_w "YCS_SKIP_TEST=1 → 跳过 pytest（不推荐）"
 else
   log_i "运行 pytest 风控+诊断冒烟子集…"
+  # 显式 cd 到 $INSTALL_DIR + 把它放到 PYTHONPATH 首位：
+  #   这样测试里 Path(__file__).resolve().parent.parent == REPO 始终成立
+  #   （兼容 VPS /opt/ycs、容器 /app、本地任意目录部署，不再依赖硬编码 /workspace）
+  cd "$INSTALL_DIR"
+  export PYTHONPATH="$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}"
   if uv run pytest "${PYTEST_DEFAULT_TARGETS[@]}" -q --no-header; then
     log_o "pytest 风控/诊断子集全部通过"
   else

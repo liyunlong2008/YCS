@@ -4,12 +4,19 @@ TDD 阶段 10 · 实盘 7 条硬风控 + /api/diag 诊断快照接口（含 ycsc
 """
 from __future__ import annotations
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+# 项目根：按当前测试文件位置推导（tests/*.py → parent.parent = 项目根）
+# 兼容 VPS /opt/ycs、容器 /app、本地 D:\code\vps\YCS 等任意目录，不再硬编码 /workspace
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = REPO / "config.yaml"
 
 
 # ============================================================================
@@ -23,7 +30,7 @@ class Test_A1_EquityCap:
            - live_max_single_order_usdt = 2.0
         """
         import yaml
-        cfg = yaml.safe_load(Path("/workspace/config.yaml").read_text())
+        cfg = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text())
         assert "risk_limits" in cfg, "config.yaml 缺少 risk_limits 段（用户要求按护栏方案补齐）"
         rl = cfg["risk_limits"]
         assert float(rl["live_max_equity_usdt"]) == 15.0, (
@@ -42,7 +49,7 @@ class Test_A1_EquityCap:
     def test_app_config_loads_risk_limits_pydantic(self):
         """AppConfig 必须能解析 risk_limits 段（新增 RiskLimits 模型）。"""
         from app.core.config import load_config
-        cfg = load_config("/workspace/config.yaml")
+        cfg = load_config(str(DEFAULT_CONFIG_PATH))
         assert hasattr(cfg, "risk_limits"), "AppConfig 缺少 risk_limits 字段"
         rl = cfg.risk_limits
         assert float(rl.live_max_equity_usdt) == 15.0
@@ -60,7 +67,7 @@ class Test_A2_DailyLossHalt:
         """
         from app.core.config import load_config
         from app.risk.engine import RiskEngine
-        cfg = load_config("/workspace/config.yaml")
+        cfg = load_config(str(DEFAULT_CONFIG_PATH))
         re = RiskEngine()
         re.daily_start_balance = 14.8
         ok, reason = re.check_absolute_daily_loss(
@@ -146,9 +153,39 @@ class Test_A4_PositionReconciliation:
 # ============================================================================
 class Test_A5_KillSwitchThreeChannels:
     def test_ycsctl_has_kill_subcommand(self):
-        """ycsctl --help 应出现 'kill' 子命令。"""
-        r = os.popen("cd /workspace && uv run python deploy/ycsctl.py --help 2>&1 | grep -E '^  kill|kill.*紧急'").read()
-        assert "kill" in r.strip(), f"ycsctl 缺少 kill 子命令，grep 结果={r!r}"
+        """ycsctl --help 应出现 'kill' 子命令（与 cwd / 项目绝对路径解耦，subprocess 内直接按当前 pytest 运行的 Python + 项目根定位 deploy/ycsctl.py）。"""
+        script = REPO / "deploy" / "ycsctl.py"
+        assert script.is_file(), f"缺失 deploy/ycsctl.py：{script}"
+        # PYTHONPATH 显式把 REPO 放到首位：uv editable 安装下本来就可导入，但在 VPS / 容器纯复制场景
+        # （没有 pyproject.toml editable 效果时）也能 import app / deploy 包
+        env = os.environ.copy()
+        pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(REPO) + (os.pathsep + pp if pp else "")
+        r = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert r.returncode == 0, f"ycsctl --help 非零退出：rc={r.returncode}\n{r.stderr[:600]}"
+        combined = r.stdout + "\n" + r.stderr
+        # 三种命中方式：子命令表 `  kill` 开头 / 中文『紧急停机+全平』/『Kill-Switch』
+        lines = combined.splitlines()
+        matched = False
+        for ln in lines:
+            stripped = ln.lstrip()
+            if stripped.startswith("kill"):
+                matched = True
+                break
+            if "紧急" in ln or "停机+全平" in ln or "Kill-Switch" in ln or "kill" in ln.lower():
+                matched = True
+                break
+        assert matched, (
+            f"ycsctl --help 输出中找不到 kill 子命令（ycsctl 缺少 kill 子命令）。"
+            f"grep 等价结果：\n{combined[:800]}"
+        )
 
     def test_api_app_exposes_kill_and_diag_routes(self):
         """FastAPI create_app() 返回的 app 路由表中应存在 /api/kill 和 /api/diag。"""
@@ -159,7 +196,7 @@ class Test_A5_KillSwitchThreeChannels:
         assert "/api/diag" in paths, "缺少 GET /api/diag 诊断快照接口"
 
     def test_emergency_halt_file_function_exists(self):
-        """app.core.safety 应提供 check_emergency_halt_file(rt_path='/workspace/data/EMERGENCY_HALT')。
+        """app.core.safety 应提供 check_emergency_halt_file(rt_path=<项目根>/data/EMERGENCY_HALT)。
            存在文件 → 返回 (True, reason)；不存在 → (False, '')。
         """
         from app.core.safety import check_emergency_halt_file
@@ -195,7 +232,7 @@ class Test_A7_ShadowMode:
     def test_risk_limits_shadow_mode_reads_from_config(self):
         """AppConfig.risk_limits.shadow_mode=False 默认存在。"""
         from app.core.config import load_config
-        cfg = load_config("/workspace/config.yaml")
+        cfg = load_config(str(DEFAULT_CONFIG_PATH))
         assert isinstance(cfg.risk_limits.shadow_mode, bool)
 
     def test_safety_has_shadow_gate_function(self):
@@ -304,10 +341,10 @@ class Test_A7_ShadowMode:
         import yaml
         from app.api.app import create_app
         # 拿当前 config 改 shadow_mode=true，写临时文件再让 create_app 读到
-        # 由于 create_app 里 load_config 会优先找 CONFIG_PATH env / 默认 /workspace/config.yaml
+        # 由于 create_app 里 load_config 会优先找 CONFIG_PATH env / 默认 project_root/config.yaml
         # 用环境变量覆盖最稳
         tmp = Path(tempfile.mkdtemp()) / "cfg_shadow.yaml"
-        base = yaml.safe_load(Path("/workspace/config.yaml").read_text()) or {}
+        base = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text()) or {}
         base.setdefault("risk_limits", {})["shadow_mode"] = True
         base.setdefault("trading", {})["live"] = True
         tmp.write_text(yaml.safe_dump(base, allow_unicode=True), encoding="utf-8")
