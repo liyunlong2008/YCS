@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 import yaml
 from pydantic import BaseModel, Field
@@ -84,3 +85,40 @@ def load_config(config_path: str | Path) -> AppConfig:
         raw = yaml.safe_load(f) or {}
 
     return AppConfig.model_validate(raw)
+
+
+def ensure_config_file(config_path: str | Path) -> Tuple[Path, bool]:
+    """确保目标 config.yaml 存在；不存在时从同目录 config.yaml.example 复制一份。
+
+    与 deploy/ycsctl._ensure_config_from_example 语义一致（单一事实来源是 .example 模板）。
+
+    Args:
+        config_path: 期望的 config.yaml 路径。
+
+    Returns:
+        (resolved_path, created)
+        - created=True  本函数刚从 example 复制成功（首次初始化）
+        - created=False 已存在（不覆盖用户真实密钥）
+    """
+    path = Path(config_path)
+    if path.is_file():
+        return path.resolve(), False
+    example = path.with_name(path.name + ".example")
+    if not example.is_file():
+        # 兜底：项目根的 .example（调用方传了非标准文件名 / 子目录时生效）
+        root_example = path.parent / "config.yaml.example"
+        if root_example.is_file() and example.resolve() != root_example.resolve():
+            example = root_example
+        else:
+            return path.resolve(), False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(example, path)
+        # 含密钥文件：最小权限（600）
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except OSError:
+        return path.resolve(), False
+    return path.resolve(), True

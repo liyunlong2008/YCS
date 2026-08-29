@@ -1,15 +1,20 @@
 # =============================================================================
-# 云龙挑战赛（YCS）配置文件
-# 仅保存密钥与运行模式，其它参数写入代码常量
+# 云龙挑战赛（YCS）配置模板 · config.yaml.example
+# 使用：cp config.yaml.example config.yaml 后再修改 config.yaml
+#
+# 注意：
+#   · config.yaml 已加入 .gitignore，不会提交到仓库（避免 OKX / AI 密钥泄露）
+#   · install.sh / ycsctl check 缺失 config.yaml 时会自动 cp 本模板生成一份
+#   · 所有占位值（YOUR_XXX）用于本地纸盘观察，实盘前必须替换成真实凭证
 # =============================================================================
 
-# OKX API 凭证
+# OKX API 凭证（实盘必填；纸盘模式可保持占位）
 okx:
   api_key: "YOUR_OKX_API_KEY"
   secret: "YOUR_OKX_API_SECRET"
   passphrase: "YOUR_OKX_PASSPHRASE"
 
-# AI 提供商配置（通过 LiteLLM 统一接入）
+# AI 提供商配置（通过 LiteLLM 统一接入；纸盘无网络时自动降级为离线兜底模型）
 ai:
   provider: "deepseek"        # deepseek / openai / claude / gemini / openrouter
   api_key: "YOUR_AI_API_KEY"

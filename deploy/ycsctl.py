@@ -24,12 +24,14 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 # ---- 常量（单一事实来源）----
 __version__ = "1.0.0"
 UNIT_NAME = "ycs"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+DEFAULT_EXAMPLE_CONFIG_PATH = PROJECT_ROOT / "config.yaml.example"
 INSTALL_SCRIPT = PROJECT_ROOT / "deploy" / "install_systemd.sh"
 APP_NAME_CN = "云龙挑战赛（YCS）"
 
@@ -52,6 +54,36 @@ def _journalctl(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["journalctl", "-u", UNIT_NAME, *args], capture_output=False,
     )
+
+
+def _ensure_config_from_example(cfg_path: Path) -> bool:
+    """若 cfg_path（一般 config.yaml）不存在，自动从同目录的 config.yaml.example 复制。
+
+    返回：
+        True  本函数刚创建（从 example 复制成功）
+        False 已存在（不覆盖），或 example 也不存在 / 复制失败
+    """
+    if cfg_path.is_file():
+        return False
+    example = cfg_path.with_name(cfg_path.name + ".example")
+    if not example.is_file():
+        # 兜底：如果不是 config.yaml 名字，也尝试默认 project example 常量
+        fallback = DEFAULT_EXAMPLE_CONFIG_PATH
+        if fallback.is_file():
+            example = fallback
+        else:
+            return False
+    try:
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(example, cfg_path)
+    except Exception:
+        return False
+    # 复制后权限 600（含密钥，最小权限）
+    try:
+        cfg_path.chmod(0o600)
+    except Exception:
+        pass
+    return True
 
 
 def _print_err(msg: str) -> None:
@@ -104,11 +136,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     warns: list[str] = []
     oks: list[str] = []
 
-    # ---- 0. 配置文件存在性 ----
+    # ---- 0. 配置文件存在性：缺失时从 config.yaml.example 自动创建（同 install.sh 行为）----
     if not cfg_path.is_file():
-        problems.append(f"配置文件不存在：{cfg_path}")
-        mode_cn = "未知（无配置）"
-    else:
+        created = _ensure_config_from_example(cfg_path)
+        if created:
+            warns.append(
+                f"未找到 config.yaml → 已自动从同目录 config.yaml.example 复制生成（{cfg_path}）。"
+                " 编辑该文件填入真实 OKX / AI 凭证后再切实盘。"
+            )
+        else:
+            problems.append(f"配置文件不存在且未找到 config.yaml.example 模板：{cfg_path}")
+            mode_cn = "未知（无配置）"
+            # 继续往下输出报告；下面 raw.get 不会读到值
+            raw: dict[str, Any] = {}
+    if cfg_path.is_file():
         # ---- 1. 解析 YAML ----
         try:
             import yaml  # type: ignore

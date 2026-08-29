@@ -190,8 +190,12 @@ fi
 for f in run.py deploy/ycsctl.py deploy/install_systemd.sh; do
   [ -f "$f" ] || die "$INSTALL_DIR 不是合法 YCS 项目根目录（缺少 $f）。请检查 INSTALL_DIR / 仓库内容。"
 done
-[ -f config.yaml ] || log_w "未找到 config.yaml，若仓库已移除该模板需要手动从 README 创建。"
-log_o "项目目录校验通过"
+[ -f config.yaml.example ] || die "缺少 config.yaml.example（仓库模板缺失，项目非法）。"
+if [ ! -f config.yaml ]; then
+  log_i "未找到 config.yaml → 自动 cp config.yaml.example → config.yaml（首次安装，全占位纸盘模式）"
+  cp config.yaml.example config.yaml || die "cp config.yaml.example config.yaml 失败，请手动执行：cp config.yaml.example config.yaml"
+fi
+log_o "项目目录校验通过（config.yaml / config.yaml.example 就绪）"
 
 # ---------------------------------------------------------------------------
 # 7) 依赖：uv + uv sync
