@@ -49,3 +49,21 @@ class AIProvider(ABC):
         注意：AI 永远无权决定开仓 / 平仓 / 止损。
         """
         raise NotImplementedError
+
+
+class OfflineFallbackAIProvider(AIProvider):
+    """离线 / 占位密钥场景下的确定性回退 AI：直接返回「震荡/中性」，零联网零延迟。
+
+    - 用于 VPS/本地无法访问外网、或者 AI 密钥仍是占位值时，避免 LiteLLM 超时拖慢主循环。
+    - 业务侧若使用 fixtures（/api/ai/analyze?fixture=...）会做更精细的离线判定，不依赖它。
+    """
+
+    def __init__(self, reason: str = "OfflineFallbackAI: 未配置可用 AI（占位密钥或离线）") -> None:
+        self._reason = reason
+
+    async def analyze_market(self, market_data: MarketData) -> MarketAnalysisResult:
+        return MarketAnalysisResult(
+            market_regime=MarketRegime.LOW_VOLATILITY,
+            confidence=0,
+            reason=self._reason,
+        )

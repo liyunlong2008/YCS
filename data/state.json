@@ -4,24 +4,27 @@
   "balance": {
     "total": 1000.0,
     "available": 1000.0,
-    "unrealized_pnl": 0.0
+    "unrealized_pnl": 0.0,
+    "currency": "USDT"
   },
   "position": {
-    "symbol": "ETH-USDT-SWAP",
     "side": "FLAT",
     "size": 0.0,
     "entry_price": 0.0,
     "mark_price": 2000.0,
-    "unrealized_pnl": 0.0,
     "leverage": 3,
-    "liquidation_price": 0.0
+    "unrealized_pnl": 0.0
   },
-  "last_ai": null,
+  "last_ai": {
+    "market_regime": "LOW_VOLATILITY",
+    "confidence": 0,
+    "reason": "OfflineFallbackAI: ai.api_key 是占位值（返回保守 LOW_VOLATILITY，不触发交易）",
+    "ts": 1787962170226
+  },
   "risk": {
     "consecutive_losses": 0,
     "cooldown_until_ts": 0,
-    "daily_start_balance": 1000.0,
-    "known_order_ids": []
+    "daily_start_balance": 1000.0
   },
   "stats": {
     "trades_total": 0,
@@ -52,11 +55,11 @@
     ]
   },
   "time_sync": {
-    "server_ms": 1787957871814,
-    "local_ms": 1787957871814,
+    "server_ms": 1787962159649,
+    "local_ms": 1787962159649,
     "drift_ms": 0,
-    "last_sync_at": 1787957871,
+    "last_sync_at": 1787962159,
     "drifted_pause": false
   },
-  "daily_reset_day": "2026-08-28"
+  "daily_reset_day": "2026-08-29"
 }

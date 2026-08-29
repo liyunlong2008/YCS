@@ -140,6 +140,15 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
             trading=TradingConfig(live=False, symbol=SYMBOL),
         )
 
+    # === 注入 state_store 前的小优化：AI 密钥占位时，标记到 cfg 方便 FastAPI /api/ai/analyze 直接跳过联网 ===
+    from app.core.safety import _is_placeholder as __ai_ph
+    __PLACHOLDER_AI = __ai_ph(cfg.ai.api_key)
+    # 用 AppConfig 动态属性暂存（FastAPI 侧优先读 runtime['config'].ai._placeholder_api_key）
+    try:
+        object.__setattr__(cfg.ai, "_placeholder_api_key", bool(__PLACHOLDER_AI))
+    except Exception:
+        pass  # Pydantic 拒绝时不影响主流程
+
     symbol = cfg.trading.symbol
     data_dir = PROJECT_ROOT / "data"
     data_dir.mkdir(parents=True, exist_ok=True)

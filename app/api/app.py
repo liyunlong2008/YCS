@@ -402,9 +402,112 @@ def create_app(
         return ctl.get_recent_trades(limit=limit)
 
     @app.get("/api/ai/analyze", summary="触发一次 AI 市场分析")
-    async def api_ai_analyze(request: Request) -> dict:
-        ctl = _get_controller(request)
-        import asyncio
-        return await ctl.analyze()
+    async def api_ai_analyze(
+        request: Request,
+        fixture: str | None = Query(
+            default=None,
+            description="可选：离线场景名称（trend_up/trend_down/range）→ 使用仓库内 fixtures，无需联网 OKX",
+            pattern="^(trend_up|trend_down|range)$",
+        ),
+    ) -> dict:
+        """支持两种模式：
+          1) 不传 fixture → 调 TradingController.analyze()，使用实时行情或 Broker 快照
+          2) 传 fixture=场景名 → 从离线 K 线 fixtures 加载 ccxt ohlcv 喂给 AIAnalyzer，输出中文判断
+        """
+        if fixture is None:
+            ctl = _get_controller(request)
+            return await ctl.analyze()
+
+        # 离线模式：无需 controller，直接用 AI/Analyzer + fixtures
+        from app.storage.fixtures import load_all_timeframes  # noqa: PLC0415
+        from app.ai.base import MarketAnalysisResult, MarketData  # noqa: PLC0415
+        from app.core.config import AIConfig  # noqa: PLC0415
+        from app.ai.factory import build_ai_provider  # noqa: PLC0415
+        from app.core.constants import MarketRegime  # noqa: PLC0415
+
+        runtime = request.app.state.runtime or {}
+        cfg_obj = runtime.get("config")
+        ai_settings = getattr(cfg_obj, "ai", None) if cfg_obj else None
+        if ai_settings is None:
+            ai_settings = AIConfig(
+                provider="deepseek", api_key="", model="deepseek-chat",
+                base_url="", timeout=10, retries=1,
+            )
+
+        # 找 AI 实例（优先 runtime）或新建
+        provider = runtime.get("ai")
+        # AI 密钥占位判定（优先 runtime.config 已标记 → 实时判定兜底）
+        ai_key_placeholder = bool(getattr(getattr(runtime.get("config"), "ai", None), "_placeholder_api_key", False))
+        if not ai_key_placeholder:
+            from app.core.safety import _is_placeholder as _p  # noqa: PLC0415
+            ai_key_placeholder = _p((ai_settings.api_key or "").strip())
+        if provider is None and not ai_key_placeholder:
+            provider = build_ai_provider(ai_settings)
+
+        klines_by_tf = load_all_timeframes(fixture)  # type: ignore[arg-type]
+        # 用 1h 最末一根 K 线构造 MarketData（最新一根 close 为当前价）
+        last_1h = klines_by_tf["1h"][-1]
+        current = MarketData(
+            symbol="ETH-USDT-SWAP",
+            timestamp=int(last_1h[0]),
+            open=float(last_1h[1]), high=float(last_1h[2]),
+            low=float(last_1h[3]), close=float(last_1h[4]),
+            volume=float(last_1h[5]),
+        )
+        got_exception: Exception | None = None
+        if provider is not None and not ai_key_placeholder:
+            try:
+                result = await provider.analyze_market(current)
+            except Exception as exc:
+                got_exception = exc
+                result = None
+        else:
+            result = None
+
+        if result is None:
+            # ① AI 密钥是占位值 ② LiteLLM 抛错 两种场景 → 走确定性离线回退
+            closes_1d = [float(x[4]) for x in klines_by_tf["1d"]]
+            c0, c1 = closes_1d[0], closes_1d[-1]
+            pct = (c1 - c0) / max(c0, 1e-12)
+            amp = (max(closes_1d) - min(closes_1d)) / max(c0, 1e-12)
+            if pct >= 0.05:
+                regime, conf = MarketRegime.TREND_UP, 72
+                short = f"离线判定：1d 涨幅 {pct*100:.1f}%，趋势做多"
+            elif pct <= -0.05:
+                regime, conf = MarketRegime.TREND_DOWN, 70
+                short = f"离线判定：1d 跌幅 {pct*100:.1f}%，趋势做空"
+            else:
+                regime, conf = MarketRegime.RANGE, 60
+                short = f"离线判定：1d 振幅 {amp*100:.1f}%，震荡观望"
+            if got_exception is not None:
+                short += f"（AI 异常: {type(got_exception).__name__}）"
+            elif ai_key_placeholder:
+                short += "（AI 密钥占位，跳过联网调用）"
+            result = MarketAnalysisResult(
+                market_regime=regime, confidence=conf, reason=short,
+            )
+
+        # 建议方向 / 入场 / 止损 / 止盈（MarketAnalysisResult 现无字段就用规则计算给 Dashboard 展示）
+        regime = result.market_regime
+        px = float(current.close)
+        if regime is MarketRegime.TREND_UP:
+            direction = "LONG"; stop = px * 0.985; take = px * 1.06; entry = px
+        elif regime is MarketRegime.TREND_DOWN:
+            direction = "SHORT"; stop = px * 1.015; take = px * 0.94; entry = px
+        else:
+            direction = "FLAT"; stop = None; take = None; entry = None
+
+        return {
+            "模式": f"离线 fixtures [{fixture}]",
+            "数据条数": {tf: len(v) for tf, v in klines_by_tf.items()},
+            "市场状态": result.market_regime.value,
+            "置信度(%)": int(result.confidence),
+            "建议方向": direction,
+            "入场目标价(USDT)": entry,
+            "止损价(USDT)": stop,
+            "目标止盈价(USDT)": take,
+            "简短理由": (result.reason or "")[:80],
+            "详细": result.reason,
+        }
 
     return app

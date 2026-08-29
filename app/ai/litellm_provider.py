@@ -71,12 +71,23 @@ class LiteLLMProvider(AIProvider):
             ],
             response_format={"type": "json_object"},
             temperature=0.1,
+            timeout=6,    # 单个请求 6s 超时（密钥占位 / 离线时尽快走降级，不阻塞主循环）
+            max_retries=0,  # 0 次重试（默认 5 次会拉长等待）
         )
         if self.base_url:
             kwargs["api_base"] = self.base_url
 
         logger.info("AI 分析请求: model={}", self._llm_model)
-        resp = await acompletion(**kwargs)
+        try:
+            resp = await acompletion(**kwargs)
+        except Exception as exc:
+            # 网络不可达 / 密钥占位 / LiteLLM 抛错 → 保守降级，不影响上层 API
+            logger.warning("LiteLLM 调用失败，降级为 LOW_VOLATILITY 保守判断：{}：{}", type(exc).__name__, exc)
+            return MarketAnalysisResult(
+                market_regime=MarketRegime.LOW_VOLATILITY,
+                confidence=0,
+                reason=f"LiteLLM 调用失败: {type(exc).__name__}",
+            )
         content = resp.choices[0].message.content or "{}"
         logger.info("AI 分析响应: {}", content)
 
