@@ -155,6 +155,7 @@ class AIThrottler:
         take_profit_price: float = 0.0,
         liquidation_price: float = 0.0,
         force: bool = False,
+        position_side: str = "",
     ) -> ThrottleDecision:
         """主入口。
 
@@ -231,7 +232,15 @@ class AIThrottler:
                         level = ThrottleLevel.HOT
                     else:
                         level = ThrottleLevel.LONG_HOLD
-                        reason = "LONG_HOLD 持仓中，本地利润保护足以判定平仓(180s AI 节奏)"
+                        # 2026-08-31 修复 Bug C：根据 position_side 显示多/空方向，不再写死 "LONG_HOLD 持仓中"
+                        _side = str(position_side or "").upper()
+                        if _side in ("LONG", "BUY"):
+                            side_cn = "多单"
+                        elif _side in ("SHORT", "SELL"):
+                            side_cn = "空单"
+                        else:
+                            side_cn = "持仓"
+                        reason = f"持仓中({side_cn})，本地利润保护足以判定平仓(180s AI 节奏)"
                 else:
                     # RUNNING+空仓(最关键盯盘档)
                     level = ThrottleLevel.NORMAL

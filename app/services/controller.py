@@ -156,19 +156,102 @@ class TradingController:
         ))
 
         # AI 节流状态（2026-08-30 新增）：实时算一遍 sentinel/level，把最新 mark 价作为输入让波动%准
-        mark_input = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
+        # 2026-08-31 修复 Bug B+C：
+        #   B) 用 broker.get_position 实时代替 state_store.position 快照（ShadowBroker 虚拟持仓能真正显现）
+        #   C) 把持仓方向 position.side.value 传给 throttler，避免 SHORT 也显示 LONG_HOLD 文案
+        import asyncio as _aio_posctl  # noqa: PLC0415
+        pos_side_str: str = ""
+        pos_has_real: bool = bool(st.get("position") and (st["position"].get("size") or 0) > 0)
+        pos_mark_input = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
+        pos_entry_input = float((st.get("position") or {}).get("entry_price", 0.0) or 0.0)
+        pos_liq_input = float((st.get("position") or {}).get("liquidation_price", 0.0) or 0.0)
+        current_position_block: dict[str, Any] = {
+            "方向": "空仓",
+            "数量": 0.0,
+            "开仓均价": 0.0,
+            "标记价": 0.0,
+            "未实现盈亏": 0.0,
+            "杠杆": 1,
+        }
+        try:
+            _sym = getattr(self.config.trading, "symbol", None) or "ETH-USDT-SWAP"
+            _broker_pos: Position | None = None
+            if hasattr(self, "broker") and self.broker is not None:
+                async def _fetch_pos(broker_ref, sym_ref):
+                    try:
+                        return await broker_ref.get_position(sym_ref)
+                    except Exception:  # noqa: BLE001
+                        return None
+                # 同步 get_status_dict 里调异步 broker.get_position：
+                #   - 无 running loop：直接 asyncio.run（pytest / CLI 最常见）
+                #   - 已有 running loop：先尝试 nest_asyncio.apply() + run_until_complete；
+                #     不行就退回 state_store.position 兜底（绝不遗留未 await 协程警告）
+                try:
+                    _loop = _aio_posctl.get_running_loop()
+                except RuntimeError:
+                    _loop = None
+                if _loop is None:
+                    _coro = _fetch_pos(self.broker, _sym)
+                    try:
+                        _broker_pos = _aio_posctl.run(_coro)
+                    except Exception:  # noqa: BLE001
+                        _broker_pos = None
+                        try:
+                            _coro.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                else:
+                    try:
+                        import nest_asyncio as _nest  # noqa: PLC0415
+                        _nest.apply()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _coro2 = _fetch_pos(self.broker, _sym)
+                    try:
+                        _broker_pos = _loop.run_until_complete(_coro2)
+                    except Exception:  # noqa: BLE001
+                        # 例如 uvloop / 旧 loop 状态不对：走 state_store.position 兜底
+                        _broker_pos = None
+                        try:
+                            _coro2.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+            if _broker_pos is not None:
+                _sz = float(getattr(_broker_pos, "size", 0.0) or 0.0)
+                _side_obj = getattr(_broker_pos, "side", None)
+                _side_raw = getattr(_side_obj, "value", str(_side_obj)) if _side_obj is not None else "FLAT"
+                current_position_block = {
+                    "方向": _ZH_POSITION.get(_side_obj, _ZH_POSITION.get(type(_side_obj), _side_raw)) if _side_obj else _side_raw,
+                    "数量": float(_sz),
+                    "开仓均价": float(getattr(_broker_pos, "entry_price", 0.0) or 0.0),
+                    "标记价": float(getattr(_broker_pos, "mark_price", 0.0) or 0.0),
+                    "未实现盈亏": float(getattr(_broker_pos, "unrealized_pnl", 0.0) or 0.0),
+                    "杠杆": int(getattr(_broker_pos, "leverage", 1) or 1),
+                    "强平价": float(getattr(_broker_pos, "liquidation_price", 0.0) or 0.0),
+                }
+                if _sz > 0 and _side_raw != "FLAT":
+                    pos_has_real = True
+                    pos_side_str = str(_side_raw)
+                    pos_mark_input = float(current_position_block["标记价"] or 0.0)
+                    pos_entry_input = float(current_position_block["开仓均价"] or 0.0)
+                    pos_liq_input = float(current_position_block["强平价"] or 0.0)
+        except Exception:  # noqa: BLE001
+            # 同步 get_running_loop 报错 / broker 还没装配：退回 state_store.position 兜底
+            pass
+
         try:
             _ = self.ai_throttler.should_call_ai(
                 now_ts=now_ts,
                 system_status_running=(sys_status == SystemStatus.RUNNING),
-                has_position=bool(st.get("position") and (st["position"].get("size") or 0) > 0),
+                has_position=pos_has_real,
                 allow_trading=bool(
                     (self.risk.cooldown_until_ts == 0 or now_ts >= self.risk.cooldown_until_ts)
                     and sys_status == SystemStatus.RUNNING
                 ),
-                mark_price=mark_input if mark_input > 0 else 2466.0,
-                entry_price=float((st.get("position") or {}).get("entry_price", 0.0) or 0.0),
-                liquidation_price=float((st.get("position") or {}).get("liquidation_price", 0.0) or 0.0),
+                mark_price=pos_mark_input if pos_mark_input > 0 else 2466.0,
+                entry_price=pos_entry_input,
+                liquidation_price=pos_liq_input,
+                position_side=pos_side_str,  # Bug C：SHORT 场景不再写 "LONG_HOLD 持仓中"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -227,6 +310,16 @@ class TradingController:
                 started_at_epoch = int(_dt_sa.datetime.strptime(raw_sa, "%Y-%m-%d %H:%M:%S").timestamp())
             except Exception:  # noqa: BLE001
                 started_at_epoch = None
+        # 2026-08-31 修复 Bug A：started_at 空兜底写回 StateStore（recoverer/run.py 漏写时，/api/status 首访也能恢复）
+        if started_at_epoch is None:
+            started_at_epoch = int(now_ts)
+            try:
+                if not isinstance(st, dict):
+                    st = {}
+                st["started_at"] = started_at_epoch
+                self.state_store.save(st)
+            except Exception:  # noqa: BLE001
+                pass
         if started_at_epoch is not None:
             try:
                 started_at_local = _dt_sa.datetime.fromtimestamp(started_at_epoch).strftime("%Y-%m-%d %H:%M:%S")
@@ -317,6 +410,11 @@ class TradingController:
                 # 最近一次通过风控+AI双确认→进入下单流程的时间戳；=0 意味着从未准备下单
                 "最近一次交易信号就绪时间戳": int(getattr(self.risk, "last_pass_trade_signal_at", 0) or 0),
             },
+            # 2026-08-31 修复 Bug B：新增『当前持仓』= broker.get_position 实时数据。
+            #   背景：ShadowBroker 虚拟持仓不落 state_store.position，Dashboard SSR/JS 若只
+            #        读 state_store 快照就一直显示空仓；本字段就是 /api/status → JS refresh →
+            #        Dashboard 持仓卡 DOM 刷新的唯一真源。
+            "当前持仓": current_position_block,
         }
 
     def _last_ai_block(self) -> dict[str, Any]:

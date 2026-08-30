@@ -7,6 +7,24 @@ from enum import Enum
 
 
 # ---------------------------------------------------------------------------
+# 便捷 re-export：测试/业务代码都可以从 constants 拿 ThrottleLevel
+# ---------------------------------------------------------------------------
+try:  # 2026-08-31 新增：统一入口，避免 ImportError（原仅 ai_throttle 内定义）
+    from app.core.ai_throttle import ThrottleLevel as _ThrottleLevel  # noqa: F401
+    ThrottleLevel = _ThrottleLevel
+except Exception:  # pragma: no cover
+    class ThrottleLevel(str, Enum):  # type: ignore[no-redef]
+        """兜底占位：保证 import 不崩（实际应该从 ai_throttle 取到真枚举）。"""
+        HOT = "HOT"
+        NORMAL = "NORMAL"
+        LONG_HOLD = "LONG_HOLD"
+        IDLE = "IDLE"
+        DEGRADED = "DEGRADED"
+        SLEEP = "SLEEP"
+        CAPPED = "CAPPED"
+
+
+# ---------------------------------------------------------------------------
 # AI 输出：市场状态
 # ---------------------------------------------------------------------------
 class MarketRegime(str, Enum):

@@ -873,6 +873,39 @@ def create_app(
                 const wr = closed > 0 ? (wins / closed * 100) : 0;
                 setText('k-wr', wr.toFixed(0) + '%');
 
+                // 2026-08-31 修复 Bug B：持仓卡 5s 刷新必须走 /api/status['当前持仓']
+                //   （SSR 启动时确实读了 broker 实时，但若 ShadowBroker 之后开了空仓，
+                //    不刷新 DOM 用户就一直看到「空仓 / 0.000000」——用户现场就是这情况！）
+                const curPos = s['当前持仓'] || {{}};
+                const pSide = String(curPos['方向'] ?? '空仓');
+                const pSize = Number(curPos['数量'] ?? 0);
+                const pEntry = Number(curPos['开仓均价'] ?? 0);
+                const pMark = Number(curPos['标记价'] ?? 0);
+                const pUpl = Number(curPos['未实现盈亏'] ?? 0);
+                const pLev = Number(curPos['杠杆'] ?? 1);
+                setText('k-pos-side', pSide);
+                const elSz = document.getElementById('k-pos-size');
+                if (elSz) elSz.textContent = pSize.toFixed(6);
+                const elPE = document.getElementById('k-pos-price') || document.getElementById('k-pos-entry');
+                if (elPE) elPE.textContent = pEntry.toFixed(2) + ' / ' + pMark.toFixed(2);
+                const elPU = document.getElementById('k-pos-upl');
+                if (elPU) {{
+                  const protectTxt = (elPU.textContent || '').split('·')[1] || '· 未启用';
+                  const uplPrefix = (pUpl >= 0 ? '+' : '') + pUpl.toFixed(2);
+                  elPU.textContent = uplPrefix + protectTxt.replace(/^(\s*·)?/, ' · ');
+                  elPU.classList.remove('loss','win');
+                  elPU.classList.add(pUpl < 0 ? 'loss' : 'win');
+                }}
+                // 把实时持仓同步到 window.__ycsLastFull（如果没有的话），方便风控提示卡拿
+                if (!window.__ycsLastFull) window.__ycsLastFull = {{}};
+                if (!window.__ycsLastFull.position) window.__ycsLastFull.position = {{}};
+                window.__ycsLastFull.position.side = pSide;
+                window.__ycsLastFull.position.size = pSize;
+                window.__ycsLastFull.position.entry_price = pEntry;
+                window.__ycsLastFull.position.mark_price = pMark;
+                window.__ycsLastFull.position.unrealized_pnl = pUpl;
+                window.__ycsLastFull.position.leverage = pLev;
+
                 // 风控提示（2026-08-30 新增：直接显示『为什么不开仓』）
                 // 2026-08-31 修复：若 state.position.size>0（或 state_store 持仓大小>0）→ 显示「已持仓概况」
                 const elRiskTip = document.getElementById('k-risk-tip');
@@ -1327,6 +1360,22 @@ def create_app(
                         started_at = None
             except Exception:
                 state_snapshot = {}
+        # ----------------------------------------------------------------
+        # 2026-08-31 修复 Bug A：started_at 仍 None（典型：recoverer 异常路径 / 旧 config 手改 / PID 新进程没跑到 run.py 兜底）
+        # 这里是 Dashboard / 诊断 最后一道防线——再空就写当前 time.time() 回 StateStore，
+        # 保证 /api/diag 和 Dashboard「启动时间/运行时长」至少是个合理值。
+        # ----------------------------------------------------------------
+        if not (isinstance(started_at, int) and started_at > 0):
+            _fallback_epoch = int(_t.time())
+            started_at = _fallback_epoch
+            if store is not None and hasattr(store, "save"):
+                try:
+                    if not isinstance(state_snapshot, dict):
+                        state_snapshot = {}
+                    state_snapshot["started_at"] = _fallback_epoch
+                    store.save(state_snapshot)
+                except Exception:  # noqa: BLE001
+                    pass
         # uptime: started_at 有值 = now - started_at；否则 None（保持接口向后兼容）
         uptime_seconds = int(_t.time() - started_at) if isinstance(started_at, int) and started_at > 0 else None
         # 防御：时区时钟漂移 / 测试虚构未来时间 时避免负数显示（避免 -17000s 这种荒谬值）

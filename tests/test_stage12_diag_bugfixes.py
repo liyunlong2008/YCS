@@ -260,3 +260,311 @@ class Test_6_PlaceholderCountOnFallbacks:
         assert int(s["ai_placeholder_key_count"]) == 1, (
             f"ai.api_key 空串应算占位，实际 {s['ai_placeholder_key_count']}"
         )
+
+
+# ============================================================================
+# Test_7_20260831DashboardBugs（用户现场贴回 Dashboard + /api/diag 发现 4 个一致性 Bug）
+#
+# Bug A：started_at = None 即使是新 PID（VPS PID=82613 启动后 5m29s 仍然 null）
+#         → 要求：create_app 后 lifespan 写 started_at；或 get_status_dict 兜底
+#              且 /api/diag.system.started_at 返回 int epoch（非 None）
+# Bug B：Dashboard 截图持仓卡显示 空仓/0.00，但真实 ShadowBroker 是 SHORT 0.1
+#         → 要求：get_status_dict 返回 『当前持仓』键，且值是 broker.get_position 实
+#              时快照（不是 state_store 里老 position），/api/status 也含该字段
+# Bug C：AI 节流级别原因写死 "LONG_HOLD 持仓中..."，现在是 SHORT 也 LONG_HOLD
+#         → 要求：ThrottleLevel 增加 SHORT_HOLD 或通用 HOLD；
+#              或当持 SHORT 空仓时 reason 显示 "SHORT_HOLD 空单持仓中..."
+# Bug D：ShadowBroker SHORT 空单 2466 开，eth 真实价格变了但 mark_price=2466
+#         → 要求：ShadowBroker.get_position 的 mark_price，当 inner.get_position
+#              的 mark_price=0（真实空仓）时，从最近一次 ticker / 订单成交记录
+#              （或至少 fetch_market_spec 的缓存 entry 兜底区分出 "估算"）
+# ============================================================================
+class Test_7_DashboardConsistencyAfterAug31Fixes:
+    # ------------------------------------------------------------------
+    # Bug A: started_at epoch 绝不能 None（即使 recoverer 漏写也要兜底）
+    # ------------------------------------------------------------------
+    def test_diag_started_at_is_non_null_int_epoch_after_lifespan_start(self, tmp_path):
+        """模拟 bootstrap 写入 started_at → /api/diag 必须返回 int epoch + uptime_s 非负。
+        用户 VPS PID=82613 已经跑了 5m29s 仍然 started_at=null，这是 Dashboard 启动时间/运行时长展示的根问题。"""
+        from fastapi.testclient import TestClient
+        from app.api.app import create_app
+        from app.storage.state_store import StateStore
+        from app.core.config import AppConfig, OKXConfig, AIConfig, TradingConfig
+        from app.broker.paper import PaperBroker
+        import time as _t
+
+        # 建一个 StateStore（写入合法 started_at=epoch 秒）
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        ss = StateStore(data_dir)
+        st = ss.load()
+        fake_epoch = int(_t.time()) - 329  # 跑了 5m29s
+        st["started_at"] = fake_epoch
+        ss.save(st)
+
+        app = create_app()
+        cfg = AppConfig(
+            okx=OKXConfig(api_key="", secret="", passphrase=""),
+            ai=AIConfig(provider="deepseek", api_key=""),
+            trading=TradingConfig(live=False, symbol="ETH-USDT-SWAP"),
+        )
+        broker = PaperBroker(symbol="ETH-USDT-SWAP", initial_balance=100.0)
+        app.state.runtime.update({
+            "config": cfg,
+            "state_store": ss,
+            "broker": broker,
+            "data_dir": data_dir,
+        })
+        with TestClient(app) as client:
+            diag = client.get("/api/diag").json()
+        sys = diag["system"]
+        # 硬性要求：started_at 必须是正 int（不能 null）
+        assert isinstance(sys.get("started_at"), int) and int(sys["started_at"]) > 0, (
+            f"started_at={sys.get('started_at')!r}，期望 int epoch（启动 5m 仍 null 是致命 Bug）"
+        )
+        # uptime_seconds 必须 >= 329s（不要负）
+        up = int(sys.get("uptime_seconds") or 0)
+        assert up >= 300, (
+            f"uptime_seconds={up} < 300，started_at epoch ({sys.get('started_at')}) 或计算有问题"
+        )
+        assert isinstance(sys.get("started_at_local"), str) and len(sys["started_at_local"]) >= 10, (
+            f"started_at_local={sys.get('started_at_local')!r}，期望 YYYY-MM-DD HH:MM:SS"
+        )
+        assert isinstance(sys.get("uptime_human"), str) and sys["uptime_human"], (
+            f"uptime_human={sys.get('uptime_human')!r} 不能空或 null"
+        )
+
+    def test_started_at_null_bootstrap_sets_current_epoch(self, tmp_path):
+        """若 state_store.started_at=None（新 VPS 第一次启动）→ /api/diag 返回 int，
+        必须是当前时间附近，不要 null。"""
+        from fastapi.testclient import TestClient
+        from app.api.app import create_app
+        from app.storage.state_store import StateStore
+        from app.core.config import AppConfig, OKXConfig, AIConfig, TradingConfig
+        from app.broker.paper import PaperBroker
+        import time as _t
+
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        ss = StateStore(data_dir)
+        app = create_app()
+        cfg = AppConfig(
+            okx=OKXConfig(api_key="", secret="", passphrase=""),
+            ai=AIConfig(provider="deepseek", api_key=""),
+            trading=TradingConfig(live=False, symbol="ETH-USDT-SWAP"),
+        )
+        broker = PaperBroker(symbol="ETH-USDT-SWAP", initial_balance=100.0)
+        app.state.runtime.update({
+            "config": cfg, "state_store": ss, "broker": broker, "data_dir": data_dir,
+        })
+        before = int(_t.time())
+        with TestClient(app) as client:
+            after = int(_t.time())
+            diag = client.get("/api/diag").json()
+        sa = diag["system"].get("started_at")
+        assert isinstance(sa, int) and before - 2 <= int(sa) <= after + 2, (
+            f"冷启动 started_at={sa!r} 不在当前时间附近 [{before},{after}]（必须兜底不要 null）"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug B：/api/status & /api/diag 中「持仓」与 broker.get_position 一致
+    # ------------------------------------------------------------------
+    def test_api_status_returns_realtime_position_from_shadow_short_01(self, tmp_path):
+        """/api/status 必须包含 ShadowBroker 实时 SHORT 0.1 空单（不是 state_store 空快照）。
+        用户现场：/api/diag broker.position.side=SHORT size=0.1，但 Dashboard 持仓卡=空仓/0.000000
+        说明 Dashboard 的 SSR / JS refresh 都走的 stale 源。
+        要求：ctl.get_status_dict() 返回 『当前持仓』dict，side==SHORT/size==0.1 与 broker 一致。"""
+        from app.broker.shadow import ShadowBroker
+        from app.broker.paper import PaperBroker
+        from app.core.constants import OrderSide, OrderType
+        from app.risk.engine import RiskEngine
+        from app.storage.state_store import StateStore
+        from app.storage.trade_journal import TradeJournal
+        from app.ai.factory import build_ai_provider
+        from app.core.config import AppConfig, OKXConfig, AIConfig, TradingConfig, RiskLimits
+        from app.services.controller import TradingController
+        from app.exchange.market import MarketDataProducer
+        from app.ai.base import MarketAnalysisResult
+        from app.core.constants import MarketRegime
+
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cfg = AppConfig(
+            okx=OKXConfig(api_key="", secret="", passphrase=""),
+            ai=AIConfig(provider="deepseek", api_key="dummy", model="deepseek-chat"),
+            trading=TradingConfig(live=True, symbol="ETH-USDT-SWAP", default_leverage=10),
+            risk_limits=RiskLimits(shadow_mode=True),
+        )
+        ss = StateStore(data_dir)
+        journal = TradeJournal(data_dir)
+        risk = RiskEngine()
+        inner = PaperBroker(symbol="ETH-USDT-SWAP", initial_balance=14.83)
+        broker = ShadowBroker(inner=inner, symbol="ETH-USDT-SWAP")
+        ai = build_ai_provider(cfg.ai)
+        mp = MarketDataProducer(okx=cfg.okx, symbol=cfg.trading.symbol)
+        ctl = TradingController(
+            config=cfg, broker=broker, ai=ai, risk=risk,
+            state_store=ss, journal=journal, market_producer=mp,
+        )
+        import asyncio as _aio
+        # 1) 先 SHORT 开仓（影子模式）
+        async def _open():
+            await broker.set_leverage("ETH-USDT-SWAP", 10)
+            return await broker.place_order(
+                symbol="ETH-USDT-SWAP", side=OrderSide.SELL, type=OrderType.LIMIT,
+                amount=0.1, price=2466.0, client_order_id="T-SHADOW-SHORT-001",
+            )
+        _aio.run(_open())
+        # 2) 再拿 broker position 实锤
+        async def _pos():
+            return await broker.get_position("ETH-USDT-SWAP")
+        pos = _aio.run(_pos())
+        assert pos.side.value == "SHORT" and abs(float(pos.size) - 0.1) < 1e-9, (
+            f"ShadowBroker 实时持仓 side={pos.side} size={pos.size}（期望 SHORT 0.1）"
+        )
+        # 3) get_status_dict 必须反映「实时 position」：新增 『当前持仓』结构化字段
+        d = ctl.get_status_dict()
+        realtime = d.get("当前持仓") or {}
+        # 断言关键字段：side / size / entry / mark
+        side_txt = str(realtime.get("方向") or realtime.get("持仓方向") or "").strip()
+        # 兼容：中文方向（做多/做空/空单）或英文枚举 SHORT/SELL（upper 后一致）
+        ok_side = (
+            "SHORT" in side_txt.upper()
+            or "SELL" in side_txt.upper()
+            or "做空" in side_txt
+            or "空单" in side_txt
+        )
+        assert ok_side, (
+            f"get_status_dict['当前持仓']={realtime!r}，期望方向=做空/SHORT（Bug B：ShadowBroker SHORT 0.1 空单，却展示空仓）"
+        )
+        sz = float(realtime.get("数量") or realtime.get("持仓数量") or 0.0)
+        assert abs(sz - 0.1) < 1e-9, (
+            f"get_status_dict['当前持仓']['数量']={sz}，期望 0.1（ShadowBroker 实时持仓）"
+        )
+        lev = int(realtime.get("杠杆") or realtime.get("持仓杠杆") or 1)
+        assert lev == 10, (
+            f"get_status_dict['当前持仓']['杠杆']={lev}，期望 10（set_leverage 的结果要落到 /api/status）"
+        )
+
+    def test_diag_broker_position_short_matches_why_no_position(self, tmp_path):
+        """在 Bug B 场景下 /api/diag 的 broker.position.side == SHORT / size == 0.1
+        必须与 system.why_no_position 一致（✅ 已持仓…空单…）。"""
+        from fastapi.testclient import TestClient
+        from app.api.app import create_app
+        from app.storage.state_store import StateStore
+        from app.storage.trade_journal import TradeJournal
+        from app.core.config import AppConfig, OKXConfig, AIConfig, TradingConfig, RiskLimits
+        from app.broker.shadow import ShadowBroker
+        from app.broker.paper import PaperBroker
+        from app.risk.engine import RiskEngine
+        from app.trading.position_manager import PositionManager
+        from app.services.controller import TradingController
+        from app.ai.factory import build_ai_provider
+        from app.exchange.market import MarketDataProducer
+        from app.core.constants import OrderSide, OrderType
+        import asyncio as _aio, time as _t
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cfg = AppConfig(
+            okx=OKXConfig(api_key="", secret="", passphrase=""),
+            ai=AIConfig(provider="deepseek", api_key="dummy", model="deepseek-chat"),
+            trading=TradingConfig(live=True, symbol="ETH-USDT-SWAP", default_leverage=10),
+            risk_limits=RiskLimits(shadow_mode=True),
+        )
+        ss = StateStore(data_dir)
+        # 手工写 started_at 防 null
+        snap = ss.load(); snap["started_at"] = int(_t.time()) - 200; ss.save(snap)
+        journal = TradeJournal(data_dir)
+        risk = RiskEngine(); risk.daily_start_balance = 14.83
+        inner = PaperBroker(symbol="ETH-USDT-SWAP", initial_balance=14.83)
+        broker = ShadowBroker(inner=inner, symbol="ETH-USDT-SWAP")
+        ai = build_ai_provider(cfg.ai)
+        mp = MarketDataProducer(okx=cfg.okx, symbol=cfg.trading.symbol)
+        pm = PositionManager()
+        ctl = TradingController(
+            config=cfg, broker=broker, ai=ai, risk=risk,
+            state_store=ss, journal=journal, market_producer=mp,
+        )
+        ctl.position_manager = pm
+        async def _init():
+            await broker.set_leverage("ETH-USDT-SWAP", 10)
+            await broker.place_order(symbol="ETH-USDT-SWAP", side=OrderSide.SELL,
+                                     type=OrderType.LIMIT, amount=0.1, price=2466.0,
+                                     client_order_id="DIAG-SHORT-001")
+        _aio.run(_init())
+
+        app = create_app()
+        app.state.runtime.update({
+            "config": cfg,
+            "state_store": ss,
+            "broker": broker,
+            "risk": risk,
+            "position_manager": pm,
+            "controller": ctl,
+            "journal": journal,
+            "data_dir": data_dir,
+        })
+        with TestClient(app) as client:
+            body = client.get("/api/diag").json()
+        bp = body["broker"]["position"]
+        assert bp["side"] == "SHORT" and abs(float(bp["size"]) - 0.1) < 1e-9 and int(bp["leverage"]) == 10, (
+            f"/api/diag broker.position={bp!r}，期望 SHORT/size=0.1/lev=10"
+        )
+        why = str(body["system"]["why_no_position"])
+        assert "已持仓" in why and ("SHORT" in why.upper() or "空" in why), (
+            f"why_no_position={why!r}，期望含「已持仓...空单/SHORT」(与 broker.position 一致)"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug C：SHORT 持仓时节流状态不要用『LONG_HOLD 持仓中』
+    # ------------------------------------------------------------------
+    def test_throttler_short_hold_reason_is_short_hold_not_long_hold(self):
+        """SHORT 0.1 空单持仓 → reason 不得出现 "LONG_HOLD" 字眼（混淆多空）。
+        要么新增 SHORT_HOLD 级别，要么 reason 改成 『持仓中(多/空)』+ 中文方向。"""
+        from app.core.ai_throttle import AIThrottler
+        from app.core.constants import ThrottleLevel
+        thr = AIThrottler()
+        # 初始化状态：RUNNING+有持仓（SHORT 方向在 entry_price 不影响，只要 has_pos=True 即可）
+        dec = thr.should_call_ai(
+            now_ts=1_700_000_000,
+            system_status_running=True,
+            allow_trading=True,
+            has_position=True,  # 这里是 SHORT 持仓场景
+            mark_price=2466.0,
+            entry_price=2466.0,
+            stop_loss_price=2404.0,
+            liquidation_price=4680.0,
+        )
+        reason = str(dec.reason or "")
+        # 断言：如果 reason 含 "持仓中"，就不得有 "LONG_HOLD 持仓中"（要根据持单方向显示）
+        if "持仓中" in reason:
+            assert "LONG_HOLD 持仓中" not in reason, (
+                f"SHORT 场景下 reason={reason!r}：错误地写死 LONG_HOLD 字样（Bug C）"
+                "，应当把持仓方向写进 reason，或用 HOLD/HOLD_SHORT 等中立表述"
+            )
+
+    # ------------------------------------------------------------------
+    # Bug D（可选轻量）：ShadowBroker 返回的虚拟持仓，当 inner 没 mark 时至少给 entry*作为"估算价"
+    # ------------------------------------------------------------------
+    def test_shadow_get_position_when_inner_mark_zero_uses_sane_mark_not_entry_for_long(self):
+        """SHORT 开 2466 后，真实 mark 永远 = inner 空仓的 mark（=0）会导致 ShadowBroker
+        mark_price=2466（=entry），即使 eth 实际涨跌。本测试至少确认：
+        ShadowBroker.get_position 后 mark_price 不是 0（有一个合理的兜底值）。
+        真正 fix 建议：每次 bg_main_loop 更新 mark 到 ShadowBroker._last_mark_cache。"""
+        from app.broker.shadow import ShadowBroker
+        from app.broker.paper import PaperBroker
+        from app.core.config import RiskLimits
+        from app.core.constants import OrderSide, OrderType
+        import asyncio as _aio
+        cfg_rl = RiskLimits(shadow_mode=True, live_max_equity_usdt=15.0)
+        inner = PaperBroker(symbol="ETH-USDT-SWAP", initial_balance=14.83)
+        # PaperBroker 真实持仓=空，get_position().mark_price=0 → 正是 ShadowBroker 遇的场景
+        sb = ShadowBroker(inner=inner, symbol="ETH-USDT-SWAP")
+        async def _go():
+            await sb.set_leverage("ETH-USDT-SWAP", 10)
+            await sb.place_order(symbol="ETH-USDT-SWAP", side=OrderSide.SELL,
+                                 type=OrderType.LIMIT, amount=0.1, price=2466.0,
+                                 client_order_id="MARK-TEST-1")
+            return await sb.get_position("ETH-USDT-SWAP")
+        pos = _aio.run(_go())
+        # mark_price 绝不=0（兜底：entry_price）
+        assert float(pos.mark_price or 0.0) > 0, (
+            f"ShadowBroker SHORT 持仓 mark_price={pos.mark_price} = 0，Dashboard 现价显示 0.00 是乱码 Bug D"
+        )
+
