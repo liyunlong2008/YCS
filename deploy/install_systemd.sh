@@ -159,7 +159,8 @@ ok "写入目录就绪（data/logs/.venv 存在，owner=${RUN_USER}:${RUN_GROUP}
 # ---- unit 渲染（通过 Python 做模板注入，避免 sed 边界 bug）----
 log "生成 ${UNIT_DST}（使用 Python 模板注入）…"
 RENDERED="$(python3 - "$TEMPLATE" "$RUN_USER" "$PROJECT_ROOT" "$VENV_PYTHON" "$RUN_PY" <<'PY'
-import sys, pathlib, shlex
+# 2026-08-30：所有 import 写顶部，避免 VPS 系统 python3 跑进来漏 shutil / os（之前 NameError: shutil is not defined）
+import sys, os, pathlib, shlex, shutil, subprocess  # noqa: F401  (subprocess 占位：将来延伸时用；目前防漏导入)
 tpl = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 user, workdir, venv_python, run_py = sys.argv[2:6]
 # Python dict 作为单一事实来源注入
@@ -190,8 +191,6 @@ for leftover in ("__UV__", "__USER__", "__WORKDIR__", "__VENV_PYTHON__", "__RUN_
             print(f"ERROR: 渲染仍残留占位符 {leftover} (第 {ln} 行: {raw})", file=sys.stderr)
             sys.exit(5)
 # ExecStart 与 ExecCondition 必须真实存在/可执行（等价于本地提前模拟 systemd exec()）
-import subprocess
-checks = []
 for line in tpl.splitlines():
     s = line.strip()
     if s.startswith("ExecStart="):
@@ -201,19 +200,17 @@ for line in tpl.splitlines():
         exe = parts[0]
         if not pathlib.Path(exe).is_file():
             print(f"ERROR: ExecStart 二进制不存在: {exe}", file=sys.stderr); sys.exit(6)
-        import os
         if not os.access(exe, os.X_OK):
             print(f"ERROR: ExecStart 二进制不可执行(+x): {exe}", file=sys.stderr); sys.exit(6)
-        checks.append(("ExecStart", exe))
     elif s.startswith("ExecCondition="):
-        # ExecCondition=test -x <path>：保证第二参数 (test) 存在即可
+        # ExecCondition=test -x <path>：保证 test 可执行 + 目标条件满足
         parts = shlex.split(s[len("ExecCondition="):])
         if not parts:
             print("ERROR: ExecCondition 为空", file=sys.stderr); sys.exit(7)
         test_bin = shutil.which(parts[0]) or parts[0]
         if not pathlib.Path(test_bin).is_file():
             print(f"ERROR: ExecCondition 二进制不存在: {test_bin}", file=sys.stderr); sys.exit(7)
-        # 如果是 test -x/-f/-d，验证目标文件/目录也存在
+        # test -x/-f/-d：验证目标也真实存在（= systemd exec 前执行的同一套语义）
         if parts[0] == "test" and len(parts) == 3 and parts[1] in ("-x", "-f", "-d"):
             target = parts[2]
             if parts[1] == "-x" and not (pathlib.Path(target).is_file() and os.access(target, os.X_OK)):
