@@ -86,7 +86,17 @@ class SystemRecoverer:
         logger.info("=== 系统恢复开始（交易所状态优先）===")
         st = self._state_store.load()
         st["status"] = SystemStatus.RECOVERING.value
-        st.setdefault("started_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+        # 统一 started_at 为「epoch 秒整数」便于 uptime 计算；避免与 /api/diag uptime_seconds 做减法时类型不一致
+        existing = st.get("started_at")
+        if isinstance(existing, str):
+            # 兼容老格式「YYYY-MM-DD HH:MM:SS」字符串 → 反解为 epoch（老数据迁移一次）
+            try:
+                import datetime as _dt
+                st["started_at"] = int(_dt.datetime.strptime(existing, "%Y-%m-%d %H:%M:%S").timestamp())
+            except Exception:  # noqa: BLE001
+                st["started_at"] = int(time.time())
+        elif not isinstance(existing, int) or existing <= 0:
+            st["started_at"] = int(time.time())
         self._state_store.save(st)
 
         # 1) 时间同步（若失败则进入异常）

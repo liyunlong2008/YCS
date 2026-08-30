@@ -306,6 +306,33 @@ def create_app(
         wr = (wins / closed * 100) if closed > 0 else 0.0
         sys_status_cn = (status_from_ctl or {}).get("系统状态") or snapshot.get("status") or "运行中"
 
+        # 启动时间 + 运行时长：Controller 优先；state_store started_at（兼容 int/字符串）兜底 —— 修复 started_at=None 空值
+        import datetime as _dt_up, time as _tt_up  # noqa: PLC0415
+        start_epoch: int | None = (status_from_ctl or {}).get("启动时间戳(epoch秒)") if isinstance(status_from_ctl, dict) else None
+        start_local: str | None = (status_from_ctl or {}).get("启动时间") if isinstance(status_from_ctl, dict) else None
+        upt_s: int | None = (status_from_ctl or {}).get("运行时长(秒)") if isinstance(status_from_ctl, dict) else None
+        upt_human: str | None = (status_from_ctl or {}).get("运行时长") if isinstance(status_from_ctl, dict) else None
+        if start_epoch is None:
+            raw_sa = snapshot.get("started_at")
+            if isinstance(raw_sa, int) and raw_sa > 0:
+                start_epoch = raw_sa
+            elif isinstance(raw_sa, str):
+                try:
+                    start_epoch = int(_dt_up.datetime.strptime(raw_sa, "%Y-%m-%d %H:%M:%S").timestamp())
+                except Exception:  # noqa: BLE001
+                    start_epoch = None
+        if start_epoch:
+            if not start_local:
+                try:
+                    start_local = _tt_up.strftime("%Y-%m-%d %H:%M:%S", _tt_up.localtime(int(start_epoch)))
+                except Exception:  # noqa: BLE001
+                    start_local = None
+            if upt_s is None:
+                s_ = max(int(_tt_up.time()) - int(start_epoch), 0)  # max(0): 时钟漂移不显示负运行时间
+                upt_s = s_
+                h, rem = divmod(s_, 3600); m, s2 = divmod(rem, 60)
+                upt_human = (f"{h}h{m:02d}m{s2:02d}s" if h > 0 else (f"{m}m{s2:02d}s" if m > 0 else f"{s2}s"))
+
         # 4) 风控：Controller 实时 block 优先
         rsk_ctl = (status_from_ctl or {}).get("风控状态") or {}
         consec = int(rsk_ctl.get("连续亏损次数") or risk_dict.get("consecutive_losses", 0) or 0)
@@ -485,6 +512,11 @@ def create_app(
             "thr_failures": thr_failures,
             "thr_volatility": thr_volatility,
             "thr_reason": thr_reason,
+            # 启动时间 + 运行时长（修复 started_at / uptime_seconds 此前一直为 None）
+            "start_epoch": start_epoch,
+            "start_local": start_local or "未启动",
+            "uptime_seconds": upt_s or 0,
+            "uptime_human": upt_human or "0s",
             # 2026-08-30 顶部漂移 tag（替代原 实盘模式 + AI 节流 顶部 tag）
             "drift_tag_text": drift_tag_text,
             "drift_tag_color": drift_tag_color,
@@ -571,6 +603,8 @@ def create_app(
               <div class="kv">
                 <div class="label">运行模式</div><div id="k-mode" class="value">{d['mode']}</div>
                 <div class="label">系统状态</div><div id="k-status" class="value">{d['status']}</div>
+                <div class="label">启动时间</div><div id="k-started" class="value">{d['start_local']}</div>
+                <div class="label">运行时长</div><div id="k-uptime" class="value">{d['uptime_human']}</div>
                 <div class="label">累计收益率 (%)</div><div id="k-total-pnl" class="value {'loss' if d['total_pnl_pct']<0 else 'win'}">{d['total_pnl_pct']:.2f}%</div>
                 <div class="label">已平仓交易</div><div id="k-closed" class="value">{d['closed']} 笔（胜{d['wins']}/败{d['losses']}）</div>
               </div>
@@ -678,6 +712,16 @@ def create_app(
                 // 运行模式 / 状态
                 setText('k-mode', s['运行模式'] ?? null);
                 setText('k-status', s['系统状态'] ?? null);
+                // 启动时间 + 运行时长（修复 started_at/uptime_seconds 此前为 None）
+                setText('k-started', s['启动时间'] ?? s['start_local'] ?? '未启动');
+                const upS = Number(s['运行时长(秒)'] ?? s['uptime_seconds'] ?? 0);
+                let upTxt = s['运行时长'] ?? null;
+                if (!upTxt) {{
+                  const h = Math.floor(upS / 3600), m = Math.floor((upS % 3600) / 60), s2 = Math.floor(upS % 60);
+                  upTxt = h > 0 ? (h + 'h' + String(m).padStart(2,'0') + 'm' + String(s2).padStart(2,'0') + 's')
+                         : m > 0 ? (m + 'm' + String(s2).padStart(2,'0') + 's') : (s2 + 's');
+                }}
+                setText('k-uptime', upTxt);
                 const totalPnl = Number(s['累计收益率(%)'] ?? 0);
                 const elPnl = document.getElementById('k-total-pnl');
                 if (elPnl) {{
@@ -804,6 +848,39 @@ def create_app(
 
         # 兜底：Controller 尚未初始化（如：仅 create_app 跑骨架、或前端刚打开 Dashboard）。
         # 仍保证"运行模式"字段可被监控脚本 / 自检读到——这是影子模式判定的关键入口。
+        # 2026-08-30: started_at / uptime 空值修复：即使 Controller 没初始化，也从 state_store 推算（3 处写入路径统一）
+        import time as _t2, datetime as _dt2  # noqa: PLC0415
+        start_epoch: int | None = None
+        start_local = None
+        upt_seconds = None
+        upt_human = None
+        store = request.app.state.runtime.get("state_store")
+        if store is None:
+            storages = request.app.state.runtime.get("storage")
+            if isinstance(storages, (list, tuple)) and len(storages) > 0:
+                store = storages[0]
+        if store is not None and hasattr(store, "load"):
+            try:
+                raw_sa = (store.load() or {}).get("started_at")
+                if isinstance(raw_sa, int) and raw_sa > 0:
+                    start_epoch = raw_sa
+                elif isinstance(raw_sa, str):
+                    try:
+                        start_epoch = int(_dt2.datetime.strptime(raw_sa, "%Y-%m-%d %H:%M:%S").timestamp())
+                    except Exception:  # noqa: BLE001
+                        start_epoch = None
+            except Exception:  # noqa: BLE001
+                pass
+        if start_epoch:
+            try:
+                start_local = _t2.strftime("%Y-%m-%d %H:%M:%S", _t2.localtime(int(start_epoch)))
+            except Exception:  # noqa: BLE001
+                start_local = None
+            s_ = max(int(_t2.time()) - int(start_epoch), 0)
+            upt_seconds = s_
+            hh, rem = divmod(s_, 3600); mm, ss = divmod(rem, 60)
+            upt_human = (f"{hh}h{mm:02d}m{ss:02d}s" if hh > 0 else (f"{mm}m{ss:02d}s" if mm > 0 else f"{ss}s"))
+
         cfg = request.app.state.runtime.get("config")
         mode_cn = "纸盘模式"
         shadow = False
@@ -819,7 +896,10 @@ def create_app(
         return {
             "运行模式": mode_cn,
             "系统状态": "未初始化（等待 run.py 注入 TradingController）",
-            "启动时间": None,
+            "启动时间戳(epoch秒)": start_epoch,
+            "启动时间": start_local,
+            "运行时长(秒)": upt_seconds,
+            "运行时长": upt_human,
             "账户余额总权益": 0.0,
             "可用保证金": 0.0,
             "未实现盈亏": 0.0,
@@ -1027,17 +1107,54 @@ def create_app(
         if shadow:
             mode_cn = f"{mode_cn}(影子 SHADOW)"
         state_snapshot: dict[str, Any] = {}
-        started_at = None
+        started_at: int | None = None
         if store is not None and hasattr(store, "load"):
             try:
                 state_snapshot = store.load() or {}
-                started_at = state_snapshot.get("started_at")
+                raw = state_snapshot.get("started_at")
+                if isinstance(raw, int) and raw > 0:
+                    started_at = raw
+                elif isinstance(raw, float) and raw > 0:
+                    started_at = int(raw)
+                elif isinstance(raw, str):
+                    # 兼容老格式字符串迁移（新代码写入都为 int epoch；仅老数据兜底）
+                    try:
+                        import datetime as _dt_m
+                        started_at = int(_dt_m.datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").timestamp())
+                    except Exception:  # noqa: BLE001
+                        started_at = None
             except Exception:
                 state_snapshot = {}
+        # uptime: started_at 有值 = now - started_at；否则 None（保持接口向后兼容）
+        uptime_seconds = int(_t.time() - started_at) if isinstance(started_at, int) and started_at > 0 else None
+        # 防御：时区时钟漂移 / 测试虚构未来时间 时避免负数显示（避免 -17000s 这种荒谬值）
+        if isinstance(uptime_seconds, int) and uptime_seconds < 0:
+            uptime_seconds = 0
+        # 人类可读本地时间（便于 Dashboard / 排查直接看）
+        started_at_local = None
+        if isinstance(started_at, int) and started_at > 0:
+            try:
+                started_at_local = _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(started_at))
+            except Exception:  # noqa: BLE001
+                started_at_local = None
+        # uptime 人类可读：XhYmZs
+        uptime_human = None
+        if isinstance(uptime_seconds, int) and uptime_seconds >= 0:
+            h, rem = divmod(uptime_seconds, 3600)
+            m, s = divmod(rem, 60)
+            if h > 0:
+                uptime_human = f"{h}h{m:02d}m{s:02d}s"
+            elif m > 0:
+                uptime_human = f"{m}m{s:02d}s"
+            else:
+                uptime_human = f"{s}s"
+
         system_block: dict[str, Any] = {
             "runtime_mode": mode_cn,
             "started_at": started_at,
-            "uptime_seconds": int(_t.time() - started_at) if isinstance(started_at, (int, float)) and started_at > 0 else None,
+            "started_at_local": started_at_local,
+            "uptime_seconds": uptime_seconds,
+            "uptime_human": uptime_human,
             "pid": _os.getpid(),
             "python_version": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
             "version": version,

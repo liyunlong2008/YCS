@@ -206,10 +206,45 @@ class TradingController:
             "阈值秒": 10,
         }
 
+        # 启动时间：统一 started_at 为 int epoch（兼容字符串老数据）+ 人类可读文本 + 运行时长
+        raw_sa = st.get("started_at")
+        import datetime as _dt_sa  # noqa: PLC0415
+        started_at_epoch: int | None = None
+        started_at_local: str | None = None
+        uptime_s: int | None = None
+        uptime_human: str | None = None
+        if isinstance(raw_sa, int) and raw_sa > 0:
+            started_at_epoch = raw_sa
+        elif isinstance(raw_sa, float) and raw_sa > 0:
+            started_at_epoch = int(raw_sa)
+        elif isinstance(raw_sa, str):
+            try:
+                started_at_epoch = int(_dt_sa.datetime.strptime(raw_sa, "%Y-%m-%d %H:%M:%S").timestamp())
+            except Exception:  # noqa: BLE001
+                started_at_epoch = None
+        if started_at_epoch is not None:
+            try:
+                started_at_local = _dt_sa.datetime.fromtimestamp(started_at_epoch).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:  # noqa: BLE001
+                started_at_local = None
+            upt_s = now_ts - started_at_epoch
+            if upt_s >= 0:
+                uptime_s = upt_s
+                h, rem = divmod(upt_s, 3600); m, s_ = divmod(rem, 60)
+                uptime_human = (f"{h}h{m:02d}m{s_:02d}s" if h > 0
+                                else f"{m}m{s_:02d}s" if m > 0 else f"{s_}s")
+            else:
+                # 时钟漂移 / 未来时区错觉：归零不显示负数
+                uptime_s = 0
+                uptime_human = "0s"
+
         return {
             "运行模式": mode_cn,
             "系统状态": _ZH_SYSTEM_STATUS.get(sys_status, str(status_raw)),
-            "启动时间": st.get("started_at") or None,
+            "启动时间戳(epoch秒)": started_at_epoch,
+            "启动时间": started_at_local,
+            "运行时长(秒)": uptime_s,
+            "运行时长": uptime_human,
             "账户余额总权益": st.get("balance", {}).get("total", 0.0),
             "可用保证金": st.get("balance", {}).get("available", 0.0),
             "未实现盈亏": st.get("balance", {}).get("unrealized_pnl", 0.0),

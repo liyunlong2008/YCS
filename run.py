@@ -228,6 +228,21 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     except Exception:
         logger.exception("启动恢复失败，以 STOPPED 继续启动 Dashboard（请检查 OKX 网络/密钥）")
 
+    # 6.5) 兜底写 started_at：无论 recoverer 是否异常路径，都保证 state_store.started_at 为 int epoch 秒
+    #      · 若已有合法 int started_at（恢复流程已写入或上次进程残留）→ 不覆盖
+    #      · 若 started_at 为 None / 非法字符串 / 0 → 写当前时间
+    import datetime as _dtb, time as _tb
+    st_snap = state_store.load()
+    raw_ts = st_snap.get("started_at")
+    if isinstance(raw_ts, str):
+        try:
+            st_snap["started_at"] = int(_dtb.datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").timestamp())
+        except Exception:  # noqa: BLE001
+            st_snap["started_at"] = int(_tb.time())
+    elif not isinstance(raw_ts, int) or raw_ts <= 0:
+        st_snap["started_at"] = int(_tb.time())
+    state_store.save(st_snap)
+
     # 7) 注入 FastAPI runtime
     app.state.runtime.update({
         "config": cfg,
