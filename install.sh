@@ -93,9 +93,18 @@ fi
 : "${YCS_NO_SYSTEMD:=0}"
 : "${YCS_FORCE:=0}"
 # YCS_KEEP_LOCAL_CONFIG=1（默认）：
-#   · YCS_FORCE=1 做 git reset --hard 前，会把 $INSTALL_DIR/config.yaml
-#     备份到 /tmp；reset 完成后再拷回来，避免用户填好的 OKX/AI 凭证被刷成模板。
-#   · =0 则不备份（极少用到；用户可以自行在备份目录留副本）。
+#   · 为什么即使 .gitignore 已经写了 /config.yaml，仍然要做备份？
+#     因为 .gitignore 只管「git add/status 时把 config.yaml 当 untracked 忽略」，
+#     管不了这三件事（它们是 VPS 上 FORCE 更新真实会遇到的）：
+#       1) 仓库历史里如果曾经提交过 config.yaml（你之前 push 过实盘配置），
+#          git reset --hard <远端HEAD> 会直接把仓库里那份旧 config.yaml 盖到你本地，
+#          会把你 VPS 上填好的 OKX 密钥 / shadow_mode / risk 刷掉。
+#       2) git clean -fd 删除未跟踪文件时，如果忘了 -e config.yaml 白名单（或者
+#          以后代码改漏了），它也会直接把你的 config.yaml 当垃圾清掉。
+#       3) 更常见：你刚才 VPS 上把源码全删了只剩 config.yaml，reset 前得先把
+#          config.yaml「抢救出来」，reset 后再放回去才安全。
+#   · =1（默认）：FORCE 路径自动 mktemp 备份 → reset 完立刻写回。
+#   · =0：不备份（高级用户、且你确认 config.yaml 已经另存副本时才关）。
 : "${YCS_KEEP_LOCAL_CONFIG:=1}"
 
 # ---------------------------------------------------------------------------
@@ -228,13 +237,20 @@ else
 
     if [ "$YCS_FORCE" -eq 1 ]; then
       # ============== FORCE 路径：备份 config → 重置仓库到远端最新 ==============
-      # 原因：VPS 常见现场 = 只剩 config.yaml（源码被误删），这时 stash 没用；
-      #       真正需要的是「对齐远端最新 commit + 保留 config.yaml」。
+      # 为什么即使 .gitignore 写了 /config.yaml 仍先备份？核心 3 点：
+      #   1) git reset --hard 只管"已跟踪文件"，如果远端历史里曾有 config.yaml，
+      #      它会覆盖本地 untracked 的实盘配置；.gitignore 拦不住这个。
+      #   2) git clean -fd 如果没写白名单会把 untracked config.yaml 清掉；
+      #      我们下面确实写了 -e config.yaml，但"先备份再写回"属于零成本防线兜底。
+      #   3) 最常见现场：VPS 里只有 config.yaml 留着，源码全没了（git ls-files 上百个 D）
+      #      reset 之前先把用户唯一的实盘凭证挪到 /tmp 永远是最稳的。
       backup_cfg=""
       if [ "$YCS_KEEP_LOCAL_CONFIG" -eq 1 ] && [ -f config.yaml ]; then
         backup_cfg="$(mktemp /tmp/ycs.config.yaml.XXXXXX)"
         cp -f config.yaml "$backup_cfg"
-        log_w "已备份你的 config.yaml → ${backup_cfg}（将在 reset 后写回）"
+        log_w "已备份你的 config.yaml → ${backup_cfg}（.gitignore 不挡 reset/clean，reset 后立即写回）"
+      elif [ "$YCS_KEEP_LOCAL_CONFIG" -eq 0 ] && [ -f config.yaml ]; then
+        log_w "YCS_KEEP_LOCAL_CONFIG=0 且存在 config.yaml：若远端历史有 config.yaml，reset --hard 会覆盖你本地实盘配置！（不改 = 保持现有选择）"
       fi
 
       log_w "YCS_FORCE=1 → 将仓库重置到 origin/${GIT_BRANCH} 最新（本地未 push 提交/untracked/删除都会丢失）"
@@ -247,11 +263,12 @@ else
 
       # 三步强清理：(1) 恢复已跟踪文件（消除 D / M）；(2) 删掉 untracked files/dirs；(3) 强行对齐远端指针
       git checkout -f "origin/${GIT_BRANCH}" -- . 2>/dev/null || true
-      # 除 .venv / data / logs / config.yaml / config.yaml.example 以外，都可以清
+      # 白名单明确：.venv / data / logs / config.yaml / config.yaml.example → 一律不删
+      #   (config.yaml 虽然已在 .gitignore，但这里重复 -e 作为防御性编程，避免 .gitignore 改漏/没生效时 clean 误删)
       git clean -fd \
         -e '.venv' -e '.venv/**' \
-        -e 'data' -e 'data/**' \
-        -e 'logs' -e 'logs/**' \
+        -e 'data'   -e 'data/**' \
+        -e 'logs'   -e 'logs/**' \
         -e 'config.yaml' -e 'config.yaml.example' 2>/dev/null || true
       git reset --hard "origin/${GIT_BRANCH}" || die "YCS_FORCE reset --hard origin/${GIT_BRANCH} 失败（检查仓库/分支/代理）"
 
