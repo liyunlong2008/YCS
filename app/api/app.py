@@ -139,6 +139,20 @@ def _zh(value: str | None) -> str:
     return ZH_STATUS.get(value, value)
 
 
+def _infer_direction_from_regime(regime_cn: str) -> str:
+    """从 AI 市场状态中文推断建议方向（兜底；有 suggested_direction 时走它）。"""
+    r = str(regime_cn or "")
+    if "上涨" in r:
+        return "做多 LONG"
+    if "下跌" in r:
+        return "做空 SHORT"
+    if "震荡" in r or "低波动" in r:
+        return "观望 WAIT"
+    if "波动" in r:
+        return "谨慎观望"
+    return "—"
+
+
 def create_app(
     config_path: Path | str | None = None,
     *,
@@ -221,7 +235,10 @@ def create_app(
         return ctl
 
     def _collect_dashboard_data(rt: dict[str, Any]) -> dict[str, Any]:
-        """服务端聚合首页需要的字段；缺失时填默认值以保证 HTML 有骨架文本。"""
+        """服务端聚合首页需要的字段；优先 Controller（实时）→ state_store（已持久化）→ 默认骨架。
+           · 用 ctl.get_status_dict() 的中文结构对齐 /api/status，首屏 AI 就不再空。
+           · 额外补 journal（最近交易）。
+        """
         # 1) 运行模式
         mode_cn = "纸盘模式"
         cfg = rt.get("config")
@@ -231,9 +248,22 @@ def create_app(
                 mode_cn = "实盘模式" if getattr(cfg.trading, "live", False) else "纸盘模式"
             except Exception:
                 mode_cn = "纸盘模式"
+        if cfg is not None and hasattr(cfg, "risk_limits"):
+            if bool(getattr(cfg.risk_limits, "shadow_mode", False)):
+                mode_cn = f"{mode_cn}(影子 SHADOW)"
 
-        # 2) state_store 余额/stats；若 Controller 可用则优先走 Controller
+        # 2) Controller 实时数据（首屏优先，没启动则 fallback state_store）
         ctl = rt.get("controller")
+        status_from_ctl: dict[str, Any] | None = None
+        if ctl is not None and hasattr(ctl, "get_status_dict"):
+            try:
+                status_from_ctl = ctl.get_status_dict() or {}
+                if isinstance(status_from_ctl, dict) and status_from_ctl.get("运行模式"):
+                    mode_cn = status_from_ctl["运行模式"]
+            except Exception:
+                status_from_ctl = None
+
+        # 3) state_store：Controller 没有时的骨架
         store = rt.get("state_store")
         snapshot: dict[str, Any] = {}
         if store is not None:
@@ -246,31 +276,59 @@ def create_app(
         risk_dict = snapshot.get("risk") or {}
         pm_dict = snapshot.get("position_manager") or {}
 
-        total = float(bal.get("total", 0.0) or 0.0)
-        available = float(bal.get("available", total) or total)
-        upl = float(bal.get("unrealized_pnl", 0.0) or 0.0)
+        # ---- 基本数值：Controller 优先 ----
+        total = float(
+            (status_from_ctl.get("账户余额总权益") if isinstance(status_from_ctl, dict) else None)
+            or bal.get("total", 0.0) or 0.0
+        )
+        available = float(
+            (status_from_ctl.get("可用保证金") if isinstance(status_from_ctl, dict) else None)
+            or bal.get("available", total) or total
+        )
+        upl = float(
+            (status_from_ctl.get("未实现盈亏") if isinstance(status_from_ctl, dict) else None)
+            or bal.get("unrealized_pnl", 0.0) or 0.0
+        )
         daily_start = float(risk_dict.get("daily_start_balance", total or 1000.0) or 1000.0)
-        total_pnl_pct = float(stats.get("total_pnl_pct", 0.0) or 0.0)
-
-        wins = int(stats.get("wins", 0) or 0)
-        losses = int(stats.get("losses", 0) or 0)
-        closed = int(stats.get("trades_closed", wins + losses) or wins + losses)
+        total_pnl_pct = float(
+            (status_from_ctl.get("累计收益率(%)") if isinstance(status_from_ctl, dict) else None)
+            or stats.get("total_pnl_pct", 0.0) or 0.0
+        )
+        wins = int(
+            (status_from_ctl.get("盈利次数") if isinstance(status_from_ctl, dict) else None)
+            or stats.get("wins", 0) or 0
+        )
+        losses = int(
+            (status_from_ctl.get("亏损次数") if isinstance(status_from_ctl, dict) else None)
+            or stats.get("losses", 0) or 0
+        )
+        closed = wins + losses
         wr = (wins / closed * 100) if closed > 0 else 0.0
+        sys_status_cn = (status_from_ctl or {}).get("系统状态") or snapshot.get("status") or "运行中"
 
-        # 3) 风控
-        consec = int(risk_dict.get("consecutive_losses", 0) or 0)
-        allow = bool(risk_dict.get("allow_trading", True))
-        cooldown_until = risk_dict.get("cooldown_until") or 0
-        cd_cn = "是" if allow else ("否（冷却至 " + (str(cooldown_until) if cooldown_until else "手动解除") + "）")
+        # 4) 风控：Controller 实时 block 优先
+        rsk_ctl = (status_from_ctl or {}).get("风控状态") or {}
+        consec = int(rsk_ctl.get("连续亏损次数") or risk_dict.get("consecutive_losses", 0) or 0)
+        allow_val = rsk_ctl.get("是否允许开仓")
+        if allow_val is None:
+            allow_bool = bool(risk_dict.get("allow_trading", True))
+            allow_val = "是" if allow_bool else "否"
+        cooldown_ts = rsk_ctl.get("熔断冷却至(秒时间戳)") or risk_dict.get("cooldown_until") or 0
+        if allow_val == "否" and cooldown_ts:
+            try:
+                import time as _t
+                cd_left_s = int(cooldown_ts) - int(_t.time())
+                if cd_left_s > 0:
+                    h, m = divmod(cd_left_s, 3600); m, s = divmod(m, 60)
+                    allow_val = f"否（冷却剩 {h}h{m:02d}m{s:02d}s）"
+            except Exception:
+                allow_val = f"否（冷却至 ts={cooldown_ts}）"
         daily_loss_pct = risk_dict.get("daily_loss_pct") or 0.0
         daily_status = "正常" if daily_loss_pct > -15.0 else f"已触发日亏限制（{daily_loss_pct:.2f}%）"
 
-        # 4) 持仓（从 state_store.position 或 Controller.get_position_dict）
+        # 5) 持仓：从 state_store.position 或实时 balance+position 推断；Controller 可用时实时刷新
         pos_side = "空仓"
-        pos_size = 0.0
-        pos_entry = 0.0
-        pos_mark = 0.0
-        pos_upl = 0.0
+        pos_size = 0.0; pos_entry = 0.0; pos_mark = 0.0; pos_upl = 0.0
         pos_saved = snapshot.get("position") or {}
         if pos_saved:
             pos_side = _zh(pos_saved.get("side") or "FLAT")
@@ -279,7 +337,10 @@ def create_app(
             pos_entry = float(pos_saved.get("entry_price", 0.0) or 0.0)
             pos_mark = float(pos_saved.get("mark_price", 0.0) or 0.0)
             pos_upl = float(pos_saved.get("unrealized_pnl", 0.0) or 0.0)
-        # 保护锁点（来自 position_manager）
+        # 若 state_store 位置空但 upl!=0，标记价格从 snapshot.mark_price 填
+        if pos_mark <= 0:
+            pos_mark = float(snapshot.get("mark_price", 0.0) or 0.0)
+        # 利润保护
         current_lock = float(pm_dict.get("current_lock_pct", 0.0) or 0.0)
         trailing = float(pm_dict.get("trailing_stop_price", 0.0) or 0.0)
         protect_txt = "未启用"
@@ -288,50 +349,79 @@ def create_app(
         elif trailing > 0:
             protect_txt = f"移动止损价 {trailing:.2f}"
 
-        # 5) AI 上次判断（来自 state_store.last_ai）
-        ai = snapshot.get("last_ai") or {}
-        ai_regime = ai.get("market_regime") or "—"
-        ai_conf = ai.get("confidence") or 0
-        ai_direction = ai.get("suggested_direction") or "—"
-        ai_reason = ai.get("reason_short") or "暂无"
-        # regime 中文
-        regime_map = {"TREND_UP": "上涨趋势", "TREND_DOWN": "下跌趋势", "RANGE": "震荡", "VOLATILE": "波动"}
-        ai_regime_cn = regime_map.get(str(ai_regime).upper(), str(ai_regime))
+        # 6) AI 判断：**必须取 Controller._last_ai_block() 实时结果**（否则首屏一直空）
+        ai_block: dict[str, Any] = {}
+        if isinstance(status_from_ctl, dict) and isinstance(status_from_ctl.get("最近AI判断"), dict):
+            ai_block = dict(status_from_ctl["最近AI判断"])
+        # state_store 兜底（Controller 没注入时）
+        if not ai_block:
+            ai_saved = snapshot.get("last_ai") or {}
+            regime_map_local = {"TREND_UP": "上涨趋势", "TREND_DOWN": "下跌趋势", "RANGE": "震荡", "VOLATILE": "波动", "LOW_VOLATILITY": "低波动"}
+            reg_val = ai_saved.get("market_regime") or "—"
+            ai_regime_cn_local = regime_map_local.get(str(reg_val).upper(), str(reg_val))
+            ai_block = {
+                "市场状态": ai_regime_cn_local,
+                "置信度": ai_saved.get("confidence") or 0,
+                "理由": ai_saved.get("reason_short") or ai_saved.get("reason") or "暂无",
+                "时间": ai_saved.get("ts") or ai_saved.get("time") or None,
+            }
+        # 补：建议方向（给 Dashboard『建议方向』字段，AI 分析里常含 suggest_direction）
+        ai_saved_any = snapshot.get("last_ai") or {}
+        direction = str(
+            (status_from_ctl or {}).get("建议方向")
+            or (ai_block or {}).get("建议方向")
+            or ai_saved_any.get("suggested_direction")
+            or _infer_direction_from_regime(str((ai_block or {}).get("市场状态") or "—"))
+        )
+        reason_short = str((ai_block or {}).get("理由") or "暂无")
+        if len(reason_short) > 120:
+            reason_short = reason_short[:120] + "…"
 
-        # 6) 最近交易（优先 journal；state_store 没 journal 就走空列表）
+        # 7) 最近交易：优先 journal；Controller 可用时直接 get_recent_trades
         trades_rows: list[dict] = []
-        storage = rt.get("storage")
-        if isinstance(storage, tuple) and len(storage) >= 2:
-            journal = storage[1]
-            if hasattr(journal, "read_recent"):
-                try:
-                    records = journal.read_recent(limit=20) or []
+        try:
+            if ctl is not None and hasattr(ctl, "get_recent_trades"):
+                records = list(ctl.get_recent_trades(limit=20) or [])
+                for r in records:
+                    trades_rows.append({
+                        "时间": r.get("时间") or r.get("time") or "—",
+                        "市场状态": r.get("市场状态") or r.get("market_regime") or "—",
+                        "置信度": r.get("置信度") or r.get("confidence") or 0,
+                        "入场原因": r.get("入场原因") or r.get("entry_reason") or "—",
+                        "结果": r.get("结果") or r.get("result") or "—",
+                    })
+            else:
+                storage = rt.get("storage")
+                journal = storage[1] if isinstance(storage, tuple) and len(storage) >= 2 else None
+                if journal is not None and hasattr(journal, "read_recent"):
+                    records = list(journal.read_recent(limit=20) or [])
                     for r in records:
                         trades_rows.append({
                             "时间": r.get("timestamp") or r.get("时间") or "—",
-                            "市场状态": regime_map.get(str(r.get("market_regime") or r.get("市场状态") or "—"),
-                                                     str(r.get("market_regime") or r.get("市场状态") or "—")),
+                            "市场状态": r.get("market_regime") or r.get("市场状态") or "—",
                             "置信度": r.get("confidence") or r.get("置信度") or 0,
                             "入场原因": r.get("reason_short") or r.get("入场原因") or "—",
                             "结果": r.get("result_r") or r.get("结果") or "—",
                         })
-                except Exception:
-                    trades_rows = []
+        except Exception:
+            trades_rows = []
 
         return {
             "mode": mode_cn,
-            "status": snapshot.get("status") or "运行中",
+            "status": sys_status_cn,
             "bal_total": total, "bal_available": available, "bal_upl": upl,
             "daily_start": daily_start,
             "total_pnl_pct": total_pnl_pct,
             "wins": wins, "losses": losses, "closed": closed, "wr": wr,
-            "consec": consec, "allow": cd_cn, "daily_status": daily_status,
+            "consec": consec, "allow": allow_val, "daily_status": daily_status,
             "daily_loss_pct": daily_loss_pct,
             "pos_side": pos_side, "pos_size": pos_size, "pos_entry": pos_entry,
             "pos_mark": pos_mark, "pos_upl": pos_upl,
             "protect_txt": protect_txt,
-            "ai_regime": ai_regime_cn, "ai_conf": ai_conf,
-            "ai_direction": ai_direction, "ai_reason": ai_reason,
+            "ai_regime": str(ai_block.get("市场状态") or "—"),
+            "ai_conf": int(ai_block.get("置信度") or 0),
+            "ai_direction": direction,
+            "ai_reason": reason_short,
             "trades": trades_rows,
         }
 
@@ -388,60 +478,72 @@ def create_app(
             a {{ color:#1a73e8; }}
             .loss {{ color:#c5221f; }}
             .win {{ color:#137333; }}
-            footer {{ color:#888; font-size:12px; margin-top:20px; }}
+            footer {{ color:#888; font-size:12px; margin-top:20px; text-align:center; }}
+            .updated {{ display:inline-block; margin-left:12px; font-size:12px; color:#64748b; }}
+            .reason-box {{
+              display:block; width:100%; font-size:12px; color:#334155;
+              text-align:left; word-break:break-word; line-height:1.5;
+              background:#f8fafc; padding:6px 8px; border-radius:6px; margin-top:4px;
+            }}
           </style>
         </head>
         <body>
-          <h1>云龙挑战赛 · Dashboard {mode_tag}</h1>
+          <h1>云龙挑战赛 · Dashboard {mode_tag}<span id="k-updated" class="updated"></span></h1>
 
           <div class="grid">
+            <!-- 运行模式 -->
             <div class="card">
               <h2>运 行 模 式</h2>
               <div class="kv">
-                <div class="label">运行模式</div><div class="value">{d['mode']}</div>
-                <div class="label">系统状态</div><div class="value">{d['status']}</div>
-                <div class="label">累计收益率 (%)</div><div class="value {'loss' if d['total_pnl_pct']<0 else 'win'}">{d['total_pnl_pct']:.2f}%</div>
-                <div class="label">已平仓交易</div><div class="value">{d['closed']} 笔</div>
+                <div class="label">运行模式</div><div id="k-mode" class="value">{d['mode']}</div>
+                <div class="label">系统状态</div><div id="k-status" class="value">{d['status']}</div>
+                <div class="label">累计收益率 (%)</div><div id="k-total-pnl" class="value {'loss' if d['total_pnl_pct']<0 else 'win'}">{d['total_pnl_pct']:.2f}%</div>
+                <div class="label">已平仓交易</div><div id="k-closed" class="value">{d['closed']} 笔（胜{d['wins']}/败{d['losses']}）</div>
               </div>
             </div>
 
+            <!-- 余额 -->
             <div class="card">
               <h2>余 额</h2>
               <div class="kv">
-                <div class="label">总权益 (USDT)</div><div class="value">{d['bal_total']:.2f}</div>
-                <div class="label">可用保证金</div><div class="value">{d['bal_available']:.2f}</div>
-                <div class="label">未实现盈亏</div><div class="value {'loss' if d['bal_upl']<0 else 'win'}">{d['bal_upl']:.2f}</div>
-                <div class="label">今日起始权益</div><div class="value">{d['daily_start']:.2f}</div>
+                <div class="label">总权益 (USDT)</div><div id="k-bal-total" class="value">{d['bal_total']:.2f}</div>
+                <div class="label">可用保证金</div><div id="k-bal-avail" class="value">{d['bal_available']:.2f}</div>
+                <div class="label">未实现盈亏</div><div id="k-bal-upl" class="value {'loss' if d['bal_upl']<0 else 'win'}">{'+' if d['bal_upl']>=0 else ''}{d['bal_upl']:.2f}</div>
+                <div class="label">今日起始权益</div><div id="k-daily-start" class="value">{d['daily_start']:.2f}</div>
               </div>
             </div>
 
+            <!-- 风控 -->
             <div class="card">
               <h2>风 控</h2>
               <div class="kv">
-                <div class="label">是否允许开仓</div><div class="value">{d['allow']}</div>
-                <div class="label">连续亏损</div><div class="value">{d['consec']} 次</div>
-                <div class="label">今日盈亏率</div><div class="value {'loss' if d['daily_loss_pct']<0 else ''}">{d['daily_loss_pct']:.2f}%</div>
-                <div class="label">胜率</div><div class="value">{d['wr']:.0f}% ({d['wins']}胜/{d['losses']}败)</div>
+                <div class="label">是否允许开仓</div><div id="k-allow" class="value">{d['allow']}</div>
+                <div class="label">连续亏损</div><div id="k-consec" class="value">{d['consec']} 次</div>
+                <div class="label">今日盈亏率</div><div id="k-daily-loss" class="value {'loss' if d['daily_loss_pct']<0 else ''}">{'+' if d['daily_loss_pct']>=0 else ''}{d['daily_loss_pct']:.2f}%</div>
+                <div class="label">胜率</div><div id="k-wr" class="value">{d['wr']:.0f}%</div>
               </div>
             </div>
 
+            <!-- 持仓 -->
             <div class="card">
               <h2>持 仓</h2>
               <div class="kv">
-                <div class="label">持仓方向</div><div class="value">{d['pos_side']}</div>
-                <div class="label">数量</div><div class="value">{d['pos_size']:.6f}</div>
-                <div class="label">开仓均价 / 标记价</div><div class="value">{d['pos_entry']:.2f} / {d['pos_mark']:.2f}</div>
-                <div class="label">浮动盈亏 / 保护</div><div class="value">{'+' if d['pos_upl']>=0 else ''}{d['pos_upl']:.2f} · {d['protect_txt']}</div>
+                <div class="label">持仓方向</div><div id="k-pos-side" class="value">{d['pos_side']}</div>
+                <div class="label">数量</div><div id="k-pos-size" class="value">{d['pos_size']:.6f}</div>
+                <div class="label">开仓均价 / 标记价</div><div id="k-pos-price" class="value">{d['pos_entry']:.2f} / {d['pos_mark']:.2f}</div>
+                <div class="label">浮动盈亏 / 保护</div><div id="k-pos-upl" class="value">{'+' if d['pos_upl']>=0 else ''}{d['pos_upl']:.2f} · {d['protect_txt']}</div>
               </div>
             </div>
 
+            <!-- AI 判断 -->
             <div class="card">
               <h2>AI 判 断</h2>
               <div class="kv">
-                <div class="label">市场状态</div><div class="value">{d['ai_regime']}</div>
-                <div class="label">置信度</div><div class="value">{d['ai_conf']:.0f}%</div>
-                <div class="label">建议方向</div><div class="value">{d['ai_direction']}</div>
-                <div class="label">简短理由</div><div class="value" style="text-align:left;grid-column:1/-1;">{d['ai_reason']}</div>
+                <div class="label">市场状态</div><div id="k-ai-regime" class="value">{d['ai_regime']}</div>
+                <div class="label">置信度</div><div id="k-ai-conf" class="value">{d['ai_conf']:.0f}%</div>
+                <div class="label">建议方向</div><div id="k-ai-dir" class="value">{d['ai_direction']}</div>
+                <div class="label">简短理由</div>
+                <div id="k-ai-reason" class="value" style="grid-column:1/-1;"><span class="reason-box">{d['ai_reason']}</span></div>
               </div>
             </div>
           </div>
@@ -452,23 +554,121 @@ def create_app(
               <thead><tr>
                 <th>时间</th><th>市场状态</th><th>置信度</th><th>入场原因</th><th>结果</th>
               </tr></thead>
-              <tbody>{rows_html}</tbody>
+              <tbody id="k-trades">{rows_html}</tbody>
             </table>
           </div>
 
-          <footer>本 Dashboard 遵循设计文档 · 第二十节：界面与 API 全部为中文。接口文档：<a href="/docs">/docs</a></footer>
+          <footer>by 李云龙</footer>
 
           <script>
-            // 每 5s 刷新数据，走 /api/status 与 /api/trades；未初始化（仅首页静态）时不抛错
+            // 每 5s 刷新：读 /api/status + /api/trades → 写对应 id DOM
+            // 失败（Controller 未初始化 / 网络）时静默，绝不刷新成 0 值
             window.__DASHBOARD__ = {{data: {data_json}}};
-            async function refresh() {{
+
+            function setText(id, text, {{loss=false, win=false, forceLossClass=false}} = {{}}) {{
+              const el = document.getElementById(id);
+              if (!el || text === null || text === undefined) return;
+              el.textContent = String(text);
+              el.classList.remove('loss','win');
+              if (forceLossClass || (typeof loss === 'number' && loss < 0)) el.classList.add('loss');
+              if (win && (typeof win !== 'number' || win > 0)) el.classList.add('win');
+            }}
+
+            function fmtSigned(v, decimals=2, suffix='') {{
+              const n = Number(v);
+              if (Number.isNaN(n)) return String(v ?? '—');
+              const sign = n >= 0 ? '+' : '';
+              return sign + n.toFixed(decimals) + suffix;
+            }}
+
+            async function refreshStatus() {{
               try {{
-                const resp = await fetch('/api/status');
+                const resp = await fetch('/api/status', {{cache:'no-store'}});
                 if (!resp.ok) return;
                 const s = await resp.json();
-                // 不覆盖，有值则更新对应 DOM（id 与 /api/status 中文键一一对应以兼容）
+                // 运行模式 / 状态
+                setText('k-mode', s['运行模式'] ?? null);
+                setText('k-status', s['系统状态'] ?? null);
+                const totalPnl = Number(s['累计收益率(%)'] ?? 0);
+                const elPnl = document.getElementById('k-total-pnl');
+                if (elPnl) {{
+                  elPnl.textContent = fmtSigned(totalPnl, 2, '%');
+                  elPnl.classList.remove('loss','win');
+                  elPnl.classList.add(totalPnl < 0 ? 'loss' : 'win');
+                }}
+                const wins = Number(s['盈利次数'] ?? 0);
+                const losses = Number(s['亏损次数'] ?? 0);
+                const closed = wins + losses;
+                setText('k-closed', closed + ' 笔（胜' + wins + '/败' + losses + '）');
+
+                // 余额
+                const balTotal = Number(s['账户余额总权益'] ?? 0);
+                const balAvail = Number(s['可用保证金'] ?? 0);
+                const balUpl = Number(s['未实现盈亏'] ?? 0);
+                setText('k-bal-total', balTotal.toFixed(2));
+                setText('k-bal-avail', balAvail.toFixed(2));
+                setText('k-bal-upl', fmtSigned(balUpl, 2), {{forceLossClass: balUpl < 0}});
+
+                // 风控
+                const risk = s['风控状态'] || {{}};
+                setText('k-allow', risk['是否允许开仓'] ?? null);
+                setText('k-consec', (risk['连续亏损次数'] ?? 0) + ' 次');
+                const wr = closed > 0 ? (wins / closed * 100) : 0;
+                setText('k-wr', wr.toFixed(0) + '%');
+
+                // AI
+                const ai = s['最近AI判断'] || {{}};
+                setText('k-ai-regime', ai['市场状态'] ?? null);
+                setText('k-ai-conf', (Number(ai['置信度'] ?? 0)).toFixed(0) + '%');
+                // 建议方向：推断（兜底）
+                let dir = ai['建议方向'] || null;
+                if (!dir || dir === '—') {{
+                  const regime = String(ai['市场状态'] ?? '');
+                  if (regime.includes('上涨')) dir = '做多 LONG';
+                  else if (regime.includes('下跌')) dir = '做空 SHORT';
+                  else if (regime.includes('震荡') || regime.includes('低波动')) dir = '观望 WAIT';
+                  else if (regime.includes('波动')) dir = '谨慎观望';
+                  else dir = '—';
+                }}
+                setText('k-ai-dir', dir);
+                const reason = String(ai['理由'] ?? '暂无');
+                const elR = document.getElementById('k-ai-reason');
+                if (elR) elR.innerHTML = '<span class="reason-box">' + (reason.length > 120 ? reason.slice(0,120)+'…' : reason) + '</span>';
+
+                // 更新时间
+                const up = document.getElementById('k-updated');
+                if (up) up.textContent = '· 最近刷新 ' + new Date().toLocaleTimeString();
               }} catch (_) {{ /* 未注入 controller 时静默 */ }}
             }}
+
+            async function refreshTrades() {{
+              try {{
+                const resp = await fetch('/api/trades?limit=20', {{cache:'no-store'}});
+                if (!resp.ok) return;
+                const rows = await resp.json();
+                const tbody = document.getElementById('k-trades');
+                if (!tbody) return;
+                if (!rows || !Array.isArray(rows) || rows.length === 0) {{
+                  tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#888;">暂无交易记录</td></tr>';
+                  return;
+                }}
+                tbody.innerHTML = rows.slice(0,20).map(r => (
+                  '<tr>' +
+                    '<td>' + (r['时间'] ?? r['time'] ?? '—') + '</td>' +
+                    '<td>' + (r['市场状态'] ?? r['market_regime'] ?? '—') + '</td>' +
+                    '<td>' + (r['置信度'] ?? r['confidence'] ?? 0) + '</td>' +
+                    '<td>' + (r['入场原因'] ?? r['entry_reason'] ?? '—') + '</td>' +
+                    '<td>' + (r['结果'] ?? r['result'] ?? '—') + '</td>' +
+                  '</tr>'
+                )).join('');
+              }} catch (_) {{ /* 未注入 controller 时静默 */ }}
+            }}
+
+            async function refresh() {{
+              await Promise.all([refreshStatus(), refreshTrades()]);
+            }}
+            // 首次 2s 后触发（等 Controller 初始化完）；之后每 5s
+            setTimeout(refresh, 2000);
             setInterval(refresh, 5000);
           </script>
         </body>
