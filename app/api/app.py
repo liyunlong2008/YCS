@@ -234,6 +234,54 @@ def create_app(
             raise HTTPException(status_code=503, detail="控制器尚未初始化，请先在 run.py 中注入 TradingController")
         return ctl
 
+    def _build_risk_tip(
+        *,
+        last_risk: Any,
+        pass_ts: int,
+        allow_val: Any,
+        ai_regime: Any,
+        ai_conf: int,
+    ) -> str:
+        """把风控 + AI 信号 + 缺口本金 压缩成 Dashboard 一行人类可读提示。"""
+        import time as _tip_t  # noqa: PLC0415
+        now = int(_tip_t.time())
+        if not isinstance(last_risk, dict):
+            return "启动中：等待第一轮风控评估（10s 内）"
+        conclusion = str(last_risk.get("结论") or "未执行")
+        reason = str(last_risk.get("原因") or "")[:80]
+        ai_ok = (isinstance(ai_regime, str)
+                 and ai_regime in ("上涨趋势", "下跌趋势")
+                 and int(ai_conf or 0) >= 50)
+        gap = last_risk.get("缺口本金(USDT)")
+        sug_lev = last_risk.get("建议杠杆(X)")
+        sug_nom = last_risk.get("建议名义价值(USDT)")
+        min_nom = last_risk.get("最小名义(USDT)")
+        ai_txt = (
+            f"AI信号到位[{ai_regime} conf={ai_conf}]"
+            if ai_ok
+            else f"AI信号未到[{ai_regime or '暂无'} conf={ai_conf}；需TREND_UP/DOWN+≥50才开]"
+        )
+        if int(pass_ts or 0) > 0:
+            age = now - int(pass_ts or 0)
+            hh, rem = divmod(age, 3600); mm, ss = divmod(rem, 60)
+            age_txt = (f"{hh}h{mm:02d}m{ss:02d}s前" if hh > 0
+                       else (f"{mm}m{ss:02d}s前" if mm > 0 else f"{ss}s前"))
+            if conclusion == "通过":
+                return f"✅ 信号双过{age_txt}，等成交/下一轮再评估 · 风控结论=通过(名义{sug_nom or '?'}U ≥ min {min_nom or '?'}U @ {sug_lev or '?'}X) · {ai_txt}"
+        if conclusion == "拒绝":
+            tail = ""
+            if isinstance(gap, (int, float)) and float(gap) > 0:
+                tail = (f" · ⚠️还差 ≈ {float(gap):.2f}U 本金才摸到最小单；"
+                        f"补救：提高杠杆(当前 {sug_lev if sug_lev else '?'}X)"
+                        f"或调大 R%/止损%")
+            return f"❌ 风控拒绝 · {reason}{tail}"
+        if conclusion == "通过":
+            if not ai_ok:
+                return f"🟡 风控通过(名义 {sug_nom or '?'}U ≥ min {min_nom or '?'}U @ {sug_lev or '?'}X) · 等{ai_txt}"
+            return f"🟢 风控通过 + {ai_txt} · 信号应已发送，查『最近交易』或 journalctl -u ycs | grep [主循环]"
+        # 未执行
+        return "启动中：等待第一轮风控评估（10s 内）"
+
     def _collect_dashboard_data(rt: dict[str, Any]) -> dict[str, Any]:
         """服务端聚合首页需要的字段；优先 Controller（实时）→ state_store（已持久化）→ 默认骨架。
            · 用 ctl.get_status_dict() 的中文结构对齐 /api/status，首屏 AI 就不再空。
@@ -523,6 +571,14 @@ def create_app(
             "drift_ms": drift_ms_val,
             "drift_age": drift_age_txt,
             "drift_paused": drift_paused,
+            # 2026-08-30：运行模式卡『风控提示』（解释为什么一直不开仓：风控拒因/AI信号状态/缺口本金）
+            "risk_tip": _build_risk_tip(
+                last_risk=rsk_ctl.get("最近一次风控"),
+                pass_ts=int(rsk_ctl.get("最近一次交易信号就绪时间戳") or 0),
+                allow_val=allow_val,
+                ai_regime=(ai_block or {}).get("市场状态"),
+                ai_conf=int((ai_block or {}).get("置信度") or 0),
+            ),
             "trades": trades_rows,
         }
 
@@ -574,6 +630,12 @@ def create_app(
             .kv {{ display:grid; grid-template-columns:1fr 1fr; gap:8px 16px; }}
             .kv .label {{ color:#64748b; font-size:12px; }}
             .kv .value {{ font-size:15px; font-weight:600; text-align:right; }}
+            /* 2026-08-30: 风控提示跨两列显示（长文本需要整行）*/
+            .kv .risk-tip-label {{ color:#64748b; font-size:12px; grid-column:1/2; }}
+            .kv .risk-tip-value {{ grid-column:2/3; text-align:left; font-weight:500; font-size:12.5px; word-break:break-word; line-height:1.55; border-left:3px solid #cbd5e1; padding:4px 10px; background:#fafbfc; border-radius:4px; }}
+            .kv .risk-tip-value.risk-deny {{ border-left-color:#c5221f; background:#fce8e6; color:#5f0e0b; }}
+            .kv .risk-tip-value.risk-wait {{ border-left-color:#f1b000; background:#fff7d6; color:#5a4400; }}
+            .kv .risk-tip-value.risk-pass {{ border-left-color:#137333; background:#e6f4ea; color:#083d18; }}
             .tag {{ display:inline-block; padding:2px 10px; border-radius:999px;
                      background:#e6f4ea; color:#137333; font-size:12px; margin-left:8px; vertical-align:middle; }}
             .tag.live {{ background:#fce8e6; color:#c5221f; }}
@@ -607,6 +669,8 @@ def create_app(
                 <div class="label">运行时长</div><div id="k-uptime" class="value">{d['uptime_human']}</div>
                 <div class="label">累计收益率 (%)</div><div id="k-total-pnl" class="value {'loss' if d['total_pnl_pct']<0 else 'win'}">{d['total_pnl_pct']:.2f}%</div>
                 <div class="label">已平仓交易</div><div id="k-closed" class="value">{d['closed']} 笔（胜{d['wins']}/败{d['losses']}）</div>
+                <div class="label risk-tip-label">风控提示</div>
+                <div id="k-risk-tip" class="value risk-tip-value">{d['risk_tip']}</div>
               </div>
             </div>
 
@@ -748,6 +812,50 @@ def create_app(
                 setText('k-consec', (risk['连续亏损次数'] ?? 0) + ' 次');
                 const wr = closed > 0 ? (wins / closed * 100) : 0;
                 setText('k-wr', wr.toFixed(0) + '%');
+
+                // 风控提示（2026-08-30 新增：直接显示『为什么不开仓』）
+                const elRiskTip = document.getElementById('k-risk-tip');
+                if (elRiskTip) {{
+                  const lastRisk = risk['最近一次风控'] || {{}};
+                  const ai = s['最近AI判断'] || {{}};
+                  const aiRegime = String(ai['市场状态'] ?? '暂无');
+                  const aiConf = Number(ai['置信度'] ?? 0);
+                  const aiOK = (aiRegime === '上涨趋势' || aiRegime === '下跌趋势') && aiConf >= 50;
+                  const passTs = Number(risk['最近一次交易信号就绪时间戳'] ?? 0);
+                  const conc = String(lastRisk['结论'] ?? '未执行');
+                  const reason = String(lastRisk['原因'] ?? '').slice(0, 120);
+                  const gap = lastRisk['缺口本金(USDT)'];
+                  const lev = lastRisk['建议杠杆(X)'];
+                  const sugNom = lastRisk['建议名义价值(USDT)'];
+                  const minNom = lastRisk['最小名义(USDT)'];
+                  let tip = '';
+                  if (passTs > 0 && conc === '通过') {{
+                    const age = Math.floor(Date.now()/1000 - passTs);
+                    const h = Math.floor(age/3600), m = Math.floor((age%3600)/60), s2 = age%60;
+                    const a = (h>0? h+'h'+String(m).padStart(2,'0')+'m'+String(s2).padStart(2,'0')+'s前'
+                              : (m>0? m+'m'+String(s2).padStart(2,'0')+'s前' : s2+'s前'));
+                    tip = '✅ 信号双过 ' + a + '，等成交/下一轮再评估 · 风控通过(名义 ' + sugNom + 'U ≥ min ' + minNom + 'U @ ' + lev + 'X) · AI[' + aiRegime + ' conf=' + aiConf + ']';
+                  }} else if (conc === '拒绝') {{
+                    let tail = '';
+                    if (gap != null && !isNaN(Number(gap)) && Number(gap) > 0) {{
+                      tail = ' · ⚠️还差 ≈ ' + Number(gap).toFixed(2) + 'U 本金摸到最小单；调杠杆(当前 ' + lev + 'X)或调大R%/止损%';
+                    }}
+                    tip = '❌ 风控拒绝 · ' + reason + tail;
+                  }} else if (conc === '通过') {{
+                    if (!aiOK) {{
+                      tip = '🟡 风控通过(名义 ' + sugNom + 'U ≥ min ' + minNom + 'U @ ' + lev + 'X) · 等AI信号(当前 [' + aiRegime + ' conf=' + aiConf + ']，需 TREND_UP/DOWN + ≥50)';
+                    }} else {{
+                      tip = '🟢 风控通过 + AI[' + aiRegime + ' conf=' + aiConf + '] · 信号应已发送，查「最近交易」或 journalctl -u ycs | grep [主循环]';
+                    }}
+                  }} else {{
+                    tip = '启动中：等待第一轮风控评估（10s 内）';
+                  }}
+                  elRiskTip.textContent = tip;
+                  elRiskTip.classList.remove('risk-pass','risk-deny','risk-wait');
+                  if (conc === '拒绝') elRiskTip.classList.add('risk-deny');
+                  else if (conc === '通过' && !aiOK) elRiskTip.classList.add('risk-wait');
+                  else if (conc === '通过') elRiskTip.classList.add('risk-pass');
+                }}
 
                 // AI
                 const ai = s['最近AI判断'] || {{}};
@@ -942,6 +1050,12 @@ def create_app(
                 "连续亏损次数": 0,
                 "熔断冷却至(秒时间戳)": 0,
                 "是否允许开仓": "否",
+                "最近一次风控": {
+                    "时间戳": None, "结论": "未执行", "原因": "Controller 未初始化（系统启动中）",
+                    "建议杠杆(X)": None, "建议名义价值(USDT)": None, "最小名义(USDT)": None,
+                    "缺口本金(USDT)": None, "AI_信号状态": "暂无",
+                },
+                "最近一次交易信号就绪时间戳": 0,
             },
         }
 
@@ -1163,6 +1277,58 @@ def create_app(
             "live_max_equity_usdt": max_eq,
             "live_max_daily_loss_usdt": max_daily_loss,
         }
+        # 2026-08-30: 不开仓可观测：把最近风控结论/建议名义/缺口/双过时间戳写入 system（curl 粘贴直接可读）
+        status_from_ctl: dict[str, Any] | None = None
+        if ctl is not None and hasattr(ctl, "get_status_dict"):
+            try:
+                status_from_ctl = ctl.get_status_dict() or None
+            except Exception:  # noqa: BLE001
+                status_from_ctl = None
+        if isinstance(status_from_ctl, dict):
+            rsk_ctl = status_from_ctl.get("风控状态") or {}
+            if isinstance(rsk_ctl, dict):
+                last_r = rsk_ctl.get("最近一次风控") or {}
+                if isinstance(last_r, dict):
+                    system_block["last_risk_conclusion"] = last_r.get("结论")
+                    system_block["last_risk_reason"] = (str(last_r.get("原因") or "")[:200] or None)
+                    system_block["last_risk_suggested_notional_usdt"] = last_r.get("建议名义价值(USDT)")
+                    system_block["last_risk_min_notional_usdt"] = last_r.get("最小名义(USDT)")
+                    system_block["last_risk_capital_gap_usdt"] = last_r.get("缺口本金(USDT)")
+                    system_block["last_risk_suggested_leverage"] = last_r.get("建议杠杆(X)")
+                system_block["last_risk_evaluated_at"] = (
+                    int(last_r.get("时间戳")) if isinstance(last_r, dict) and isinstance(last_r.get("时间戳"), (int, float)) else None
+                )
+                pt_ts = int(rsk_ctl.get("最近一次交易信号就绪时间戳") or 0)
+                if pt_ts > 0:
+                    system_block["last_trade_signal_ready_at"] = pt_ts
+                    age = max(0, int(_t.time()) - pt_ts)
+                    hh, rem = divmod(age, 3600); mm, ss = divmod(rem, 60)
+                    system_block["last_trade_signal_ready_age"] = (
+                        f"{hh}h{mm:02d}m{ss:02d}s" if hh > 0
+                        else (f"{mm}m{ss:02d}s" if mm > 0 else f"{ss}s")
+                    )
+                else:
+                    system_block["last_trade_signal_ready_at"] = None
+                    system_block["last_trade_signal_ready_age"] = None
+                ai_b = status_from_ctl.get("最近AI判断") or {}
+                if isinstance(ai_b, dict):
+                    regime = ai_b.get("市场状态")
+                    conf = int(ai_b.get("置信度") or 0)
+                    signal_ok = (isinstance(regime, str) and regime in ("上涨趋势", "下跌趋势") and conf >= 50)
+                    system_block["ai_signal_status"] = (
+                        f"到位[{regime} conf={conf}]" if signal_ok else f"不足[{regime or '暂无'} conf={conf}]"
+                    )
+                    if isinstance(last_r, dict) and last_r.get("结论") == "通过" and signal_ok:
+                        system_block["why_no_position"] = (
+                            "风控+AI双过，信号应已发送；仍未持仓 → 查日志 grep '[主循环]' / '[开仓]' / 'SHADOW' / execute 结果"
+                        )
+                    elif isinstance(last_r, dict) and last_r.get("结论") == "拒绝":
+                        system_block["why_no_position"] = "风控拒绝：" + (str(last_r.get("原因") or "")[:200])
+                    elif isinstance(last_r, dict) and last_r.get("结论") == "通过":
+                        system_block["why_no_position"] = f"风控通过(名义 {last_r.get('建议名义价值(USDT)')}U ≥ min {last_r.get('最小名义(USDT)')}U @ {last_r.get('建议杠杆(X)')}X)，等 AI信号到位或成交"
+                    elif last_r.get("结论") == "未执行" if isinstance(last_r, dict) else True:
+                        system_block["why_no_position"] = "风控未执行：等下一轮 bg_main_loop 10s"
+
 
         # ── 2) broker ──────────────────────────────────────────────
         broker_block: dict[str, Any] = {"available": False, "broker_type": None}

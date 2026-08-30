@@ -418,6 +418,11 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                     else:
                         market_side = None
                     if market_side is not None:
+                        # 2026-08-30：双过(风控+AI信号)后打一次时间戳快照，供 Dashboard「最近交易信号就绪时间」
+                        # 若 14:00 启动但这里始终=0 → 说明风控或 AI 之一没到位
+                        setattr(risk, "last_pass_trade_signal_at",
+                                int(getattr(risk, "last_pass_trade_signal_at", 0) or 0))
+                        risk.last_pass_trade_signal_at = int(now_ts)
                         logger.bind(log_type="trade").info(
                             "[主循环] 发起交易信号：side={} entry={} sz={} 名义={:.2f}U sl={} lev={}X "
                             "(min_notional={:.2f}U, max_notional={:.2f}U) {}",

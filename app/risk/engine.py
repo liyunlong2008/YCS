@@ -50,6 +50,8 @@ class RiskEngine:
         类常量仅在调用方不传参数时兜底（兼容旧测试）。
       · 计算链统一用『USDT 名义 ↔ 交易所 sz（张数）』双向换算，不再靠硬编码 0.1 张常量判断。
       · RiskVerdict 里新增 USDT 口径字段，让 Dashboard / 日志能直接展示『可下多少 USDT，最小需要多少 USDT，为什么开不了』。
+      · 新增 last_verdict / last_verdict_at：把「为什么没开仓」暴露给 /api/status + Dashboard（用户
+        之前看到风控状态=允许但实际上没触发开仓，无法分辨是风控拒了还是 AI 信号没到还是信号 pass 但 broker 没下）。
     """
 
     # ------------------------------------------------------------------
@@ -58,6 +60,13 @@ class RiskEngine:
     MAX_CONSECUTIVE_LOSSES = 3
     COOL_DOWN_HOURS = 12
     MAX_DAILY_LOSS_PCT = 15
+
+    # ------------------------------------------------------------------
+    # Dashboard 可观测：最近一次 check_can_open 快照（2026-08-30 新增）
+    # ------------------------------------------------------------------
+    last_verdict: RiskVerdict | None = None
+    last_verdict_at: int = 0          # 秒时间戳
+    last_pass_trade_signal_at: int = 0  # 最近一次 AI 信号 + 风控 双过（进入 execute_trade_signal 前记录）
 
     # 单笔风险：每笔最大亏损 = 账户总权益 × RISK_PER_TRADE_PCT（兜底默认；实际取 risk_limits.risk_per_trade_pct）
     #   14.83U × 5% = 0.7415U/笔
@@ -216,38 +225,44 @@ class RiskEngine:
 
         avail = balance_available if (balance_available is not None and balance_available > 0) else balance_total * 0.9
 
+        def _snap(v: RiskVerdict) -> RiskVerdict:
+            """所有拒/通 verdict 都落一份快照 → Dashboard 『为什么不开仓』提示。"""
+            self.last_verdict = v
+            self.last_verdict_at = int(now_ts)
+            return v
+
         # 1) 熔断期内
         if now_ts < self.cooldown_until_ts:
             remain_h = (self.cooldown_until_ts - now_ts) / 3600
-            return RiskVerdict(
+            return _snap(RiskVerdict(
                 allow=False,
                 reason=f"连续亏损熔断期内，剩余 {remain_h:.1f} 小时，暂停开仓",
                 suggested_leverage=leverage,
-            )
+            ))
 
         # 2) 连续亏损达到阈值 → 立即熔断，下次 check 起生效
         if self.consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
             self.cooldown_until_ts = now_ts + self.COOL_DOWN_HOURS * 3600
             self.consecutive_losses = 0
-            return RiskVerdict(
+            return _snap(RiskVerdict(
                 allow=False,
                 reason=f"连续亏损 {self.MAX_CONSECUTIVE_LOSSES} 次，启动熔断 {self.COOL_DOWN_HOURS} 小时",
                 suggested_leverage=leverage,
-            )
+            ))
 
         # 3) 日亏损熔断
         daily_loss_pct = 0.0
         if self.daily_start_balance > 1e-9:
             daily_loss_pct = (1 - balance_total / self.daily_start_balance) * 100
             if daily_loss_pct >= self.MAX_DAILY_LOSS_PCT:
-                return RiskVerdict(
+                return _snap(RiskVerdict(
                     allow=False,
                     reason=(
                         f"当日亏损 {daily_loss_pct:.2f}% 超过阈值 {self.MAX_DAILY_LOSS_PCT}%，"
                         "强制停止交易，请次日再启动"
                     ),
                     suggested_leverage=leverage,
-                )
+                ))
 
         # 4) 按 R + 交易所规则统一算（先 USDT 口径，再折算 sz 并按 lotSz 夹合法性）
         #    4.1 目标最大亏损(USDT) = balance_total × risk_pct%
@@ -285,7 +300,7 @@ class RiskEngine:
             raw_notional = raw_sz * per_contract
             # 反推：『摸到最小名义』需要多少本金（=eff_min_notional / leverage）；用户若余额只差一点，能直接看出要补多少
             min_capital_for_min = eff_min_notional / max(1, leverage)
-            return RiskVerdict(
+            deny = RiskVerdict(
                 allow=False,
                 reason=(
                     f"本金太小无法开最小单：当前名义上限可开 ≈ {raw_notional:.2f} USDT "
@@ -305,9 +320,12 @@ class RiskEngine:
                 sz_by_risk=qty_by_risk,
                 sz_by_margin=qty_by_margin,
             )
+            self.last_verdict = deny
+            self.last_verdict_at = int(now_ts)
+            return _snap(deny)
         # 通过：sz 合法，填充完整字段（含 USDT 口径，供运行日志展示）
         suggested_notional = legal_notional
-        return RiskVerdict(
+        verdict = RiskVerdict(
             allow=True,
             reason=(
                 f"风控通过：连亏={self.consecutive_losses} 日亏={daily_loss_pct:.2f}% "
@@ -324,6 +342,8 @@ class RiskEngine:
             sz_by_risk=float(qty_by_risk),
             sz_by_margin=float(qty_by_margin),
         )
+        # 2026-08-30：落盘一份最新 verdict 给 Dashboard「为什么不开仓」卡片
+        return _snap(verdict)
 
     # ------------------------------------------------------------------
     # 辅助：按方向返回正确止损价（check_can_open 返回的是多头基准）

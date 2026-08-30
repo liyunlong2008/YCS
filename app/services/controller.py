@@ -259,6 +259,58 @@ class TradingController:
                 "连续亏损次数": self.risk.consecutive_losses,
                 "熔断冷却至(秒时间戳)": self.risk.cooldown_until_ts,
                 "是否允许开仓": "是" if (self.risk.cooldown_until_ts == 0 or time.time() >= self.risk.cooldown_until_ts) and sys_status == SystemStatus.RUNNING else "否",
+                # 2026-08-30 新增：Dashboard 直读「最近一次风控结论/建议名义/缺口」，解决用户反馈的
+                #   '风控显示允许但实盘影子从启动至今没开仓' 的可观测黑盒
+                "最近一次风控": {
+                    "时间戳": (
+                        int(self.risk.last_verdict_at) if isinstance(getattr(self.risk, "last_verdict_at", 0), (int, float)) else 0
+                    ),
+                    "结论":
+                        "通过" if (
+                            self.risk.last_verdict is not None
+                            and bool(getattr(self.risk.last_verdict, "allow", False))
+                        ) else (
+                            "拒绝" if self.risk.last_verdict is not None else "未执行"
+                        ),
+                    "原因": (
+                        str(getattr(self.risk.last_verdict, "reason", ""))
+                        if self.risk.last_verdict is not None
+                        else "系统尚未发起风控评估（等下一轮主循环 10s 内）"
+                    ),
+                    "建议杠杆(X)":
+                        int(getattr(self.risk.last_verdict, "suggested_leverage", 0) or 0)
+                        if self.risk.last_verdict is not None else None,
+                    "建议名义价值(USDT)": round(
+                        float(getattr(self.risk.last_verdict, "suggested_notional_usdt", 0.0) or 0.0), 4
+                    ) if self.risk.last_verdict is not None else None,
+                    "最小名义(USDT)": round(
+                        float(getattr(self.risk.last_verdict, "effective_min_notional_usdt", 0.0) or 0.0), 4
+                    ) if self.risk.last_verdict is not None else None,
+                    "缺口本金(USDT)": (
+                        # 缺口 = 摸到最小单还需要补多少本金（= (min_notional - 当前目标名义)/leverage）
+                        round(max(0.0, (
+                            float(getattr(self.risk.last_verdict, "effective_min_notional_usdt", 0.0) or 0.0)
+                            - float(getattr(self.risk.last_verdict, "suggested_notional_usdt", 0.0) or 0.0)
+                        )) / max(1, int(getattr(self.risk.last_verdict, "suggested_leverage", 1) or 1)), 4)
+                        if (self.risk.last_verdict is not None and not bool(getattr(self.risk.last_verdict, "allow", False)))
+                        else None
+                    ),
+                    "AI_信号状态": (
+                        "不足(reg=%s conf=%s，≥50且TREND才开)" % (
+                            (ai_block.get("市场状态") or "?"),
+                            (ai_block.get("置信度") if isinstance(ai_block, dict) else 0),
+                        )
+                        if (not isinstance(ai_block, dict)
+                            or int(ai_block.get("置信度") or 0) < 50
+                            or (ai_block.get("市场状态") or "") in ("低波动", "震荡区间", "暂无"))
+                        else "到位: %s conf=%s" % (
+                            (ai_block.get("市场状态") or "?"),
+                            (ai_block.get("置信度") if isinstance(ai_block, dict) else 0),
+                        )
+                    ),
+                },
+                # 最近一次通过风控+AI双确认→进入下单流程的时间戳；=0 意味着从未准备下单
+                "最近一次交易信号就绪时间戳": int(getattr(self.risk, "last_pass_trade_signal_at", 0) or 0),
             },
         }
 
