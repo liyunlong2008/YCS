@@ -590,19 +590,23 @@ if [ "$IS_FIRST" -eq 1 ]; then
   log_o "部署完成；系统状态摘要："
   systemctl status ycs --no-pager --lines=10 || true
 else
-  log_i "更新完成 → ycsctl restart（加载新代码）"
-  # 更新分支：重启前再双保险做一次 data/logs/.venv 存在检查（尤其 VPS 老版本遗留下来 logs 没建的情况）
+  # 2026-08-30：增量更新分支**必须重新执行 install_systemd.sh（幂等）**，而不是只跑
+  #   `ycsctl restart`。原因：只要仓库里 deploy/ycs.service.template 升级（比如本轮：
+  #   老 ExecStart=uv run python → 新 ExecStart=.venv/bin/python；加 ExecCondition；
+  #   ProtectHome=true→tmpfs；…），如果不重渲 /etc/systemd/system/ycs.service，
+  #   systemd 会一直跑老模板，现场表现就是 install.sh 打印「更新成功 + ycs 重启成功」，
+  #   但 journalctl 仍然 status=203/EXEC 无限重启（因为 /etc 那份还是用 uv 路径，
+  #   被 ProtectHome=true 藏掉）。
+  #   install_systemd.sh 本身是幂等的：每次都会重新渲染 unit、daemon-reload、
+  #   enable + restart，且新增了「渲染后 6 类静态断言 + run.py --help 冒烟」，
+  #   有问题直接在安装阶段 die，不会把坏 unit 留在 /etc 让 systemd 无限循环。
+  log_i "更新模式：重渲 systemd unit（对齐仓库 ycs.service.template 最新）+ daemon-reload + restart"
   _mk_runtime_dirs
-  # 主路径：ycsctl restart（UV_BIN 绝对路径 → sudo 下也不会被清 PATH）
   # shellcheck disable=SC2086
-  if $SUDO env UV_BIN="$UV_BIN" "$UV_BIN" run python deploy/ycsctl.py restart; then
-    log_o "ycs 服务重启成功"
-  else
-    log_w "ycsctl restart 失败（可能 systemd unit 尚未安装），改为首次执行 install_systemd.sh"
-    # shellcheck disable=SC2086
-    $SUDO env UV_BIN="$UV_BIN" INSTALL_DIR="$INSTALL_DIR" CONFIG_PATH="${CONFIG_PATH:-}" \
-      bash deploy/install_systemd.sh || die "install_systemd.sh 兜底失败，见上方输出"
-  fi
+  $SUDO env UV_BIN="$UV_BIN" INSTALL_DIR="$INSTALL_DIR" CONFIG_PATH="${CONFIG_PATH:-}" \
+    bash deploy/install_systemd.sh || die "install_systemd.sh 失败，见上方输出。" \
+      "若提示 ExecCondition/ExecStart 某目录不存在 → 先手动：mkdir -p $INSTALL_DIR/data $INSTALL_DIR/logs && chown -R root:root $INSTALL_DIR/data $INSTALL_DIR/logs"
+  log_o "ycs 服务重启成功（systemd unit 已按最新模板重渲 & enable）"
 fi
 
 # ---------------------------------------------------------------------------
