@@ -30,6 +30,7 @@ from ..storage.state_store import StateStore
 from ..storage.trade_journal import TradeJournal
 from ..storage import journal_ext  # noqa: F401 —— 绑定 TradeJournal.append_market 便捷方法
 from ..trading.order_manager import OrderManager  # noqa: F401 —— 运行时装配、execute_trade_signal 中 getattr 使用
+from ..core.ai_throttle import AIThrottler, ThrottleDecision  # 新增 2026-08-30 自适应节流+价格哨兵
 
 
 _ZH_RUN_MODE = {RunMode.PAPER: "纸盘模式", RunMode.LIVE: "实盘模式"}
@@ -73,11 +74,24 @@ class TradingController:
         self.state_store = state_store
         self.journal = journal
         self.market_producer = market_producer
+        # AI 节流器：2026-08-30 自适应 7 级状态机+价格哨兵
+        self.ai_throttler: AIThrottler = AIThrottler()
         # 记录最近一次 AI 判断结果，供 Dashboard 展示
         self._last_ai: Optional[MarketAnalysisResult] = None
         self._last_ai_ts: Optional[int] = None
-        # 从 state_store 恢复 last_ai
+        # 从 state_store 恢复 last_ai + throttler
         self._restore_last_ai_from_store()
+        # 恢复 throttler 持久化状态（注意：_restore_last_ai_from_store 已 load 过 state_store）
+        st2 = self.state_store.load()
+        self.ai_throttler.load_from(st2)
+        # 若还没设过价格锚（冷启动），预填一个价格锚：否则前 30s~1m 哨兵没基准。
+        if self.ai_throttler.state.sentinel_mark_price <= 0:
+            # 冷启动先用 ETH≈2466 的保守参考价，后续 AI 真正调用时会刷新到真实 mark_price
+            self.ai_throttler.state.sentinel_mark_price = 2466.0
+            self.ai_throttler.state.sentinel_anchor_ts = int(time.time())
+            st2b = self.state_store.load()
+            self.ai_throttler.persist_to(st2b)
+            self.state_store.save(st2b)
 
     # ------------------------------------------------------------------
     # 初始化：从 state_store 恢复 last_ai；若仍为空，用构造的 MarketData 调一次 AI 给初始值
@@ -225,13 +239,138 @@ class TradingController:
         return out
 
     # ------------------------------------------------------------------
-    async def analyze(self) -> dict[str, Any]:
-        """拉行情 → 调 AI → 写入 last_ai，返回中文展示。
+    # AI 节流 + 价格哨兵（新增 2026-08-30：7 级状态机自适应调用频率）
+    # ------------------------------------------------------------------
+    async def should_analyze(
+        self,
+        *,
+        mark_price: float = 0.0,
+        entry_price: float = 0.0,
+        stop_loss_price: float = 0.0,
+        take_profit_price: float = 0.0,
+        liquidation_price: float = 0.0,
+        has_position: bool = False,
+        force: bool = False,
+    ) -> ThrottleDecision:
+        """主循环入口：本轮是否需要调 AI analyze()。
+        - 自动读 state_store：RUNNING 状态、风控 allow_trading、冷却 cooldown_until；
+        - mark_price 不传时自动查 broker 仓位 mark_price → state_store → 兜底 2466；
+        - 返回 ThrottleDecision：should_call / level / reason / early_wake（行情≥1% 波动叫醒）/ event_pct。
+        """
+        now_ts = int(time.time())
+        st = self.state_store.load()
+        self.ai_throttler.load_from(st)
+        # 系统状态 & 风控 allow
+        status_raw = st.get("status") or SystemStatus.STOPPED.value
+        try:
+            running = SystemStatus(status_raw) == SystemStatus.RUNNING
+        except ValueError:
+            running = False
+        risk_dict = st.get("risk") or {}
+        cd_ts = int(risk_dict.get("cooldown_until", 0) or 0)
+        allow = bool(risk_dict.get("allow_trading", True)) and (cd_ts == 0 or now_ts >= cd_ts)
+        # 价格 & 仓位实时获取
+        mark = float(mark_price or 0.0)
+        has_pos = bool(has_position)
+        entry = float(entry_price or 0.0)
+        liq = float(liquidation_price or 0.0)
+        if mark <= 0:
+            try:
+                pos = await self.broker.get_position(self.config.trading.symbol)
+                mark = float(getattr(pos, "mark_price", 0.0) or 0.0)
+                from ..core.constants import PositionSide as _PS
+                has_pos = (pos.side != _PS.FLAT)
+                if entry <= 0:
+                    entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                if liq <= 0:
+                    liq = float(getattr(pos, "liquidation_price", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                mark = 0.0
+        if mark <= 0:
+            pos_save = (st.get("position") or {}) if isinstance(st, dict) else {}
+            mark = float(pos_save.get("mark_price", 0.0) or 0.0)
+            if entry <= 0:
+                entry = float(pos_save.get("entry_price", 0.0) or 0.0)
+        if mark <= 0:
+            mark = 2466.0  # 兜底
 
-        若未配置 market_producer 或拉取失败（超时/无网络），回退到默认 MarketData，
-        确保 Dashboard 始终有可用结果展示。
+        dec = self.ai_throttler.should_call_ai(
+            now_ts=now_ts,
+            system_status_running=running,
+            has_position=has_pos,
+            allow_trading=allow,
+            mark_price=mark,
+            entry_price=entry,
+            stop_loss_price=float(stop_loss_price or 0.0),
+            take_profit_price=float(take_profit_price or 0.0),
+            liquidation_price=liq,
+            force=bool(force),
+        )
+        # 持久化：哪怕本轮不调 AI，价格哨兵的 last_event_pct / last_event_at / level 也要存
+        st2 = self.state_store.load()
+        self.ai_throttler.persist_to(st2)
+        self.state_store.save(st2)
+        return dec
+
+    # ------------------------------------------------------------------
+    async def analyze(self, force: bool = False) -> dict[str, Any]:
+        """拉行情 → 调 AI → 记录节流状态 → 返回中文展示。
+
+        - force=True 绕过节流（价格哨兵早叫 / API 手动触发）；
+        - 节流挡住时返回上一次 AI 结果 + 理由前缀提示节流级别；
+        - 失败时递增 consec_failures（下次进入 DEGRADED 120s 降频）。
         """
         from ..ai.base import MarketAnalysisResult
+        now_ts = int(time.time())
+
+        # 1) 节流决策（哪怕 force=True 也要跑一遍，以持久化 early_wake 统计）
+        mark_price = 0.0
+        has_pos = False
+        entry = 0.0; liq = 0.0
+        try:
+            pos = await self.broker.get_position(self.config.trading.symbol)
+            mark_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
+            has_pos = pos.side != PositionSide.FLAT
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            liq = float(getattr(pos, "liquidation_price", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            pos = None  # type: ignore[assignment]
+        st_dec = self.state_store.load()
+        self.ai_throttler.load_from(st_dec)
+        status_raw = (st_dec.get("status") or "") if isinstance(st_dec, dict) else ""
+        running = (status_raw == SystemStatus.RUNNING.value)
+        risk_d = st_dec.get("risk") or {} if isinstance(st_dec, dict) else {}
+        allow = bool(risk_d.get("allow_trading", True))
+        dec = self.ai_throttler.should_call_ai(
+            now_ts=now_ts,
+            system_status_running=running,
+            has_position=has_pos,
+            allow_trading=allow,
+            mark_price=float(mark_price or 2466.0),
+            entry_price=entry,
+            stop_loss_price=0.0,
+            take_profit_price=0.0,
+            liquidation_price=liq,
+            force=bool(force),
+        )
+        # 未到时：直接返回上次 AI 结果 + 标注『节流』
+        if not dec.should_call:
+            last = self._last_ai_block()
+            wait = max(dec.next_call_at - now_ts, 0)
+            reason_prefix = f"[节流 {dec.level.value} 冷却 {wait}s] {dec.reason} | "
+            # 避免重复前缀
+            prev_reason = str(last.get("理由") or "")
+            if prev_reason.startswith("[节流"):
+                import re as _re
+                prev_reason = _re.sub(r"^\[节流[^\]]*\][^|]*\|\s*", "", prev_reason)
+            last["理由"] = reason_prefix + prev_reason
+            last["节流级别"] = dec.level.value
+            last["下次调用(秒后)"] = wait
+            last["早叫触发(1%波动)"] = dec.early_wake
+            last["最近波动(%)"] = round(dec.event_pct, 3)
+            return last
+
+        # 2) 拉行情（market_producer → 兜底）
         if self.market_producer is not None:
             try:
                 md: MarketData = await self.market_producer.get_market_data()
@@ -246,10 +385,13 @@ class TradingController:
                 symbol=self.config.trading.symbol,
                 timestamp=int(time.time() * 1000),
             )
+        # 3) 调 AI
+        ai_ok = True
         try:
             result = await self.ai.analyze_market(md)
         except Exception as e:
             logger.warning("AI 分析失败（回退默认 RANGE）：{}", e)
+            ai_ok = False
             result = MarketAnalysisResult(
                 market_regime=MarketRegime.RANGE,
                 confidence=0,
@@ -257,24 +399,45 @@ class TradingController:
             )
         self._last_ai = result
         self._last_ai_ts = int(time.time() * 1000)
+        # 真实价格锚：ticker last / md.close / mark_price → 越准越好
+        real_mark = float(md.close or 0.0)
+        if real_mark <= 0 and isinstance(getattr(md, "extra", None), dict):
+            real_mark = float(md.extra.get("last") or 0.0)  # type: ignore[union-attr]
+        if real_mark <= 0 and mark_price > 0:
+            real_mark = float(mark_price)
+        if real_mark <= 0:
+            real_mark = 2466.0
         logger.bind(log_type="trade").info(
-            "[AI 决策] 市场状态={} 置信度={} 理由={}",
+            "[AI 决策] 市场状态={} 置信度={} 理由={} (节流={} early_wake={} 波动={:.2f}%)",
             result.market_regime.value, result.confidence, result.reason,
+            dec.level.value, dec.early_wake, dec.event_pct,
         )
-        # 持久化到 state.json 便于恢复
+        # 4) 持久化 last_ai + ai_throttler
         st = self.state_store.load()
         st["last_ai"] = {
             "market_regime": result.market_regime.value,
             "confidence": result.confidence,
             "reason": result.reason,
             "ts": self._last_ai_ts,
+            "throttle_level": dec.level.value,
+            "early_wake": dec.early_wake,
+            "event_pct": dec.event_pct,
         }
+        self.ai_throttler.load_from(st)
+        self.ai_throttler.record_analyze_outcome(
+            now_ts=now_ts, ok=ai_ok, cost_usdt=0.0, mark_price_after=real_mark,
+        )
+        self.ai_throttler.persist_to(st)
         self.state_store.save(st)
         return {
             "市场状态": _ZH_MARKET.get(result.market_regime, str(result.market_regime)),
             "置信度": result.confidence,
             "理由": result.reason,
             "时间": self._last_ai_ts,
+            "节流级别": dec.level.value,
+            "下次调用(秒后)": max(dec.next_call_at - now_ts, 0),
+            "早叫触发(1%波动)": dec.early_wake,
+            "最近波动(%)": round(dec.event_pct, 3),
         }
 
     # ------------------------------------------------------------------
