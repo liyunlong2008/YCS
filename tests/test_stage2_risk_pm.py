@@ -52,8 +52,9 @@ class TestRiskEngine:
 
     def test_check_can_open_allows_then_computes_size(self) -> None:
         r = RiskEngine()
-        # 1000U 余额，入场价 2000 ETH，默认 RISK_PER_TRADE=1% 亏 10U；止损 1% → 价格跌 20 U
-        # Qty = 10U / (20U * 3 lev) = 0.166 张
+        # 1000U 余额，入场价 2000 ETH：
+        #   R=5% → max_loss=50U；SL=2.5% 价格 → 每张 (0.01) 止损=2000*2.5%*0.01=0.5U；lev=10X
+        #   sz_by_risk = 50 / (0.5 * 10) = 10.0 张 → 名义=10 * 0.01 * 2000 = 200U
         v = asyncio.run(r.check_can_open(
             balance_total=1000.0, entry_price=2000.0, now_ts=1_000_000,
         ))
@@ -63,8 +64,8 @@ class TestRiskEngine:
         assert v.suggested_size > 0
         # 止损价 < 入场价（多头基准）
         assert 0 < v.stop_loss_price < 2000
-        # 建议杠杆 = DEFAULT_LEVERAGE = 3
-        assert v.suggested_leverage == 3
+        # 建议杠杆 = DEFAULT_LEVERAGE = 10（2026-08-30 校准：适配 14.83U 小账户跨 minSz 门槛）
+        assert v.suggested_leverage == r.DEFAULT_LEVERAGE
         # 中文 reason 包含关键词
         assert "风控通过" in v.reason
 
@@ -101,12 +102,18 @@ class TestRiskEngine:
 
     def test_check_can_open_low_balance_blocked(self) -> None:
         r = RiskEngine()
-        # 余额 10U × 1% = 0.1U；止损 2000 × 1% = 20U × 3 杠杆 → 所需张数极小
+        # 余额 1U（小到摸不到 minSz）：R=5% → max_loss=0.05U；SL=2.5% → 每张止损=0.5U；lev=10X
+        #   sz_by_risk = 0.05 / (0.5 * 10) = 0.01 张 < minSz=0.1 → 拒绝
+        # 拒绝原因是 USDT 口径（本金太小无法开最小单 / 最小名义），不应出现老的"张数 < X"裸张数判断
         v = asyncio.run(r.check_can_open(
-            balance_total=10.0, entry_price=2000, now_ts=1_000_000,
+            balance_total=1.0, entry_price=2000, now_ts=1_000_000,
         ))
         assert v.allow is False
-        assert "余额不足" in v.reason
+        # 中文拒绝原因应出现：USDT / 名义 / 最小单 相关关键词（USDT 口径）
+        reason = v.reason or ""
+        assert ("本金太小" in reason) or ("名义" in reason) or ("USDT" in reason) or ("最小单" in reason), (
+            f"拒绝原因未走 USDT 口径（防止老的 sz<0.1 裸判断回退）：{reason[:200]}"
+        )
 
     def test_start_new_day_sets_daily_balance(self) -> None:
         r = RiskEngine()

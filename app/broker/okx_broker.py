@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from decimal import Decimal
+from typing import Any, Optional, Tuple
 
 import ccxt.pro as ccxt_pro
 from loguru import logger
@@ -22,7 +23,7 @@ from ..core.constants import (
     SYMBOL,
 )
 from ..core.safety import should_block_real_orders
-from .base import Balance, Broker, Order, Position
+from .base import Balance, Broker, MarketSpec, Order, Position
 
 
 _CCXT_SIDE_TO_LOCAL = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}
@@ -87,6 +88,9 @@ class OKXBroker(Broker):
         self._shadow_mode = bool(shadow_mode)
         # 懒初始化：便于测试时注入 Fake exchange
         self._exchange: Optional[ccxt_pro.okx] = None
+        # 2026-08-30：MarketSpec 缓存（symbol -> (spec, 过期秒时间戳)），避免每次风控都打 OKX
+        self._market_spec_cache: dict[str, Tuple[MarketSpec, float]] = {}
+        self._market_spec_ttl_s: int = 3600  # 1 小时刷新一次足够（最小下单规则几乎不变）
         logger.info("OKXBroker 初始化完成: symbol={} shadow={}", symbol, self._shadow_mode)
 
     def set_shadow_mode(self, value: bool) -> None:
@@ -206,6 +210,173 @@ class OKXBroker(Broker):
         return out
 
     # ------------------------------------------------------------------
+    # MarketSpec：交易所最小下单 / 面值 / 杠杆上限（2026-08-30 新增）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _decimals_from_str(s: str, cap: int = 4) -> int:
+        """按 lotSz / tickSz 的字符串（0.1, 0.0001, 1）推小数位；最大 cap 位，避免极端精度值撑爆。"""
+        try:
+            d = Decimal(str(s))
+            exponent = d.as_tuple().exponent
+            if isinstance(exponent, int):
+                return max(0, min(int(-exponent), int(cap)))
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
+    async def fetch_market_spec(self, symbol: Optional[str] = None) -> MarketSpec:
+        """真实从 OKX 拉交易规则：
+            1) 先用 ccxt.load_markets 拿 ctVal / minSz / precision;
+            2) 再用 /api/v5/public/instruments 补 minSz / lotSz / maxLever / maxLmtSz / maxMktSz / ctVal；
+            3) 全失败就 fallback 默认值（ETH-USDT-SWAP 的公开保守值）。
+        结果带 1 小时 TTL 缓存。"""
+        key = symbol or self.symbol
+        now = time.time()
+        cached = self._market_spec_cache.get(key)
+        if cached and cached[1] >= now:
+            return cached[0]
+        ex = self._ensure_client()
+        # OKX instId（/api/v5 风格）：ETH-USDT-SWAP；若 ccxt 风格 ETH/USDT:USDT 传入则归一
+        inst_id = key if "-SWAP" in key or "-SPOT" in key else key
+        # 把 ccxt 格式归一到 instId （简单映射：ETH/USDT:USDT → ETH-USDT-SWAP）
+        if ":" in inst_id and "/" in inst_id and "-" not in inst_id:
+            base, rest = inst_id.split("/", 1)
+            quote = rest.split(":", 1)[0]
+            inst_id = f"{base}-{quote}-SWAP"
+
+        collected: dict[str, Any] = {"symbol": key, "source_parts": []}
+
+        # --- L1: ccxt.load_markets（能拿到 precision/limits/contractSize）---
+        try:
+            markets = await ex.load_markets(reload=False)
+            candidates = [key]
+            # 把 ccxt 风格符号也加进去互查
+            if "-SWAP" in key:
+                base2, quote2, _typ = key.split("-", 2)
+                candidates.insert(0, f"{base2}/{quote2}:{quote2}")
+            m: Any = None
+            for cand in candidates:
+                m = markets.get(cand)
+                if m:
+                    break
+            if m:
+                collected["source_parts"].append("ccxt_load_markets")
+                ct_val = float(m.get("contractSize") or 0.01)
+                precision = m.get("precision") or {}
+                amount_p = precision.get("amount") or m.get("contractSize") or 0.1
+                price_p = precision.get("price") or 0.1
+                lim = m.get("limits") or {}
+                lim_amount = lim.get("amount") or {}
+                collected.setdefault("ct_val", ct_val)
+                collected.setdefault("lot_sz", float(amount_p))
+                collected.setdefault("min_sz", float(lim_amount.get("min") or float(amount_p)))
+                collected.setdefault("max_limit_sz", float((lim.get("order") or {}).get("max") or 10_000.0))
+                collected.setdefault("max_market_sz", float((lim.get("market") or lim.get("order") or {}).get("max") or 10_000.0))
+                collected.setdefault("tick_sz", float(price_p))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("OKX fetch_market_spec L1(load_markets) 失败，继续：{}", e)
+
+        # --- L2: OKX /api/v5/public/instruments（真官方源）---
+        try:
+            # ccxt.pro.okx 提供了 unified signed + public API；公共接口直接查
+            resp = await ex.public_get_public_instruments(params={
+                "instType": "SWAP",
+                "instId": inst_id,
+            })
+            data = ((resp or {}).get("data") or [])
+            if not data:
+                # 若没有按 instId 命中，再拉全量 SWAP 并按 uly=ETH 过滤（兜底）
+                resp2 = await ex.public_get_public_instruments(params={"instType": "SWAP"})
+                all_rows = ((resp2 or {}).get("data") or []) if isinstance(resp2, dict) else []
+                data = [r for r in all_rows if r.get("instId") == inst_id or r.get("instId") == key]
+                if not data:
+                    # 再退化：取一个 uly=ETH-USDT / category=linear 的第一个
+                    data = [r for r in all_rows if str(r.get("uly", "")).startswith("ETH")]
+            if data:
+                row = data[0] or {}
+                collected["source_parts"].append("okx_public_instruments")
+
+                def _g(fields: list[str], default: Any) -> Any:
+                    for fld in fields:
+                        v = row.get(fld)
+                        if v not in (None, "", "null"):
+                            return v
+                    return default
+
+                ct_val = float(_g(["ctVal", "contractMultiplier", "ctMult"], collected.get("ct_val") or 0.01))
+                min_sz = float(_g(["minSz"], collected.get("min_sz") or 0.1))
+                lot_sz = float(_g(["lotSz"], collected.get("lot_sz") or min_sz))
+                tick_sz = float(_g(["tickSz"], collected.get("tick_sz") or 0.1))
+                max_lmt = float(_g(["maxLmtSz"], collected.get("max_limit_sz") or 10_000.0))
+                max_mkt = float(_g(["maxMktSz"], collected.get("max_market_sz") or 10_000.0))
+                # 最大杠杆：lever 一般传 "1.25.50.100" 这种段（用最大数兜底）；maxLever（V5 新字段）优先
+                lever_raw = _g(["maxLever", "lever"], None)
+                max_lever = 125
+                if lever_raw is not None:
+                    try:
+                        s = str(lever_raw)
+                        if s.isdigit():
+                            max_lever = int(s)
+                        else:
+                            nums = [int(p) for p in s.replace("x", "").replace("X", "").split(".") if p.isdigit()]
+                            if nums:
+                                max_lever = max(nums)
+                    except Exception:  # noqa: BLE001
+                        pass
+                # minNotionalUsd（部分品种会直接给；没给就留 0，RiskEngine 会用 minSz×ctVal×entry 推算）
+                min_notional = float(_g(["minNotionalUsd", "minVal", "minNominalUsd"], 0.0) or 0.0)
+                collected.update({
+                    "ct_val": ct_val,
+                    "min_sz": min_sz,
+                    "lot_sz": lot_sz,
+                    "tick_sz": tick_sz,
+                    "max_limit_sz": max_lmt,
+                    "max_market_sz": max_mkt,
+                    "max_lever": int(max_lever),
+                    "min_notional_usdt": min_notional,
+                })
+        except Exception as e:  # noqa: BLE001
+            logger.debug("OKX fetch_market_spec L2(public instruments) 失败，继续：{}", e)
+
+        # --- L3: 兜底默认值（ETH-USDT-SWAP）---
+        defaults: dict[str, Any] = {
+            "ct_val": 0.01,
+            "min_sz": 0.1,
+            "lot_sz": 0.1,
+            "tick_sz": 0.1,
+            "max_lever": 125,
+            "max_limit_sz": 10_000.0,
+            "max_market_sz": 10_000.0,
+            "min_notional_usdt": 0.0,
+        }
+        for k, v in defaults.items():
+            collected.setdefault(k, v)
+        # 计算 sz_decimals（来源于 lotSz 字符串精度；缺则 1）
+        lot_sz_raw: Any = collected.get("lot_sz") or "0.1"
+        sz_decimals = self._decimals_from_str(str(lot_sz_raw), cap=4)
+        if sz_decimals == 0 and float(lot_sz_raw) < 1:
+            sz_decimals = 1  # 兜底
+
+        source = "+".join(collected["source_parts"]) if collected.get("source_parts") else "fallback_defaults"
+        spec = MarketSpec(
+            symbol=key,
+            ct_val=float(collected["ct_val"]),
+            min_sz=float(collected["min_sz"]),
+            lot_sz=float(collected["lot_sz"]),
+            sz_decimals=int(sz_decimals),
+            tick_sz=float(collected["tick_sz"]),
+            min_notional_usdt=float(collected.get("min_notional_usdt") or 0.0),
+            max_lever=int(collected.get("max_lever") or 125),
+            max_limit_sz=float(collected.get("max_limit_sz") or 10_000.0),
+            max_market_sz=float(collected.get("max_market_sz") or 10_000.0),
+            source=source,
+        )
+        self._market_spec_cache[key] = (spec, now + self._market_spec_ttl_s)
+        logger.debug("OKX MarketSpec[{}] OK: source={} minSz={} ctVal={} maxLever={} szDecimals={}",
+                     key, source, spec.min_sz, spec.ct_val, spec.max_lever, spec.sz_decimals)
+        return spec
+
+    # ------------------------------------------------------------------
     # 交易（阶段 2 实现 · 带 A7 影子闸门双保险）
     # ------------------------------------------------------------------
     def _shadow_filled_order(
@@ -257,6 +428,21 @@ class OKXBroker(Broker):
             return self._shadow_filled_order(symbol, side, type, amount, price, client_order_id)
         if amount <= 0:
             raise ValueError("下单数量必须为正")
+
+        # 2026-08-30：对 sz 做交易所 lotSz/szDecimals 规范化（否则 OKX 会报 sz precision / sz lot 错误）
+        try:
+            spec = await self.fetch_market_spec(symbol)
+            norm = spec.clamp_sz(float(amount), is_market=(type == OrderType.MARKET))
+            if norm <= 0:
+                raise ValueError(f"规范化后 sz=0（原 amount={amount}，spec.minSz={spec.min_sz} lotSz={spec.lot_sz}）")
+            if abs(norm - float(amount)) > 1e-9:
+                logger.info("OKX place_order sz 规范化：amount={} → {} (lotSz={} decimals={})",
+                            amount, norm, spec.lot_sz, spec.sz_decimals)
+            amount = norm
+        except ValueError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("OKX place_order sz 规范化失败（按原 amount 继续）: {}", e)
 
         ex = self._ensure_client()
         side_str = "buy" if side == OrderSide.BUY else "sell"

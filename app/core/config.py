@@ -33,6 +33,10 @@ class TradingConfig(BaseModel):
     """交易运行模式配置。"""
     live: bool = False
     symbol: str = SYMBOL
+    # 2026-08-30：新增默认杠杆。小账户开仓的关键杠杆倍数：
+    #   可开名义 ≈ 余额 × default_leverage；若交易所最小名义 = 2.5U（ETH-USDT-SWAP 约 0.1 张），
+    #   14.83U 账户至少 lev≈2 才能勉强摸到最小；lev=5~10 才能让 risk_pct 模型稳定过 0.1 张。
+    default_leverage: int = 10
 
     @property
     def mode(self) -> RunMode:
@@ -46,8 +50,15 @@ class RiskLimits(BaseModel):
       A1. 本金上限硬锁 → live_max_equity_usdt
       A2. 每日亏损熔断（USDT 绝对值）→ live_max_daily_loss_usdt
       A3. 订单双因子 sanity → live_max_single_order_usdt + position_change_pct
+           与 USDT 口径约束：min_order_notional_usdt / max_order_notional_usdt
       A5. Kill-Switch → kill_switch_token
       A7. Shadow 影子模式 → shadow_mode
+
+    新增 2026-08-30：R 模型参数化（之前 RiskEngine 是类常量写死，14.8U 小账户会算 0.002 张被 minSz 拦下）：
+      risk_per_trade_pct ：每笔最大允许亏 = total * r%（R 模型）
+      stop_loss_price_pct：止损价相对入场价的价格百分比（无杠杆）
+      min_order_notional_usdt：下单名义硬下限（USDT）；> 交易所 minNotional 会用更严格值
+      max_order_notional_usdt：下单名义硬上限（USDT）；< 交易所 maxNotional 用更严格值
     """
     live_max_equity_usdt: float = 15.0
     live_max_daily_loss_usdt: float = 3.0
@@ -58,6 +69,20 @@ class RiskLimits(BaseModel):
     kill_http_timeout_s: int = 3
     emergency_halt_file: str = "data/EMERGENCY_HALT"
     shadow_mode: bool = False
+
+    # R 模型（可配置）
+    # 2026-08-30 校准：以 14.83U / ETH≈2466$ / 10X 杠杆 / 最小名义≈2.47U（sz≥0.1）为参照，
+    #   math: sz_by_risk = total × R% / (entry*SL%*ctVal) / leverage
+    #         0.1  ≤  14.83*R% / (2466*2.5%*0.01) / 10
+    #      → R% ≥ 3.33%（留余量取 5%；嫌激进可调回 3.5%/2.5%）
+    #   risk=5% + stop=2.5% + lev=10X → 单笔最大损=0.7415U；每张止损=2466*2.5%*0.01=0.6165U；
+    #   sz=0.7415 / (0.6165*10) ≈ 0.12 张 → floor 到 0.1 张，名义 2.47U，满足最小下单。
+    risk_per_trade_pct: float = 5.0
+    stop_loss_price_pct: float = 2.5
+    # USDT 名义上下限（最终生效值 = max(交易所 minNotional, config.min_order_notional_usdt) / min(交易所 max, config.max)）
+    # 0 表示完全以交易所返回为准；非 0 会叠加更严格约束
+    min_order_notional_usdt: float = 0.0
+    max_order_notional_usdt: float = 0.0
 
 
 class ServerConfig(BaseModel):

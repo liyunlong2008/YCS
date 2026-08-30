@@ -180,6 +180,17 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     ai: AIProvider = build_ai_provider(cfg.ai)
     broker: Broker = build_broker(cfg)
 
+    # 3.1) MarketSpec：交易所最小下单 / 面值 / 杠杆上限（实盘从 OKX 拉；失败 fallback 默认值，绝不影响启动）
+    from app.broker.base import MarketSpec
+    try:
+        market_spec: MarketSpec = await broker.fetch_market_spec(symbol)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("拉取交易所 MarketSpec 失败（将使用 ETH-USDT-SWAP 默认保守值）：{}", exc)
+        market_spec = MarketSpec(symbol=symbol)
+    logger.info("MarketSpec: source={} ctVal={} minSz={} lotSz={} szDecimals={} maxLever={} minNotionalUsdt={}",
+                market_spec.source, market_spec.ct_val, market_spec.min_sz, market_spec.lot_sz,
+                market_spec.sz_decimals, market_spec.max_lever, market_spec.min_notional_usdt or "(按 minSz*ctVal*entry 推算)")
+
     # 3.5) OrderManager（Maker 优先）
     from app.trading.order_manager import OrderManager
     order_manager = OrderManager(broker, state_store=state_store)
@@ -226,6 +237,7 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
         "position_manager": position_manager,
         "storage": (state_store, journal),
         "market_producer": market_producer,
+        "market_spec": market_spec,        # 2026-08-30：新增，risk.check_can_open 会消费（USDT 口径判单）
         "recoverer": recoverer,
         "controller": controller,
     })
@@ -309,22 +321,48 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                     last_ai = ctl._last_ai
                     bal = await ctl.broker.get_balance()
                     now_ts = int(time.time())
-                    # 计算入场价：用当前 mark_price（若有）或 2000 兜底
-                    entry_price = float(pos.mark_price or bal.total and 0 or 2000)
-                    # 获取合理的 entry price：读 position mark_price（PaperBroker mark 会在最近 ticker 上更新；若空则 default 2000 fallback 会有问题，改成读取 broker last 或 state balance；简化：用 PaperBroker 的 _last_price。更稳妥：直接设为上次 state 中 balance_mark。暂用默认风险计算会兜底。）
-                    # 兜底：若 mark_price == 0（初始），回退 2000
-                    if not entry_price or entry_price <= 0:
-                        entry_price = 2000.0
+                    # ---- 计算 entry_price（核心改动：尽量用真实最新价，避免 fallback 到虚构 2000 导致
+                    #      R 模型把名义算错；VPS 现场抓包 ETH≈2466 时 2000 会让 sz 计算差 20%）
+                    # 优先级：
+                    #   1) 当前持仓.mark_price（有持仓时 mark 会实时更新）
+                    #   2) state.json 里 position.mark_price（上次快照）
+                    #   3) MarketDataProducer 最新 ticker（若已连接）
+                    #   4) 兜底 2466.0（ETH 2026-08 参考价，比 2000 更准）
+                    entry_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
+                    if entry_price <= 0:
+                        entry_price = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
+                    if entry_price <= 0:
+                        mp = getattr(ctl.market_producer, "last_mark_price", None)
+                        if callable(mp):
+                            try:
+                                v = mp()
+                                if isinstance(v, (int, float)) and v > 0:
+                                    entry_price = float(v)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    if entry_price <= 0:
+                        # 兜底：真实 ETH 2026-08 参考价 2466（避免 2000 让 sz 偏差 ~20%）
+                        entry_price = 2466.0
                     verdict = await risk.check_can_open(
                         balance_total=float(bal.total or 0),
                         balance_available=float(bal.available or 0),
                         entry_price=entry_price,
                         now_ts=now_ts,
+                        # 2026-08-30：注入交易所市场规则 + 本笔风控配置（risk_pct/stop_pct/名义上下限/默认杠杆）
+                        market_spec=rt.get("market_spec"),
+                        risk_limits=getattr(cfg, "risk_limits", None) if (cfg := rt.get("config")) else None,
+                        trading_config=getattr(cfg, "trading", None) if (cfg := rt.get("config")) else None,
                     )
                     if not verdict.allow:
+                        # 中文拒绝原因：RiskEngine 现在会直接给『当前名义上限≈X U，最小名义=Y U，需要余额≈Z U 或调杠杆/R/止损』——不用再拼『张数<0.1』
+                        extra = (
+                            f"（名义={verdict.suggested_notional_usdt:.2f}U / 最小={verdict.effective_min_notional_usdt:.2f}U "
+                            f"/ 杠杆={verdict.suggested_leverage}X）"
+                            if verdict.effective_min_notional_usdt > 0 else f"（杠杆={verdict.suggested_leverage}X）"
+                        )
                         logger.bind(log_type="trade").info(
-                            "[风控] 本轮跳过开仓：{}（连续亏损={}，日切余额={:.2f}U 权益={:.2f}U）",
-                            verdict.reason, risk.consecutive_losses,
+                            "[风控] 本轮跳过开仓：{}{}（连续亏损={}，日切余额={:.2f}U 权益={:.2f}U）",
+                            verdict.reason, extra, risk.consecutive_losses,
                             risk.daily_start_balance, float(bal.total or 0),
                         )
                     elif last_ai is None or last_ai.confidence < 50 or last_ai.market_regime in (
@@ -345,9 +383,13 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                             market_side = None
                         if market_side is not None:
                             logger.bind(log_type="trade").info(
-                                "[主循环] 发起交易信号：side={} entry={} size={:.6f} sl={}",
+                                "[主循环] 发起交易信号：side={} entry={} sz={} 名义={:.2f}U sl={} lev={}X "
+                                "(min_notional={:.2f}U, max_notional={:.2f}U)",
                                 market_side.value, entry_price,
-                                verdict.suggested_size, verdict.stop_loss_price,
+                                f"{verdict.suggested_size:.4f}".rstrip("0").rstrip("."),
+                                verdict.suggested_notional_usdt, verdict.stop_loss_price,
+                                verdict.suggested_leverage,
+                                verdict.effective_min_notional_usdt, verdict.effective_max_notional_usdt,
                             )
                             exec_res = await ctl.execute_trade_signal(
                                 ai=last_ai, verdict=verdict,

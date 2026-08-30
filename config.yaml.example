@@ -25,6 +25,13 @@ ai:
 trading:
   live: false                 # false=纸盘模式(Paper)   true=实盘模式(Live)
   symbol: "ETH-USDT-SWAP"     # 单品种
+  # 2026-08-30 新增：默认杠杆倍数。实际可用杠杆 = min(default_leverage, 交易所 maxLever)。
+  #   小账户『14.83U』关键杠杆：
+  #     · ETH-USDT-SWAP 最小名义≈2.5U（sz≥0.1 张 × ctVal 0.01 ETH × entry≈2466$）；
+  #     · 配 risk_per_trade_pct=5% + stop_loss_price_pct=2.5% + default_leverage=10X
+  #       → 刚好 0.1 张 ≈ 2.47U 名义，满足交易所最小单。
+  #     · 若 OKX 后续放宽 minSz（比如到 0.01），可以把杠杆降到 3~5X 更保守。
+  default_leverage: 10
 
 # 实盘硬风控阈值（按用户当前账户 14.8 USDT 保守配置，护栏 A1/A2/A3/A5/A7）
 risk_limits:
@@ -33,8 +40,26 @@ risk_limits:
   # A2. 每日亏损熔断（USDT 绝对值，比百分比更稳）：当日累计 realized + unrealized <= -3.0U → 全平 + 停机
   live_max_daily_loss_usdt: 3.0
   # A3. 单笔下单名义上限 & 仓位变动率上限（0 加到 N 的变化 ÷ 总资产 ≤ position_change_pct）
+  # 2026-08-30：老护栏 live_max_single_order_usdt（被 app/core/safety.order_size_sanity_check 消费，
+  #   controller 下单前再次调用）；RiskEngine 里新 max_order_notional_usdt 才是"反推 sz 时的名义上限"。
+  #   两者不叠加，避免『单笔上限 2U < 交易所最小名义 2.47U』卡死全场。
   live_max_single_order_usdt: 2.0
+  # 新名义上限：0 = 不启用（仅靠交易所 maxSz + 保证金×杠杆 + R 模型上限控制）。
+  #   想强制小仓位时可填 3.0 = 最多下单 3U 名义。
+  max_order_notional_usdt: 0.0
+  # 0 表示「以交易所 minNotional 为准」；非 0 会叠加更严格下限（防止把 sz 压到 0.1 张还会被交易所名义拒单）
+  min_order_notional_usdt: 0.0
   position_change_pct: 0.10   # 10%：不能一口吃成胖子
+  # R 模型（新增 2026-08-30）：每笔最大允许亏 = 权益 × risk_per_trade_pct%
+  #   14.83U 小账户跨 0.1 张最小单推导（ETH≈2466 ctVal=0.01 minSz=0.1 lev=10X）：
+  #     sz_by_risk = total × R% / (entry × SL% × ctVal) / leverage
+  #     0.1      ≤ 14.83 × R% / (2466 × 2.5% × 0.01) / 10
+  #     → R% ≥ 3.33%（取 5% 留余量；嫌激进可调回 3.5%/2.5%）
+  #   risk=5% + stop=2.5% + lev=10X → 单笔最大损=0.74U → sz≈0.12 → floor 0.1 张 (≈2.47U 名义)
+  #   实盘观察 1~2 天后再自行降到 3%/2%（更保守）。
+  risk_per_trade_pct: 5.0
+  # 价格止损百分比（相对入场价，无杠杆）：2.5% = ETH 价格跌 ≈62$ 止损
+  stop_loss_price_pct: 2.5
   # A5. Kill-Switch API Token（POST /api/kill 时用 X-YCS-Admin-Token: <这里的值>；生产必须改成 32 位随机串）
   kill_switch_token: "YCS_KILL_CHANGEME_32BYTES_RANDOM_STRING_PLEASE"
   # A7. 影子模式（观察模式）：true = 生成完整订单但绝不真发（用于链路联调 6 小时再切 live=true）

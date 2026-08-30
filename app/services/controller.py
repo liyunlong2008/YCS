@@ -356,6 +356,23 @@ class TradingController:
             return {"status": "REJECTED", "via": "none", "reason": "建议数量<=0",
                     "order_id": None, "avg_fill_price": 0.0, "qty": 0.0}
 
+        # 2026-08-30：拿到 symbol 的 MarketSpec → 按 lotSz/szDecimals 重夹一遍 amount（避免 broker 下单还得处理）
+        #   Broker 层也有同名规范化兜底，但 Controller 先做一遍可以把「规范化后 sz 不足」提前打日志
+        try:
+            spec = await self.broker.fetch_market_spec(symbol)
+            norm = spec.clamp_sz(amount, is_market=False)
+            if norm <= 0:
+                return {"status": "REJECTED", "via": "none",
+                        "reason": (f"按交易所规则夹后 sz=0（原 amount={amount}, "
+                                   f"minSz={spec.min_sz}, lotSz={spec.lot_sz}）"),
+                        "order_id": None, "avg_fill_price": 0.0, "qty": 0.0}
+            if abs(norm - amount) > 1e-9:
+                logger.info("[execute_trade_signal] sz 规范化：{} → {} (lotSz={} decimals={})",
+                            amount, norm, spec.lot_sz, spec.sz_decimals)
+            amount = norm
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[execute_trade_signal] MarketSpec sz 规范化失败，按原 amount 继续：{}", e)
+
         # 2) 设置建议杠杆（若 Broker 支持）
         if verdict.suggested_leverage and verdict.suggested_leverage > 0:
             setter = getattr(self.broker, "set_leverage", None)
