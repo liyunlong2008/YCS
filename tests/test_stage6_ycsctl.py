@@ -107,7 +107,7 @@ def test_cli_check_paper_with_placeholders_is_warn_ok(tmp_path: Path):
         "  shadow_mode: false\n"
         "server:\n"
         "  host: 127.0.0.1\n"
-        "  port: 8000\n"
+        "  port: 8765\n"
         "  ui_port: 8080\n"
         "logging:\n"
         "  level: INFO\n"

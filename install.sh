@@ -430,8 +430,8 @@ cat <<'INSTALLSH_END'
     uv run deploy/ycsctl.py status        查询 systemd 服务状态
     uv run deploy/ycsctl.py logs -n 200   最近 200 行日志
     uv run deploy/ycsctl.py logs -f       实时跟随日志
-    curl http://127.0.0.1:8000/           Dashboard 首页（中文界面）
-    curl http://127.0.0.1:8000/api/status JSON 格式总览
+    curl http://127.0.0.1:8765/           Dashboard 首页（中文界面）
+    curl http://127.0.0.1:8765/api/status JSON 格式总览
 
   实盘前必须：
     1) uv run deploy/ycsctl.py check   —— 确保无任何 FATAL

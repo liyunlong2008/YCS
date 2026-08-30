@@ -14,7 +14,7 @@ cp config.yaml config.yaml.bak   # 保留模板，编辑 config.yaml 填入 OKX/
 # 启动（纸盘模式，config.yaml 中 trading.live = false）
 .venv/bin/python run.py
 
-# Dashboard  http://127.0.0.1:8000
+# Dashboard  http://127.0.0.1:8765
 ```
 
 ## 目录

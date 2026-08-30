@@ -54,7 +54,29 @@ class RiskLimits(BaseModel):
     live_max_single_order_usdt: float = 2.0
     position_change_pct: float = 0.10
     kill_switch_token: str = "YCS_KILL_CHANGEME_32BYTES_RANDOM_STRING_PLEASE"
+    kill_panic_flatten: bool = True
+    kill_http_timeout_s: int = 3
+    emergency_halt_file: str = "data/EMERGENCY_HALT"
     shadow_mode: bool = False
+
+
+class ServerConfig(BaseModel):
+    """Dashboard / API 端口与监听配置。"""
+    host: str = "127.0.0.1"
+    port: int = 8765      # 2026-08-30：默认从 8000 统一改为 8765
+    ui_port: int = 8080
+
+
+class LoggingConfig(BaseModel):
+    """日志配置（Pydantic 校验，避免缺失字段时 fallback 散落在各处）。"""
+    level: str = "INFO"
+    file: str = "logs/app.log"
+
+
+class StorageConfig(BaseModel):
+    """交易记录存储路径配置。"""
+    journal_dir: str = "data/journal"
+    ledger_file: str = "data/ledger.jsonl"
 
 
 class AppConfig(BaseModel):
@@ -63,6 +85,9 @@ class AppConfig(BaseModel):
     ai: AIConfig
     trading: TradingConfig = Field(default_factory=TradingConfig)
     risk_limits: RiskLimits = Field(default_factory=RiskLimits)
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
 
 
 def default_config_path() -> Path:

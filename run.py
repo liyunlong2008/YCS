@@ -2,8 +2,8 @@
 # 云龙挑战赛（YCS）系统启动入口（完整装配版）
 # 用法：
 #   cd /workspace
-#   .venv/bin/python run.py          # 默认：加载 config.yaml，监听 0.0.0.0:8000
-#   .venv/bin/python run.py --dev    # 开发模式：127.0.0.1
+#   .venv/bin/python run.py          # 默认：加载 config.yaml，监听 0.0.0.0:<config.server.port 默认 8765>
+#   .venv/bin/python run.py --dev    # 开发模式：127.0.0.1:8765
 # =============================================================================
 
 from __future__ import annotations
@@ -392,11 +392,40 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+# 默认端口权威值：AppConfig.server.port（ServerConfig 默认 8765）。
+# 解析 config.yaml 失败时，回退到 8765，保证「没有 config.yaml 也能跑」的场景有合理默认。
+_FALLBACK_PORT = 8765
+
+
+def _read_default_port_from_config() -> int:
+    """尝试从项目根 config.yaml 读取 server.port；缺失/解析失败都返回兜底端口。"""
+    try:
+        from app.core.config import default_config_path, load_config  # noqa: PLC0415
+        cfg_path = default_config_path()
+        if cfg_path.is_file():
+            cfg = load_config(cfg_path)
+            port = int(getattr(cfg.server, "port", _FALLBACK_PORT))
+            if 1 <= port <= 65535:
+                return port
+    except Exception:
+        # 没 config.yaml / YAML 格式错误等：都静默回退，不阻塞启动
+        pass
+    return _FALLBACK_PORT
+
+
+_DEFAULT_PORT = _read_default_port_from_config()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="云龙挑战赛（YCS）自动交易系统启动器")
-    parser.add_argument("--dev", action="store_true", help="开发模式：监听 127.0.0.1:8000")
+    parser.add_argument("--dev", action="store_true", help=f"开发模式：监听 127.0.0.1:{_DEFAULT_PORT}")
     parser.add_argument("--host", default=None, help="自定义监听 host（覆盖 --dev）")
-    parser.add_argument("--port", type=int, default=8000, help="自定义监听 port，默认 8000")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_DEFAULT_PORT,
+        help=f"自定义监听 port；未传则取 config.server.port（默认 {_DEFAULT_PORT}）",
+    )
     parser.add_argument("--timeout-keepalive", type=int, default=5, help="uv keepalive 秒数")
     args = parser.parse_args()
 

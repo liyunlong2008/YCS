@@ -34,6 +34,34 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 DEFAULT_EXAMPLE_CONFIG_PATH = PROJECT_ROOT / "config.yaml.example"
 INSTALL_SCRIPT = PROJECT_ROOT / "deploy" / "install_systemd.sh"
 APP_NAME_CN = "云龙挑战赛（YCS）"
+# 2026-08-30：统一默认端口从 8000 → 8765（与 config.yaml.example server.port、AppConfig ServerConfig 默认值保持一致）
+DEFAULT_API_PORT = 8765
+DEFAULT_API_BASE = f"http://127.0.0.1:{DEFAULT_API_PORT}"
+
+
+def _resolve_api_base(user_provided_host: str | None = None, cfg_path: Path | None = None) -> str:
+    """按优先级计算 Dashboard API 根 URL（含 scheme+host+port，不含 trailing /）：
+       1) user_provided_host（CLI --host）——最高优先级
+       2) config.yaml 的 server.host + server.port（读取失败就跳过）
+       3) DEFAULT_API_BASE（= http://127.0.0.1:8765）
+    """
+    if user_provided_host:
+        return user_provided_host.rstrip("/")
+    cfg_path = Path(cfg_path) if cfg_path else DEFAULT_CONFIG_PATH
+    try:
+        if cfg_path.is_file():
+            import yaml as _yaml
+            raw = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            srv = raw.get("server") or {}
+            port = srv.get("port") or DEFAULT_API_PORT
+            host = srv.get("host") or "127.0.0.1"
+            port_i = int(port)
+            if 1 <= port_i <= 65535:
+                return f"http://{host}:{port_i}"
+    except Exception:
+        # YAML 坏了 / 字段缺失 都静默兜底（命令行工具不应该因为配置格式直接挂）
+        pass
+    return DEFAULT_API_BASE
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +661,7 @@ def cmd_kill(args: "argparse.Namespace") -> int:
         except Exception:
             token = None
 
-    host = (args.host or "http://127.0.0.1:8000").rstrip("/")
+    host = _resolve_api_base(args.host, cfg_path).rstrip("/")
     _print_err(f"[ycsctl kill] 通道① POST {host}/api/kill ...")
     ok_http = False
     status_code = 0
@@ -760,8 +788,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_kill.add_argument("--token", default=None,
                         help=f"kill_switch_token（未提供时从 {DEFAULT_CONFIG_PATH}.risk_limits.kill_switch_token 读取）")
-    p_kill.add_argument("--host", default="http://127.0.0.1:8000",
-                        help="Dashboard API 地址（默认 http://127.0.0.1:8000）")
+    p_kill.add_argument("--host", default=None,
+                        help=f"Dashboard API 地址（默认读取 config.server.port；未配置时 = {DEFAULT_API_BASE}）")
     p_kill.set_defaults(func=cmd_kill)
 
     return parser
