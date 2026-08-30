@@ -54,7 +54,7 @@ def _resolve_api_base(user_provided_host: str | None = None, cfg_path: Path | No
             raw = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
             srv = raw.get("server") or {}
             port = srv.get("port") or DEFAULT_API_PORT
-            host = srv.get("host") or "127.0.0.1"
+            host = srv.get("host") or "0.0.0.0"
             port_i = int(port)
             if 1 <= port_i <= 65535:
                 return f"http://{host}:{port_i}"

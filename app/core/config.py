@@ -62,7 +62,7 @@ class RiskLimits(BaseModel):
 
 class ServerConfig(BaseModel):
     """Dashboard / API 端口与监听配置。"""
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"   # 2026-08-30：默认从 127.0.0.1 改为 0.0.0.0（VPS 公网浏览器可直达）
     port: int = 8765      # 2026-08-30：默认从 8000 统一改为 8765
     ui_port: int = 8080
 

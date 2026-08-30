@@ -46,7 +46,7 @@ risk_limits:
 
 # Dashboard / API 监听配置
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"          # 2026-08-30 默认改成 0.0.0.0（公网 VPS 浏览器直接可访问；非暴露环境改 127.0.0.1 + SSH 隧道也行）
   port: 8765               # 2026-08-30 统一改为 8765（生产默认；对外 Nginx/Cloudflare 另配）
   ui_port: 8080
 

@@ -2,8 +2,8 @@
 # 云龙挑战赛（YCS）系统启动入口（完整装配版）
 # 用法：
 #   cd /workspace
-#   .venv/bin/python run.py          # 默认：加载 config.yaml，监听 0.0.0.0:<config.server.port 默认 8765>
-#   .venv/bin/python run.py --dev    # 开发模式：127.0.0.1:8765
+#   .venv/bin/python run.py          # 默认：加载 config.yaml，监听 <config.server.host 即 0.0.0.0>:<port 8765>
+#   .venv/bin/python run.py --dev    # 开发模式：绑定 127.0.0.1:8765（公网不通，仅本机）
 # =============================================================================
 
 from __future__ import annotations
@@ -393,8 +393,11 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
 # main
 # ---------------------------------------------------------------------------
 # 默认端口权威值：AppConfig.server.port（ServerConfig 默认 8765）。
-# 解析 config.yaml 失败时，回退到 8765，保证「没有 config.yaml 也能跑」的场景有合理默认。
+# 默认 host 权威值：AppConfig.server.host（ServerConfig 默认 0.0.0.0）。
+# 解析 config.yaml 失败时，回退到下方 _FALLBACK_PORT / _FALLBACK_HOST。
 _FALLBACK_PORT = 8765
+_FALLBACK_HOST = "0.0.0.0"
+_DEV_HOST = "127.0.0.1"   # --dev 模式固定回环（仅本机可访问，符合「开发模式」语义）
 
 
 def _read_default_port_from_config() -> int:
@@ -413,13 +416,37 @@ def _read_default_port_from_config() -> int:
     return _FALLBACK_PORT
 
 
+def _read_default_host_from_config() -> str:
+    """尝试从项目根 config.yaml 读取 server.host；缺失/非法值都回退到 0.0.0.0（VPS 默认公网可达）。"""
+    try:
+        from app.core.config import default_config_path, load_config  # noqa: PLC0415
+        cfg_path = default_config_path()
+        if cfg_path.is_file():
+            cfg = load_config(cfg_path)
+            host = str(getattr(cfg.server, "host", _FALLBACK_HOST) or _FALLBACK_HOST).strip()
+            if host:
+                return host
+    except Exception:
+        pass
+    return _FALLBACK_HOST
+
+
 _DEFAULT_PORT = _read_default_port_from_config()
+_DEFAULT_HOST = _read_default_host_from_config()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="云龙挑战赛（YCS）自动交易系统启动器")
-    parser.add_argument("--dev", action="store_true", help=f"开发模式：监听 127.0.0.1:{_DEFAULT_PORT}")
-    parser.add_argument("--host", default=None, help="自定义监听 host（覆盖 --dev）")
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help=f"开发模式：仅本机回环，监听 {_DEV_HOST}:{_DEFAULT_PORT}",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help=f"自定义监听 host；未传时取 config.server.host（默认 {_DEFAULT_HOST}）；--dev 则强制={_DEV_HOST}",
+    )
     parser.add_argument(
         "--port",
         type=int,
@@ -467,7 +494,15 @@ def main() -> None:
     )
     app_instance_ref[0] = app
 
-    host = args.host or ("127.0.0.1" if args.dev else "0.0.0.0")
+    # 最终监听地址优先级：
+    #   host: args.host（最高）→ --dev 强制 127.0.0.1 → config.server.host（默认 0.0.0.0）
+    #   port: args.port（最高）→ config.server.port（默认 8765）
+    if args.host:
+        host = args.host
+    elif args.dev:
+        host = _DEV_HOST
+    else:
+        host = _DEFAULT_HOST
     port = args.port
     logger.info("拉起 FastAPI Dashboard: http://{}:{}/docs", host, port)
 
