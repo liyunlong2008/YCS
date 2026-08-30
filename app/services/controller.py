@@ -169,6 +169,43 @@ class TradingController:
             pass
         throttle_block = self.ai_throttler.to_status_dict(now_ts)
 
+        # 时间同步状态（Dashboard 顶部漂移 tag 数据来源）
+        time_sync_raw = st.get("time_sync") or {}
+        drift_ms = int(time_sync_raw.get("drift_ms") or 0)
+        if abs(drift_ms) >= 1000:
+            drift_txt = f"{drift_ms/1000:.2f}s"
+        else:
+            drift_txt = f"{drift_ms:.0f}ms"
+        last_sync_at = int(time_sync_raw.get("last_sync_at") or 0)
+        sync_age_s = now_ts - last_sync_at if last_sync_at > 0 else None
+        if sync_age_s is not None and sync_age_s < 60:
+            age_txt = f"{sync_age_s}s 前同步"
+        elif sync_age_s is not None and sync_age_s < 3600:
+            age_txt = f"{sync_age_s//60}m{sync_age_s%60:02d}s 前同步"
+        elif sync_age_s is not None:
+            h, m = divmod(sync_age_s, 3600); m, _ = divmod(m, 60)
+            age_txt = f"{h}h{m:02d}m 前同步"
+        else:
+            age_txt = "未同步"
+        drifted_pause = bool(time_sync_raw.get("drifted_pause"))
+        sync_tag_cn = f"时间漂移 {drift_txt}{' ⚠️已暂停开仓' if drifted_pause else ''} · {age_txt}"
+        sync_color = (
+            "background:#fce8e6;color:#c5221f"
+            if drifted_pause or abs(drift_ms) >= 5000
+            else ("background:#feefc3;color:#8a6500" if abs(drift_ms) >= 1000
+                  else "background:#e6f4ea;color:#137333")
+        )
+        time_sync_block = {
+            "漂移毫秒": drift_ms,
+            "漂移文本": drift_txt,
+            "最后同步时间戳": last_sync_at or None,
+            "同步距今年代": age_txt,
+            "是否因漂移暂停": drifted_pause,
+            "顶部标签文本": sync_tag_cn,
+            "顶部标签颜色": sync_color,
+            "阈值秒": 10,
+        }
+
         return {
             "运行模式": mode_cn,
             "系统状态": _ZH_SYSTEM_STATUS.get(sys_status, str(status_raw)),
@@ -182,6 +219,7 @@ class TradingController:
             "累计收益率(%)": round(float(stats.get("total_pnl_pct") or 0), 2),
             "最近AI判断": ai_block,
             "AI节流状态": throttle_block,
+            "时间同步状态": time_sync_block,
             "风控状态": {
                 "连续亏损次数": self.risk.consecutive_losses,
                 "熔断冷却至(秒时间戳)": self.risk.cooldown_until_ts,

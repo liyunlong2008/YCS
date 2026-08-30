@@ -392,6 +392,45 @@ def create_app(
         if len(thr_reason) > 80:
             thr_reason = thr_reason[:80] + "…"
 
+        # 6.6) 时间同步漂移状态（2026-08-30：Dashboard 顶部 tag 显示）
+        time_sync_ctl = {}
+        if isinstance(status_from_ctl, dict) and isinstance(status_from_ctl.get("时间同步状态"), dict):
+            time_sync_ctl = dict(status_from_ctl["时间同步状态"])
+        if not time_sync_ctl:
+            ts_raw = snapshot.get("time_sync") or {}
+            drift_ms = int(ts_raw.get("drift_ms") or 0)
+            drifted_pause = bool(ts_raw.get("drifted_pause"))
+            last_sync_at = int(ts_raw.get("last_sync_at") or 0)
+            import time as _tt
+            age_s = int(_tt.time()) - last_sync_at if last_sync_at > 0 else None
+            age_txt = "未同步"
+            if age_s is not None and age_s < 60:
+                age_txt = f"{age_s}s 前同步"
+            elif age_s is not None and age_s < 3600:
+                age_txt = f"{age_s//60}m{age_s%60:02d}s 前同步"
+            elif age_s is not None:
+                hh, mm = divmod(age_s, 3600); mm, _ = divmod(mm, 60)
+                age_txt = f"{hh}h{mm:02d}m 前同步"
+            drift_txt = f"{drift_ms/1000:.2f}s" if abs(drift_ms) >= 1000 else f"{drift_ms:.0f}ms"
+            sync_tag_cn = f"时间漂移 {drift_txt}{' ⚠️已暂停开仓' if drifted_pause else ''} · {age_txt}"
+            sync_color = (
+                "background:#fce8e6;color:#c5221f"
+                if drifted_pause or abs(drift_ms) >= 5000
+                else ("background:#feefc3;color:#8a6500" if abs(drift_ms) >= 1000
+                      else "background:#e6f4ea;color:#137333")
+            )
+            time_sync_ctl = {
+                "漂移毫秒": drift_ms, "漂移文本": drift_txt,
+                "最后同步时间戳": last_sync_at or None,
+                "同步距今年代": age_txt, "是否因漂移暂停": drifted_pause,
+                "顶部标签文本": sync_tag_cn, "顶部标签颜色": sync_color,
+            }
+        drift_tag_text = str(time_sync_ctl.get("顶部标签文本") or "时间漂移 未同步")
+        drift_tag_color = str(time_sync_ctl.get("顶部标签颜色") or "background:#e0e0e0;color:#3c4043")
+        drift_ms_val = int(time_sync_ctl.get("漂移毫秒") or 0)
+        drift_age_txt = str(time_sync_ctl.get("同步距今年代") or "未同步")
+        drift_paused = bool(time_sync_ctl.get("是否因漂移暂停"))
+
         # 7) 最近交易：优先 journal；Controller 可用时直接 get_recent_trades
         trades_rows: list[dict] = []
         try:
@@ -446,6 +485,12 @@ def create_app(
             "thr_failures": thr_failures,
             "thr_volatility": thr_volatility,
             "thr_reason": thr_reason,
+            # 2026-08-30 顶部漂移 tag（替代原 实盘模式 + AI 节流 顶部 tag）
+            "drift_tag_text": drift_tag_text,
+            "drift_tag_color": drift_tag_color,
+            "drift_ms": drift_ms_val,
+            "drift_age": drift_age_txt,
+            "drift_paused": drift_paused,
             "trades": trades_rows,
         }
 
@@ -455,12 +500,10 @@ def create_app(
         """中文仪表盘首页（Dashboard 全部使用中文）—— 服务端直出骨架，JS 刷新。"""
         import json as _json
         d = _collect_dashboard_data(request.app.state.runtime)
-        tag_class = "live" if d["mode"] == "实盘模式" else ""
-        mode_tag = f'<span class="tag {tag_class}">{d["mode"]}</span>'
-        # 2026-08-30 新增：AI 节流 7 级彩色 tag（紧邻运行模式）
-        thr_tag = (
-            f'<span id="k-thr-tag" class="tag" style="{d["thr_color"]}">'
-            f'AI 节流 · {d["thr_level"]}</span>'
+        # 2026-08-30：顶部不再显示 实盘模式 + AI 节流，改显示 {时间漂移} tag
+        drift_tag = (
+            f'<span id="k-drift-tag" class="tag" style="{d["drift_tag_color"]}">'
+            f'{d["drift_tag_text"]}</span>'
         )
         thr_countdown_min, thr_countdown_s = divmod(max(int(d["thr_countdown"]), 0), 60)
         thr_countdown_str = f"{thr_countdown_min}m{thr_countdown_s:02d}s" if thr_countdown_min else f"{thr_countdown_s}s"
@@ -519,7 +562,7 @@ def create_app(
           </style>
         </head>
         <body>
-          <h1>云龙挑战赛 · Dashboard {mode_tag}{thr_tag}<span id="k-updated" class="updated"></span></h1>
+          <h1>云龙挑战赛 · Dashboard {drift_tag}<span id="k-updated" class="updated"></span></h1>
 
           <div class="grid">
             <!-- 运行模式 -->
@@ -681,15 +724,9 @@ def create_app(
                 const elR = document.getElementById('k-ai-reason');
                 if (elR) elR.innerHTML = '<span class="reason-box">' + (reason.length > 120 ? reason.slice(0,120)+'…' : reason) + '</span>';
 
-                // AI 节流（2026-08-30 新增：顶部彩色 tag + 卡片）
+                // AI 节流（2026-08-30：仅卡片显示，顶部不再挂 tag；节流级别仅更新卡片内部）
                 const thr = s['AI节流状态'] || {{}};
                 const thrLevel = String(thr['节流级别'] ?? 'NORMAL');
-                const thrColor = String(thr['节流颜色'] ?? '');
-                const elTag = document.getElementById('k-thr-tag');
-                if (elTag) {{
-                  elTag.textContent = 'AI 节流 · ' + thrLevel;
-                  if (thrColor) elTag.setAttribute('style', thrColor);
-                }}
                 setText('k-thr-level', thrLevel);
                 const cd = Number(thr['倒计时(秒)'] ?? 0);
                 const mm = Math.floor(cd / 60), ss = Math.floor(cd % 60);
@@ -701,6 +738,16 @@ def create_app(
                 const thrReason = String(thr['级别原因'] ?? '');
                 const elThrR = document.getElementById('k-thr-reason');
                 if (elThrR) elThrR.innerHTML = '<span class="reason-box">' + (thrReason.length > 80 ? thrReason.slice(0,80)+'…' : thrReason) + '</span>';
+
+                // 顶部时间漂移 tag（2026-08-30 按需求：替代原 实盘模式+AI节流顶部）
+                const ts = s['时间同步状态'] || {{}};
+                const driftTagEl = document.getElementById('k-drift-tag');
+                if (driftTagEl) {{
+                    const tagText = String(ts['顶部标签文本'] ?? '时间漂移 未同步');
+                    const tagColor = String(ts['顶部标签颜色'] ?? 'background:#e0e0e0;color:#3c4043');
+                    driftTagEl.textContent = tagText;
+                    driftTagEl.setAttribute('style', tagColor);
+                }}
 
                 // 更新时间
                 const up = document.getElementById('k-updated');
@@ -800,6 +847,16 @@ def create_app(
                 "哨兵锚定价": 0,
                 "最近波动(%)": 0,
                 "最近波动时间戳": None,
+            },
+            "时间同步状态": {
+                "漂移毫秒": 0,
+                "漂移文本": "0ms",
+                "最后同步时间戳": None,
+                "同步距今年代": "未同步",
+                "是否因漂移暂停": False,
+                "顶部标签文本": "时间漂移 未同步 · 启动中",
+                "顶部标签颜色": "background:#e0e0e0;color:#3c4043",
+                "阈值秒": 10,
             },
             "风控状态": {
                 "连续亏损次数": 0,
