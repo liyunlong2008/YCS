@@ -241,10 +241,29 @@ def create_app(
         allow_val: Any,
         ai_regime: Any,
         ai_conf: int,
+        has_pos: bool = False,
+        pos_side_cn: str = "空仓",
+        pos_size: float = 0.0,
+        pos_entry: float = 0.0,
+        pos_mark: float = 0.0,
+        pos_leverage: int = 1,
+        pos_upl: float = 0.0,
     ) -> str:
-        """把风控 + AI 信号 + 缺口本金 压缩成 Dashboard 一行人类可读提示。"""
+        """把风控 + AI 信号 + 缺口本金 压缩成 Dashboard 一行人类可读提示。
+
+        2026-08-31 新增 has_pos 分支：若当前真有持仓（ShadowBroker 虚拟持仓也算），
+        直接显示「持仓概况」，避免用户看到 stale 的「信号双过 Ns 前 等成交」误报。
+        """
         import time as _tip_t  # noqa: PLC0415
         now = int(_tip_t.time())
+        if bool(has_pos) and float(pos_size or 0.0) > 0:
+            upl_sgn = f"+{float(pos_upl or 0.0):+.4f}U"
+            return (
+                f"📦 已持仓 {float(pos_size or 0.0):.1f} 张({pos_side_cn})｜"
+                f"成本 {float(pos_entry or 0.0):.1f}$ / 现价 {float(pos_mark or 0.0):.1f}$"
+                f"{(' / '+str(int(pos_leverage or 1))+'X') if int(pos_leverage or 1) > 1 else ''}"
+                f"｜浮盈亏 {upl_sgn}｜后续：AI 风控触发利润保护平仓"
+            )
         if not isinstance(last_risk, dict):
             return "启动中：等待第一轮风控评估（10s 内）"
         conclusion = str(last_risk.get("结论") or "未执行")
@@ -282,7 +301,7 @@ def create_app(
         # 未执行
         return "启动中：等待第一轮风控评估（10s 内）"
 
-    def _collect_dashboard_data(rt: dict[str, Any]) -> dict[str, Any]:
+    async def _collect_dashboard_data(rt: dict[str, Any]) -> dict[str, Any]:
         """服务端聚合首页需要的字段；优先 Controller（实时）→ state_store（已持久化）→ 默认骨架。
            · 用 ctl.get_status_dict() 的中文结构对齐 /api/status，首屏 AI 就不再空。
            · 额外补 journal（最近交易）。
@@ -401,17 +420,50 @@ def create_app(
         daily_loss_pct = risk_dict.get("daily_loss_pct") or 0.0
         daily_status = "正常" if daily_loss_pct > -15.0 else f"已触发日亏限制（{daily_loss_pct:.2f}%）"
 
-        # 5) 持仓：从 state_store.position 或实时 balance+position 推断；Controller 可用时实时刷新
+        # 5) 持仓：Controller.broker 实时 position 优先（ShadowBroker 虚拟持仓必须在这里显现！）
+        #    state_store.position 作为上次 bg_main_loop 持久化快照兜底
         pos_side = "空仓"
-        pos_size = 0.0; pos_entry = 0.0; pos_mark = 0.0; pos_upl = 0.0
-        pos_saved = snapshot.get("position") or {}
-        if pos_saved:
-            pos_side = _zh(pos_saved.get("side") or "FLAT")
-            pos_side = "空仓" if pos_side in ("—", "FLAT") else pos_side
-            pos_size = float(pos_saved.get("size", 0.0) or 0.0)
-            pos_entry = float(pos_saved.get("entry_price", 0.0) or 0.0)
-            pos_mark = float(pos_saved.get("mark_price", 0.0) or 0.0)
-            pos_upl = float(pos_saved.get("unrealized_pnl", 0.0) or 0.0)
+        pos_size = 0.0; pos_entry = 0.0; pos_mark = 0.0; pos_upl = 0.0; pos_leverage = 1
+        realtime_pos_ok = False
+        if ctl is not None and hasattr(ctl, "broker"):
+            try:
+                import asyncio as _aio_pos
+                sym_pos = (getattr(getattr(cfg, "trading", None), "symbol", None) if cfg else None) or "ETH-USDT-SWAP"
+                try:
+                    loop = _aio_pos.get_running_loop()  # FastAPI 在 async def 里；/ 端点走 GET
+                except RuntimeError:
+                    loop = None
+                if loop is None:
+                    # 理论上 index 端点是 async 一定有 loop；这里以防万一不阻塞
+                    p_realtime = None
+                else:
+                    p_realtime = await ctl.broker.get_position(sym_pos)
+                if p_realtime is not None:
+                    rside = _zh(getattr(p_realtime, "side", PositionSide.FLAT).value
+                                if hasattr(getattr(p_realtime, "side", None), "value")
+                                else str(getattr(p_realtime, "side", "FLAT")))
+                    rside = "空仓" if rside in ("—", "FLAT") else rside
+                    rsz = float(getattr(p_realtime, "size", 0.0) or 0.0)
+                    if rsz > 0:
+                        realtime_pos_ok = True
+                        pos_side = rside
+                        pos_size = rsz
+                        pos_entry = float(getattr(p_realtime, "entry_price", 0.0) or 0.0)
+                        pos_mark = float(getattr(p_realtime, "mark_price", 0.0) or 0.0)
+                        pos_upl = float(getattr(p_realtime, "unrealized_pnl", 0.0) or 0.0)
+                        pos_leverage = int(getattr(p_realtime, "leverage", 1) or 1)
+            except Exception:  # noqa: BLE001
+                realtime_pos_ok = False
+        if not realtime_pos_ok:
+            pos_saved = snapshot.get("position") or {}
+            if pos_saved:
+                pos_side = _zh(pos_saved.get("side") or "FLAT")
+                pos_side = "空仓" if pos_side in ("—", "FLAT") else pos_side
+                pos_size = float(pos_saved.get("size", 0.0) or 0.0)
+                pos_entry = float(pos_saved.get("entry_price", 0.0) or 0.0)
+                pos_mark = float(pos_saved.get("mark_price", 0.0) or 0.0)
+                pos_upl = float(pos_saved.get("unrealized_pnl", 0.0) or 0.0)
+                pos_leverage = int(pos_saved.get("leverage", 1) or 1)
         # 若 state_store 位置空但 upl!=0，标记价格从 snapshot.mark_price 填
         if pos_mark <= 0:
             pos_mark = float(snapshot.get("mark_price", 0.0) or 0.0)
@@ -572,12 +624,20 @@ def create_app(
             "drift_age": drift_age_txt,
             "drift_paused": drift_paused,
             # 2026-08-30：运行模式卡『风控提示』（解释为什么一直不开仓：风控拒因/AI信号状态/缺口本金）
+            # 2026-08-31：优先 ShadowBroker 虚拟持仓 → 真有持仓时显示「持仓概况」，不再 stale 显示「双过 Ns前 等成交」
             "risk_tip": _build_risk_tip(
                 last_risk=rsk_ctl.get("最近一次风控"),
                 pass_ts=int(rsk_ctl.get("最近一次交易信号就绪时间戳") or 0),
                 allow_val=allow_val,
                 ai_regime=(ai_block or {}).get("市场状态"),
                 ai_conf=int((ai_block or {}).get("置信度") or 0),
+                has_pos=(pos_side != "空仓") and float(pos_size or 0.0) > 0,
+                pos_side_cn=pos_side,
+                pos_size=float(pos_size or 0.0),
+                pos_entry=float(pos_entry or 0.0),
+                pos_mark=float(pos_mark or 0.0),
+                pos_leverage=int(pos_leverage or 1),
+                pos_upl=float(pos_upl or 0.0),
             ),
             "trades": trades_rows,
         }
@@ -587,7 +647,7 @@ def create_app(
     async def index(request: Request) -> str:
         """中文仪表盘首页（Dashboard 全部使用中文）—— 服务端直出骨架，JS 刷新。"""
         import json as _json
-        d = _collect_dashboard_data(request.app.state.runtime)
+        d = await _collect_dashboard_data(request.app.state.runtime)
         # 2026-08-30：顶部不再显示 实盘模式 + AI 节流，改显示 {时间漂移} tag
         drift_tag = (
             f'<span id="k-drift-tag" class="tag" style="{d["drift_tag_color"]}">'
@@ -814,10 +874,24 @@ def create_app(
                 setText('k-wr', wr.toFixed(0) + '%');
 
                 // 风控提示（2026-08-30 新增：直接显示『为什么不开仓』）
+                // 2026-08-31 修复：若 state.position.size>0（或 state_store 持仓大小>0）→ 显示「已持仓概况」
                 const elRiskTip = document.getElementById('k-risk-tip');
                 if (elRiskTip) {{
                   const lastRisk = risk['最近一次风控'] || {{}};
                   const ai = s['最近AI判断'] || {{}};
+                  const stPos = (window.__ycsLastFull && window.__ycsLastFull.position) ? window.__ycsLastFull.position : null;
+                  const pos = stPos || {{}};
+                  const posSize = Number(pos.size ?? (typeof setText === 'function' ? 0 : 0));
+                  // 也从 /api/status 的持仓展示卡读：若 Dashboard 元素显示 size 非 0 也认为已持仓
+                  let posSize2 = 0;
+                  try {{
+                    const elSz = document.getElementById('k-pos-size');
+                    if (elSz && elSz.textContent) {{
+                      const m = String(elSz.textContent).match(/([\d.]+)/);
+                      if (m) posSize2 = parseFloat(m[1]) || 0;
+                    }}
+                  }} catch(e) {{}}
+                  const hasPosition = posSize > 0 || posSize2 > 0;
                   const aiRegime = String(ai['市场状态'] ?? '暂无');
                   const aiConf = Number(ai['置信度'] ?? 0);
                   const aiOK = (aiRegime === '上涨趋势' || aiRegime === '下跌趋势') && aiConf >= 50;
@@ -829,32 +903,46 @@ def create_app(
                   const sugNom = lastRisk['建议名义价值(USDT)'];
                   const minNom = lastRisk['最小名义(USDT)'];
                   let tip = '';
-                  if (passTs > 0 && conc === '通过') {{
+                  let kind = ''; // ''/deny/wait/pass  ->  加 CSS class
+                  if (hasPosition) {{
+                    const side = pos.side || (posSize2>0 ? (document.getElementById('k-pos-side') || {{}}).textContent : '') || '多单';
+                    const entry = Number(pos.entry_price ?? 0).toFixed(1);
+                    const mark = Number(pos.mark_price ?? 0).toFixed(1);
+                    const levTxt = Number(pos.leverage ?? 1) > 1 ? (' / ' + Number(pos.leverage ?? 1) + 'X') : '';
+                    const upl = Number(pos.unrealized_pnl ?? 0);
+                    const uplTxt = (upl >= 0 ? '+' : '') + upl.toFixed(4) + 'U';
+                    tip = '📦 已持仓 ' + Math.max(posSize, posSize2).toFixed(1) + ' 张(' + side + ')｜成本 ' + entry + '$ / 现价 ' + mark + '$' + levTxt + '｜浮盈亏 ' + uplTxt + '｜后续：AI 风控触发利润保护平仓';
+                    kind = 'pass';
+                  }} else if (passTs > 0 && conc === '通过') {{
                     const age = Math.floor(Date.now()/1000 - passTs);
                     const h = Math.floor(age/3600), m = Math.floor((age%3600)/60), s2 = age%60;
                     const a = (h>0? h+'h'+String(m).padStart(2,'0')+'m'+String(s2).padStart(2,'0')+'s前'
                               : (m>0? m+'m'+String(s2).padStart(2,'0')+'s前' : s2+'s前'));
                     tip = '✅ 信号双过 ' + a + '，等成交/下一轮再评估 · 风控通过(名义 ' + sugNom + 'U ≥ min ' + minNom + 'U @ ' + lev + 'X) · AI[' + aiRegime + ' conf=' + aiConf + ']';
+                    kind = 'pass';
                   }} else if (conc === '拒绝') {{
                     let tail = '';
                     if (gap != null && !isNaN(Number(gap)) && Number(gap) > 0) {{
                       tail = ' · ⚠️还差 ≈ ' + Number(gap).toFixed(2) + 'U 本金摸到最小单；调杠杆(当前 ' + lev + 'X)或调大R%/止损%';
                     }}
                     tip = '❌ 风控拒绝 · ' + reason + tail;
+                    kind = 'deny';
                   }} else if (conc === '通过') {{
                     if (!aiOK) {{
                       tip = '🟡 风控通过(名义 ' + sugNom + 'U ≥ min ' + minNom + 'U @ ' + lev + 'X) · 等AI信号(当前 [' + aiRegime + ' conf=' + aiConf + ']，需 TREND_UP/DOWN + ≥50)';
+                      kind = 'wait';
                     }} else {{
                       tip = '🟢 风控通过 + AI[' + aiRegime + ' conf=' + aiConf + '] · 信号应已发送，查「最近交易」或 journalctl -u ycs | grep [主循环]';
+                      kind = 'pass';
                     }}
                   }} else {{
                     tip = '启动中：等待第一轮风控评估（10s 内）';
                   }}
                   elRiskTip.textContent = tip;
                   elRiskTip.classList.remove('risk-pass','risk-deny','risk-wait');
-                  if (conc === '拒绝') elRiskTip.classList.add('risk-deny');
-                  else if (conc === '通过' && !aiOK) elRiskTip.classList.add('risk-wait');
-                  else if (conc === '通过') elRiskTip.classList.add('risk-pass');
+                  if (kind === 'deny') elRiskTip.classList.add('risk-deny');
+                  else if (kind === 'wait') elRiskTip.classList.add('risk-wait');
+                  else if (kind === 'pass') elRiskTip.classList.add('risk-pass');
                 }}
 
                 // AI
@@ -1318,7 +1406,36 @@ def create_app(
                     system_block["ai_signal_status"] = (
                         f"到位[{regime} conf={conf}]" if signal_ok else f"不足[{regime or '暂无'} conf={conf}]"
                     )
-                    if isinstance(last_r, dict) and last_r.get("结论") == "通过" and signal_ok:
+                    # 2026-08-31 修复：先判「当前是否真的空仓」，再决定是否输出 why_no_position
+                    #   (broker_block 还没 build，提前读一次 broker position 判断 has_pos)
+                    pos_snapshot = {"side": "FLAT", "size": 0.0, "entry_price": 0.0, "mark_price": 0.0,
+                                    "leverage": 1, "unrealized_pnl": 0.0}
+                    if ctl is not None and hasattr(ctl, "broker"):
+                        try:
+                            sym_check = (getattr(getattr(cfg, "trading", None), "symbol", None) if cfg else None) or "ETH-USDT-SWAP"
+                            p_tmp = await ctl.broker.get_position(sym_check)
+                            pos_snapshot = {
+                                "side": str(p_tmp.side.value) if hasattr(p_tmp.side, "value") else str(p_tmp.side),
+                                "size": float(p_tmp.size or 0.0),
+                                "entry_price": float(p_tmp.entry_price or 0.0),
+                                "mark_price": float(p_tmp.mark_price or 0.0),
+                                "leverage": int(getattr(p_tmp, "leverage", 1) or 1),
+                                "unrealized_pnl": float(getattr(p_tmp, "unrealized_pnl", 0.0) or 0.0),
+                            }
+                        except Exception:  # noqa: BLE001
+                            pass
+                    has_pos_now = pos_snapshot["side"] not in ("FLAT", None) and pos_snapshot["size"] > 0
+                    # 已持仓：why_no_position 直接显示「现有持仓概况」，不再误报「信号已发仍未持仓」
+                    if has_pos_now:
+                        side_cn = "多单(LONG)" if pos_snapshot["side"] in ("LONG",) else (
+                            "空单(SHORT)" if pos_snapshot["side"] in ("SHORT",) else str(pos_snapshot["side"])
+                        )
+                        upl_sgn = f"+{pos_snapshot['unrealized_pnl']:.4f}U" if pos_snapshot["unrealized_pnl"] >= 0 else f"{pos_snapshot['unrealized_pnl']:.4f}U"
+                        system_block["why_no_position"] = (
+                            f"✅ 已持仓 {pos_snapshot['size']:.1f} 张({side_cn})，成本 {pos_snapshot['entry_price']:.1f}$ / "
+                            f"现价 {pos_snapshot['mark_price']:.1f}$ / {pos_snapshot['leverage']}X / 浮盈亏 {upl_sgn}"
+                        )
+                    elif isinstance(last_r, dict) and last_r.get("结论") == "通过" and signal_ok:
                         system_block["why_no_position"] = (
                             "风控+AI双过，信号应已发送；仍未持仓 → 查日志 grep '[主循环]' / '[开仓]' / 'SHADOW' / execute 结果"
                         )

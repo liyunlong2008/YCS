@@ -148,7 +148,12 @@ class TradingController:
         if bool(getattr(self.config.risk_limits, "shadow_mode", False)):
             mode_cn = f"{mode_cn}(影子 SHADOW)"
         ai_block = self._last_ai_block()
-        stats = st.get("stats") or {}
+        stats = self._load_stats()  # 2026-08-30: 用统一默认字典（含 trades_opened/closed/wins/losses 全字段默认值），避免 trades_total=None
+        # 累计交易次数 = 已开 + 已平 / 2（单向单边统计一次）；更保守直接取「已开」的次数（=执行过 execute FILLED 的次数）
+        stats.setdefault("trades_total", max(
+            int(stats.get("trades_opened", 0)),
+            int(stats.get("trades_closed", 0)),
+        ))
 
         # AI 节流状态（2026-08-30 新增）：实时算一遍 sentinel/level，把最新 mark 价作为输入让波动%准
         mark_input = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
