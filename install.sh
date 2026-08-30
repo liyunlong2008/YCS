@@ -201,49 +201,100 @@ else
   log_i "检测到已有仓库 $INSTALL_DIR → 执行增量更新"
   cd "$INSTALL_DIR"
 
-  # dirty 检查
-  if ! git diff --quiet || ! git diff --cached --quiet; then
-    if [ "$YCS_FORCE" -eq 1 ]; then
-      log_w "本地有未提交修改，YCS_FORCE=1 → git stash 保留（install.sh-snapshot-时间戳）"
-      git stash push -m "install.sh-snapshot-$(date +%Y%m%d-%H%M%S)" || log_w "stash 失败，继续"
+  # ====== 5A-0. 抢救模式：内容被清空但 .git 目录残留（就是你现在 ls 只看到 config.yaml 的情况）=========
+  #         run.py / deploy/install_systemd.sh 都不存在 → 仓库实质已损坏，
+  #         继续 dirty check / pull 都没意义。自动把 INSTALL_DIR 打成 .bak，
+  #         重新 git clone 一份干净代码，再把原 config.yaml 迁回来。
+  if [ ! -f run.py ] || [ ! -f deploy/install_systemd.sh ] || [ ! -d app ]; then
+    log_w "发现 INSTALL_DIR 内容不完整（缺少 run.py / deploy/install_systemd.sh / app/）—— 判定为：仓库被清空但 .git 仍残留（=『半残仓库』）。"
+    _bak="$INSTALL_DIR.ycs-damaged-$(date +%Y%m%d-%H%M%S)"
+    log_i "抢救模式：把 ${INSTALL_DIR} → 移动到 ${_bak}（不会丢你的 config.yaml），然后全新 git clone。"
+    cd "$(dirname "$INSTALL_DIR")"
+    mv "$INSTALL_DIR" "$_bak"
+    setup_git_proxy
+    git clone --depth=1 --branch "$GIT_BRANCH" --single-branch "$GIT_REPO" "$INSTALL_DIR" \
+      || die "全新 git clone 失败。备份目录已保留在：$_bak"
+    unset_git_proxy
+    cd "$INSTALL_DIR"
+    # 迁回 config.yaml（存在才迁，避免第一次就全新 clone 的情况没这个文件）
+    if [ -f "${_bak}/config.yaml" ]; then
+      cp -f "${_bak}/config.yaml" "${INSTALL_DIR}/config.yaml"
+      log_o "抢救完成：已从备份迁回 config.yaml。完整备份仍保留在：${_bak}"
     else
-      die "检测到本地未提交修改（dirty），为避免覆盖已中断。" \
-          "" \
-          "推荐：cd $INSTALL_DIR && git stash 后重跑本脚本" \
-          "强制：YCS_FORCE=1 bash install.sh（自动 stash）"
+      log_w "备份里也没 config.yaml，正常。后面第 6 步会自动 cp config.yaml.example → config.yaml（纸盘占位）。"
     fi
-  fi
-
-  # origin 切换到目标 GIT_REPO
-  local_url="$(git remote get-url origin 2>/dev/null || true)"
-  if [ -n "$local_url" ] && [ "$local_url" != "$GIT_REPO" ]; then
-    log_i "origin 当前=$local_url，切换到目标=$GIT_REPO"
-    git remote set-url origin "$GIT_REPO"
-  fi
-
-  setup_git_proxy
-  log_i "git fetch origin $GIT_BRANCH → pull --ff-only"
-  git fetch origin "$GIT_BRANCH" || die "git fetch 失败（检查分支名/网络/代理/权限）"
-  if git show-ref --verify --quiet "refs/heads/$GIT_BRANCH"; then
-    git checkout "$GIT_BRANCH"
+    # 直接跳到后面的"合法性校验/uv sync/pytest/systemd restart"，不再走 dirty/pull。
+    goto_post_pull="1"
   else
-    git checkout -b "$GIT_BRANCH" "origin/$GIT_BRANCH" || die "无法切换/创建本地分支 $GIT_BRANCH"
+    goto_post_pull="0"
   fi
-  if ! git merge-base --is-ancestor HEAD "origin/$GIT_BRANCH"; then
-    if [ "$YCS_FORCE" -eq 1 ]; then
-      log_w "本地领先远端；YCS_FORCE=1 → 重置为 origin/$GIT_BRANCH（本地未 push 提交将丢失）"
-      git reset --hard "origin/$GIT_BRANCH"
-    else
-      die "本地 HEAD 领先于远端 origin/$GIT_BRANCH。" \
-          "请先 cd $INSTALL_DIR && git push；或使用 YCS_FORCE=1 强制重置。"
+
+  if [ "$goto_post_pull" -eq 0 ]; then
+    # ====== 5A-1. config.yaml 自动免 dirty 处理：如果 .gitignore 里写了 config.yaml，但本地因为以前 commit 过
+    #             仍处于 tracked 状态，就 git rm --cached + git update-index --skip-worktree，
+    #             保证之后你 vim config.yaml 改 OKX 密钥、端口、live=true 等，永远不会触发 dirty 拦更新。
+    if git ls-files --error-unmatch config.yaml >/dev/null 2>&1; then
+      # config.yaml 当前是 tracked 的 → 尝试解除（静默；失败不影响主流程）
+      (
+        git rm --cached -f config.yaml >/dev/null 2>&1 || true
+        git update-index --skip-worktree config.yaml >/dev/null 2>&1 || true
+        # 防止 .gitignore 里没写，再加一次保证
+        grep -q '^config\.yaml$' .gitignore 2>/dev/null || echo "config.yaml" >> .gitignore
+      ) >/dev/null 2>&1 || true
     fi
   fi
-  if ! git pull --ff-only origin "$GIT_BRANCH"; then
-    die "pull --ff-only 失败：本地与远端存在分叉。" \
-        "请 cd $INSTALL_DIR 手动处理后重跑；或 YCS_FORCE=1 bash install.sh 强制 reset。"
+
+  if [ "$goto_post_pull" -eq 0 ]; then
+    # dirty 检查
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+      # 先把"到底哪几个文件 dirty"直接打出来，用户一眼就知道，不用再猜
+      echo
+      log_w "—— 本地修改明细（git status --porcelain）：——"
+      git status --porcelain | sed 's/^/  /' || true
+      log_w "—— 结束 ——"
+      echo
+      if [ "$YCS_FORCE" -eq 1 ]; then
+        log_w "本地有未提交修改，YCS_FORCE=1 → git stash 保留（install.sh-snapshot-时间戳）"
+        git stash push -m "install.sh-snapshot-$(date +%Y%m%d-%H%M%S)" || log_w "stash 失败，继续"
+      else
+        die "检测到本地未提交修改（dirty），为避免覆盖已中断。" \
+            "" \
+            "推荐：cd $INSTALL_DIR && git stash 后重跑本脚本" \
+            "强制：YCS_FORCE=1 bash install.sh（自动 stash）"
+      fi
+    fi
+
+    # origin 切换到目标 GIT_REPO
+    local_url="$(git remote get-url origin 2>/dev/null || true)"
+    if [ -n "$local_url" ] && [ "$local_url" != "$GIT_REPO" ]; then
+      log_i "origin 当前=$local_url，切换到目标=$GIT_REPO"
+      git remote set-url origin "$GIT_REPO"
+    fi
+
+    setup_git_proxy
+    log_i "git fetch origin $GIT_BRANCH → pull --ff-only"
+    git fetch origin "$GIT_BRANCH" || die "git fetch 失败（检查分支名/网络/代理/权限）"
+    if git show-ref --verify --quiet "refs/heads/$GIT_BRANCH"; then
+      git checkout "$GIT_BRANCH"
+    else
+      git checkout -b "$GIT_BRANCH" "origin/$GIT_BRANCH" || die "无法切换/创建本地分支 $GIT_BRANCH"
+    fi
+    if ! git merge-base --is-ancestor HEAD "origin/$GIT_BRANCH"; then
+      if [ "$YCS_FORCE" -eq 1 ]; then
+        log_w "本地领先远端；YCS_FORCE=1 → 重置为 origin/$GIT_BRANCH（本地未 push 提交将丢失）"
+        git reset --hard "origin/$GIT_BRANCH"
+      else
+        die "本地 HEAD 领先于远端 origin/$GIT_BRANCH。" \
+            "请先 cd $INSTALL_DIR && git push；或使用 YCS_FORCE=1 强制重置。"
+      fi
+    fi
+    if ! git pull --ff-only origin "$GIT_BRANCH"; then
+      die "pull --ff-only 失败：本地与远端存在分叉。" \
+          "请 cd $INSTALL_DIR 手动处理后重跑；或 YCS_FORCE=1 bash install.sh 强制 reset。"
+    fi
+    log_o "更新完成，当前 HEAD=$(git rev-parse --short HEAD)"
+    unset_git_proxy
   fi
-  log_o "更新完成，当前 HEAD=$(git rev-parse --short HEAD)"
-  unset_git_proxy
 fi
 
 # ---------------------------------------------------------------------------
