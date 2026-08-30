@@ -484,7 +484,17 @@ else
   # ============================================================
   if [ -f config.yaml ]; then
     log_i "config.yaml YAML 自检（VPS 手改缩进错误最常见，提前抓住=省 30 分钟排错）…"
-    if ! "$UV_BIN" run python - <<'PYCFGCHK'
+    # PYCFGCHK 退出码：
+    #   0 = YAML 合法（或 config.yaml 不存在）
+    #   2 = YAML 语法错误（stdout/stderr 已带行号+上下文）
+    #   3 = 其它自检异常（import yaml 失败 / 读文件失败）
+    # 因此这里直接 `if CMD`（不加 !）：
+    #   CMD 成功（exit 0）→ then 分支打印「自检通过」
+    #   CMD 失败（exit 非 0）→ else 分支 die，防止带病进 pytest
+    # （之前写反成 `if ! CMD` → YAML 合法反而 die FATAL：
+    #    日志表现为「✅ config.yaml YAML 语法通过 → 下一行 FATAL 有 YAML 语法错误」，
+    #    VPS 2026-08-30 现场完全命中）
+    if "$UV_BIN" run python - <<'PYCFGCHK'
 import sys, pathlib
 p = pathlib.Path("config.yaml")
 try:
@@ -526,8 +536,9 @@ PYCFGCHK
     then
       log_o "config.yaml YAML 自检通过"
     else
-      die "config.yaml 有 YAML 语法错误（见上方红色报错具体行），pytest 肯定会失败，已中止。" \
-          "按报错的具体行号修改缩进/冒号后，重跑 install.sh 即可。"
+      die "config.yaml 有 YAML 语法错误 / 自检失败（见上方具体报错行），已中止。" \
+          "按报错的具体行号修改缩进/冒号后重跑 install.sh 即可；" \
+          "如果之前是手改实盘配置，推荐直接：cp config.yaml.example config.yaml 再重填 3 项 OKX 密钥 + shadow_mode=true（省排错）。"
     fi
   fi
 
