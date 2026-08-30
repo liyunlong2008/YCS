@@ -829,13 +829,16 @@ class TradingController:
     # 日切点
     # ------------------------------------------------------------------
     def apply_daily_reset_if_needed(self, today: str | None = None) -> bool:
-        """检测日期变化 → 触发 risk.start_new_day()，返回 True 表示发生了切换。"""
+        """检测日期变化 → 触发 risk.recompute_daily_start_if_suspicious()；
+        另外即便日期没切，也照样做一次 daily_start 异常值纠偏（防止 state.json 被旧值污染）。
+        返回 True 表示发生了 daily_start_balance 写入 / 或纠正动作。
+        """
         import datetime as _dt
+        import logging as _logging
         today = today or _dt.date.today().isoformat()
         st = self.state_store.load()
         last_day = st.get("daily_reset_day")
-        if last_day == today:
-            return False
+        day_match = bool(last_day) and str(last_day) == str(today)
         bal_total = float((st.get("balance") or {}).get("total", 0.0))
         if bal_total <= 0:
             try:
@@ -844,9 +847,20 @@ class TradingController:
                 bal_total = float(getattr(bal, "total", 0.0) or 0)
             except Exception:
                 bal_total = 0.0
-        if bal_total > 0:
-            self.risk.start_new_day(bal_total)
+        reset, reason = self.risk.recompute_daily_start_if_suspicious(
+            bal_total,
+            daily_reset_day_matches=day_match,
+            today_iso=today,
+        )
+        # 日期没切但纠偏做了（reset=True）也记录；日期切了必然会写 daily_reset_day
         st["daily_reset_day"] = today
+        # 风控状态回写（daily_start_balance 若被 reset 时已经在 risk 对象里改了）
+        st.setdefault("risk", {}).update(self.risk.to_dict())
         self.state_store.save(st)
-        logger.info("[日切点] 日期切换到 {}，risk.daily_start_balance={:.4f}U", today, bal_total)
-        return True
+        _logger = _logging.getLogger(__name__)
+        if reset:
+            _logger.info("[日切点] %s", reason)
+        else:
+            # 日期未切且无需纠偏 → TRACE，避免刷屏
+            _logger.debug("[日切点] %s", reason)
+        return reset or not day_match

@@ -218,13 +218,30 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     try:
         recovered = await recoverer.recover()
         bal_total = float((recovered.get("balance") or {}).get("total", 0.0))
-        if bal_total > 0 and risk.daily_start_balance <= 0:
-            risk.start_new_day(bal_total)
-        # 写回风控 / 仓位管理器持久态
-        st = state_store.load()
-        st.setdefault("risk", {}).update(risk.to_dict())
-        st.setdefault("position_manager", {}).update(position_manager.to_dict())
-        state_store.save(st)
+        # 2026-08-30 升级：不再只做简单的 bal>0 && daily_start<=0 判断（会让 state 残留 1000U 绕过检查）。
+        #   ① 先从 state 读 daily_reset_day 与今天比较，判断是否跨天；
+        #   ② 调用 risk.recompute_daily_start_if_suspicious() 三层纠偏：
+        #      - 跨天 → 强制重置
+        #      - 首次启动 daily_start=0 → 初始化
+        #      - 残留大值 / 充值小值（差>50U 且倍数超阈值）→ 重置
+        import datetime as _dt
+        _today = _dt.date.today().isoformat()
+        _st_pre = state_store.load()
+        last_day = (_st_pre.get("daily_reset_day") or "")
+        day_match = bool(last_day) and last_day == _today
+        reset, reason = risk.recompute_daily_start_if_suspicious(
+            bal_total,
+            daily_reset_day_matches=day_match,
+            today_iso=_today,
+        )
+        if reset:
+            logger.success("[日切初始化] {}", reason)
+        else:
+            logger.info("[日切初始化] {}", reason)
+        _st_pre["daily_reset_day"] = _today
+        _st_pre.setdefault("risk", {}).update(risk.to_dict())
+        _st_pre.setdefault("position_manager", {}).update(position_manager.to_dict())
+        state_store.save(_st_pre)
     except Exception:
         logger.exception("启动恢复失败，以 STOPPED 继续启动 Dashboard（请检查 OKX 网络/密钥）")
 

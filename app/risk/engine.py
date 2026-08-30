@@ -84,6 +84,8 @@ class RiskEngine:
         self.consecutive_losses: int = 0
         self.cooldown_until_ts: int = 0   # 熔断解除 Unix 秒时间戳
         self.daily_start_balance: float = 0.0
+        # 2026-08-30 新增：最近一次纠偏（用于 Dashboard 展示 为什么 daily_start 被重置）
+        self.daily_start_sanity_log: str = ""
 
     # ------------------------------------------------------------------
     # 状态持久化（与 StateStore["risk"] 对接）
@@ -94,6 +96,8 @@ class RiskEngine:
             "consecutive_losses": self.consecutive_losses,
             "cooldown_until_ts": self.cooldown_until_ts,
             "daily_start_balance": self.daily_start_balance,
+            # NOTE: daily_reset_day 留给 StateStore 顶层（controller/run.py 共用），
+            #       这里不重复存，避免双写不一致。
         }
 
     def load_dict(self, data: dict[str, Any] | None) -> None:
@@ -101,9 +105,9 @@ class RiskEngine:
         if not data:
             return
         try:
-            self.consecutive_losses = int(data.get("consecutive_losses", 0))
-            self.cooldown_until_ts = int(data.get("cooldown_until_ts", 0))
-            self.daily_start_balance = float(data.get("daily_start_balance", 0.0))
+            self.consecutive_losses = int(data.get("consecutive_losses", 0) or 0)
+            self.cooldown_until_ts = int(data.get("cooldown_until_ts", 0) or 0)
+            self.daily_start_balance = float(data.get("daily_start_balance", 0.0) or 0.0)
         except Exception:
             # 字段损坏时不阻塞，等价于冷启动
             self.consecutive_losses = 0
@@ -111,11 +115,117 @@ class RiskEngine:
             self.daily_start_balance = 0.0
 
     # ------------------------------------------------------------------
+    # 日切余额异常值纠正（2026-08-30 新，解决用户 VPS 出现 daily_start=1000U 的致命误熔断）
+    #
+    # 背景：
+    #   · state.json 残留（旧 pytest 写入 / 部署阶段写入） daily_start_balance=1000U，
+    #     而真实账户只有 14.83U → 当日亏损按 (1 - 14.83/1000)*100 = 98.52% ≥ 15% 直接全系统挡交易。
+    #   · 另一反向场景：新充钱 14.83 → 50U，daily_start 仍 14.83U，真实盈利但被记成日盈 237%，
+    #     虽不触发熔断，也会让「今日盈亏率 %」卡片失真。
+    #
+    # 纠偏策略（满足以下「任一」就以当前余额为锚重置 daily_start）：
+    #   1) daily_start <= 0 → 经典首次启动 / 损坏：必须重置。
+    #   2) daily_start 明显「大于」当前真实余额：
+    #        - daily_start > current * 1.5x  且  diff_abs > 50U  → 判定残留。
+    #      这样正常日内浮亏（即使亏 30% 到 0.7x）不会被误重置，仅拦「测试值 1000U vs 真金 14.83U」。
+    #   3) daily_start 明显「小于」当前真实余额：
+    #        - current > daily_start * 2x  且  diff_abs > 50U  → 判定充钱但没重启/没过自然日。
+    #      允许「今日盈亏率」从新充值后的新本金基准确认展示。
+    # 额外：
+    #   · 参数 daily_reset_day_matches：今日本地日期是否与 state 中 daily_reset_day 一致，
+    #     「不一致」则必然属于「日期应切没切」，直接强制重置（不触发异常值规则）。
+    # ------------------------------------------------------------------
+    DAILY_START_RESET_MULT_UPPER = 1.5   # daily_start > current * 1.5x → 可疑
+    DAILY_START_RESET_MULT_LOWER = 2.0   # current > daily_start * 2x → 可疑（充值未重启）
+    DAILY_START_RESET_ABS_DIFF = 50.0    # 绝对差 > 50U 才触发（避免 14.83U↔25U 这种误判）
+
+    def recompute_daily_start_if_suspicious(
+        self,
+        current_balance_total: float,
+        *,
+        daily_reset_day_matches: bool = True,
+        today_iso: str = "",
+    ) -> tuple[bool, str]:
+        """按上述规则纠正 daily_start_balance。返回 (是否发生重置, 原因描述)。"""
+        import datetime as _dt
+        cur = float(current_balance_total or 0.0)
+        ds = float(self.daily_start_balance or 0.0)
+        _today = today_iso or _dt.date.today().isoformat()
+
+        # 跨天：无条件重置（因为是新交易日），这是第一优先级
+        if not daily_reset_day_matches:
+            if cur <= 0:
+                self.daily_start_sanity_log = (
+                    f"[{_today}] 跨日到 {_today}，但当前余额={cur:.4f}U 不可信，"
+                    f"daily_start 暂保留={ds:.4f}U（等下一轮 OKX 余额后再切）。"
+                )
+                return False, self.daily_start_sanity_log
+            old = ds
+            self.start_new_day(cur)
+            self.daily_start_sanity_log = (
+                f"[{_today}] 跨日自动日切：daily_start {old:.4f}U → {cur:.4f}U（日期={_today}）。"
+            )
+            return True, self.daily_start_sanity_log
+
+        # 规则 1) 经典首次启动
+        if ds <= 0:
+            if cur <= 0:
+                self.daily_start_sanity_log = (
+                    f"[{_today}] daily_start={ds:.4f}U，但当前余额也={cur:.4f}U，暂不重置（等余额可用）。"
+                )
+                return False, self.daily_start_sanity_log
+            self.start_new_day(cur)
+            self.daily_start_sanity_log = (
+                f"[{_today}] 首次启动 daily_start=0，初始化 daily_start={cur:.4f}U。"
+            )
+            return True, self.daily_start_sanity_log
+
+        # 当前余额 0/负 → 不可作为基准（OKX 网络卡了），不动 daily_start
+        if cur <= 0:
+            self.daily_start_sanity_log = (
+                f"[{_today}] 当前余额={cur:.4f}U 不可信，保留 daily_start={ds:.4f}U。"
+            )
+            return False, self.daily_start_sanity_log
+
+        diff_abs = abs(ds - cur)
+        # 规则 2) daily_start 显著大于当前（典型旧 state 残留 1000U→14.83U）
+        if ds > cur * self.DAILY_START_RESET_MULT_UPPER and diff_abs > self.DAILY_START_RESET_ABS_DIFF:
+            old = ds
+            self.start_new_day(cur)
+            self.daily_start_sanity_log = (
+                f"[{_today}] daily_start 异常偏大：{old:.4f}U > 当前余额 {cur:.4f}U × "
+                f"{self.DAILY_START_RESET_MULT_UPPER} 且差 {diff_abs:.2f}U > {self.DAILY_START_RESET_ABS_DIFF}U，"
+                f"判定为旧 state 残留 → 重置 daily_start={cur:.4f}U（避免日损假熔断）。"
+            )
+            return True, self.daily_start_sanity_log
+
+        # 规则 3) 当前余额显著大于 daily_start（典型用户充值/转账后当日收益展示失真）
+        if cur > ds * self.DAILY_START_RESET_MULT_LOWER and diff_abs > self.DAILY_START_RESET_ABS_DIFF:
+            old = ds
+            self.start_new_day(cur)
+            self.daily_start_sanity_log = (
+                f"[{_today}] daily_start 异常偏小（充值未重启）：当前余额 {cur:.4f}U > "
+                f"{old:.4f}U × {self.DAILY_START_RESET_MULT_LOWER} 且差 {diff_abs:.2f}U > "
+                f"{self.DAILY_START_RESET_ABS_DIFF}U → 重置 daily_start={cur:.4f}U。"
+            )
+            return True, self.daily_start_sanity_log
+
+        # 正常：无需纠正
+        self.daily_start_sanity_log = (
+            f"[{_today}] daily_start={ds:.4f}U、当前余额={cur:.4f}U、差={diff_abs:.2f}U：在正常区间，无需纠正。"
+        )
+        return False, self.daily_start_sanity_log
+
+    # ------------------------------------------------------------------
     # 日切点 / 平仓结果回调
     # ------------------------------------------------------------------
     def start_new_day(self, current_balance_total: float) -> None:
-        """每个交易日开始（或首次启动）调用，固定日初权益。"""
-        self.daily_start_balance = float(current_balance_total)
+        """每个交易日开始（或首次启动）调用，固定日初权益。
+
+        保证 daily_start_balance 为正数（为 0/负 时本函数作为「空值」，等下一次 OKX 余额再填）。
+        """
+        if current_balance_total > 0:
+            self.daily_start_balance = float(current_balance_total)
 
     def on_trade_closed(self, pnl_pct: float) -> None:
         """平仓回调：累计连续亏损、重置。
@@ -250,19 +360,26 @@ class RiskEngine:
                 suggested_leverage=leverage,
             ))
 
-        # 3) 日亏损熔断
+        # 3) 日亏损熔断（2026-08-30 加固：daily_start 明显异常时直接跳过该检查，避免假熔断锁死系统）
         daily_loss_pct = 0.0
-        if self.daily_start_balance > 1e-9:
-            daily_loss_pct = (1 - balance_total / self.daily_start_balance) * 100
-            if daily_loss_pct >= self.MAX_DAILY_LOSS_PCT:
-                return _snap(RiskVerdict(
-                    allow=False,
-                    reason=(
-                        f"当日亏损 {daily_loss_pct:.2f}% 超过阈值 {self.MAX_DAILY_LOSS_PCT}%，"
-                        "强制停止交易，请次日再启动"
-                    ),
-                    suggested_leverage=leverage,
-                ))
+        if self.daily_start_balance > 1e-9 and balance_total > 1e-9:
+            # 安全夹：如果 daily_start / current ≥ 3x（典型「残留 1000U vs 真 14.83U」），
+            #         即使 recompute_daily_start_if_suspicious() 因故没调，这里也再兜一次：
+            #         直接把 daily_loss_pct 置 0，杜绝误熔断。
+            ds_sanity_ratio = self.daily_start_balance / max(balance_total, 1e-9)
+            if ds_sanity_ratio >= 3.0:
+                daily_loss_pct = 0.0
+            else:
+                daily_loss_pct = (1 - balance_total / self.daily_start_balance) * 100
+                if daily_loss_pct >= self.MAX_DAILY_LOSS_PCT:
+                    return _snap(RiskVerdict(
+                        allow=False,
+                        reason=(
+                            f"当日亏损 {daily_loss_pct:.2f}% 超过阈值 {self.MAX_DAILY_LOSS_PCT}%，"
+                            "强制停止交易，请次日再启动"
+                        ),
+                        suggested_leverage=leverage,
+                    ))
 
         # 4) 按 R + 交易所规则统一算（先 USDT 口径，再折算 sz 并按 lotSz 夹合法性）
         #    4.1 目标最大亏损(USDT) = balance_total × risk_pct%

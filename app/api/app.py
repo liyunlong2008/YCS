@@ -1519,6 +1519,28 @@ def create_app(
                     ai_conf = int(getattr(last_ai, "confidence", 0) or 0)
                     ai_reason = str(getattr(last_ai, "reason", "") or "")
                     ai_ts = last_ai_ts
+                # 2026-08-30：额外输出 daily_start 合理性指标（用户 VPS 遇到 1000U vs 14.83U 假熔断 → 一行看懂）
+                risk_obj = getattr(ctl, "risk", None)
+                ds = float(getattr(risk_obj, "daily_start_balance", 0.0) or 0.0)
+                cur_equity = float(bal_total or 0.0)
+                ds_ratio = (ds / cur_equity) if (ds > 0 and cur_equity > 0) else 0.0
+                ds_diff_usdt = (ds - cur_equity) if (ds > 0 and cur_equity > 0) else 0.0
+                # daily_loss_pct 直接用 RiskEngine 同款公式算一份给 /api/diag，避免前端再推断
+                ds_pct = (1 - cur_equity / ds) * 100 if (ds > 1e-9 and cur_equity > 0) else 0.0
+                daily_reset_day = (state_snapshot or {}).get("daily_reset_day") or ""
+                import datetime as _dt
+                _today = _dt.date.today().isoformat()
+                ds_sanity = "正常"
+                if ds <= 0:
+                    ds_sanity = "未初始化(下一轮补)"
+                elif cur_equity <= 0:
+                    ds_sanity = "当前权益不可读(等 OKX)"
+                elif ds_ratio >= 3.0:
+                    ds_sanity = f"⚠️ 异常偏大（ds/cur={ds_ratio:.2f}x），建议重启或等下一轮 apply_daily_reset 纠偏"
+                elif ds_diff_usdt < -50 and cur_equity > ds * 2.0:
+                    ds_sanity = "ℹ️ 异常偏小（疑似充值未重启），盈亏率展示会偏大"
+                elif abs(ds_diff_usdt) <= 50 and 0.7 <= ds_ratio <= 1.43:
+                    ds_sanity = "正常（日内盈亏范围内）"
                 controller_block = {
                     "controller_available": True,
                     "last_ai": {
@@ -1528,9 +1550,17 @@ def create_app(
                         "reason_preview": ai_reason[:120],
                     },
                     "risk": {
-                        "consecutive_losses": int(getattr(getattr(ctl, "risk", None), "consecutive_losses", 0) or 0),
-                        "cooldown_until_ts": int(getattr(getattr(ctl, "risk", None), "cooldown_until_ts", 0) or 0),
-                        "daily_start_balance": float(getattr(getattr(ctl, "risk", None), "daily_start_balance", 0.0) or 0.0),
+                        "consecutive_losses": int(getattr(risk_obj, "consecutive_losses", 0) or 0),
+                        "cooldown_until_ts": int(getattr(risk_obj, "cooldown_until_ts", 0) or 0),
+                        "daily_start_balance": ds,
+                        # ---- 2026-08-30 新增：可观测性 ----
+                        "daily_reset_day": daily_reset_day,   # 上次写进 state.json 的日期
+                        "today": _today,
+                        "daily_loss_pct_if_trust": round(ds_pct, 4),  # ≈ RiskEngine 同款公式
+                        "daily_start_vs_cur_ratio": round(ds_ratio, 4),
+                        "daily_start_minus_cur_usdt": round(ds_diff_usdt, 4),
+                        "sanity_status": ds_sanity,
+                        "sanity_log": str(getattr(risk_obj, "daily_start_sanity_log", "") or ""),
                     },
                 }
             except Exception as e:  # noqa: BLE001
