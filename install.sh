@@ -92,6 +92,11 @@ fi
 : "${YCS_SKIP_TEST:=0}"
 : "${YCS_NO_SYSTEMD:=0}"
 : "${YCS_FORCE:=0}"
+# YCS_KEEP_LOCAL_CONFIG=1（默认）：
+#   · YCS_FORCE=1 做 git reset --hard 前，会把 $INSTALL_DIR/config.yaml
+#     备份到 /tmp；reset 完成后再拷回来，避免用户填好的 OKX/AI 凭证被刷成模板。
+#   · =0 则不备份（极少用到；用户可以自行在备份目录留副本）。
+: "${YCS_KEEP_LOCAL_CONFIG:=1}"
 
 # ---------------------------------------------------------------------------
 # 1) 彩色日志（非 TTY 关闭颜色，便于 journalctl 阅读）
@@ -201,16 +206,70 @@ else
   log_i "检测到已有仓库 $INSTALL_DIR → 执行增量更新"
   cd "$INSTALL_DIR"
 
-  # dirty 检查
-  if ! git diff --quiet || ! git diff --cached --quiet; then
+  # -----------------------------------------------------------------
+  # dirty 检测（升级版）：
+  #   · 旧逻辑只用 git diff --quiet，只能发现“已跟踪文件内容/删除/重命名”的变化，
+  #     无法发现 untracked，也无法告诉用户到底哪里脏（你刚才 VPS 只剩 config.yaml，
+  #     实际是「上百个已跟踪源码文件被删」→ diff --quiet 成立，但用户一脸懵）。
+  #   · 新逻辑用 git status --porcelain 收集全量 dirty；然后：
+  #       - 把前 30 行原样打印出来（用户 1 秒就能看出「大量 D 被删 / ?? 未跟踪」）
+  #       - 仅 config.yaml 的 untracked 不算 dirty（.gitignore 没写到位/误删也不阻塞）
+  #       - YCS_FORCE=1：自动备份 config.yaml → reset --hard origin/<branch>
+  #                      → 恢复 config.yaml → 继续后续流程（最符合 VPS 场景）
+  # -----------------------------------------------------------------
+  dirty_lines="$(git status --porcelain | grep -vE '^\?\? config\.yaml$' || true)"
+
+  if [ -n "$dirty_lines" ]; then
+    total_dirty="$(printf '%s\n' "$dirty_lines" | sed '/^\s*$/d' | wc -l | tr -d ' ')"
+    log_w "检测到本地 dirty（共 ${total_dirty} 处，前 30 行明细如下）："
+    echo "──── git status --porcelain（除 config.yaml 未跟踪外）────"
+    printf '%s\n' "$dirty_lines" | head -30
+    echo "────────────────────────────────────────────────────────────"
+
     if [ "$YCS_FORCE" -eq 1 ]; then
-      log_w "本地有未提交修改，YCS_FORCE=1 → git stash 保留（install.sh-snapshot-时间戳）"
-      git stash push -m "install.sh-snapshot-$(date +%Y%m%d-%H%M%S)" || log_w "stash 失败，继续"
+      # ============== FORCE 路径：备份 config → 重置仓库到远端最新 ==============
+      # 原因：VPS 常见现场 = 只剩 config.yaml（源码被误删），这时 stash 没用；
+      #       真正需要的是「对齐远端最新 commit + 保留 config.yaml」。
+      backup_cfg=""
+      if [ "$YCS_KEEP_LOCAL_CONFIG" -eq 1 ] && [ -f config.yaml ]; then
+        backup_cfg="$(mktemp /tmp/ycs.config.yaml.XXXXXX)"
+        cp -f config.yaml "$backup_cfg"
+        log_w "已备份你的 config.yaml → ${backup_cfg}（将在 reset 后写回）"
+      fi
+
+      log_w "YCS_FORCE=1 → 将仓库重置到 origin/${GIT_BRANCH} 最新（本地未 push 提交/untracked/删除都会丢失）"
+      # 先做一次 fetch（保证 reset 目标可达；即使前面没走 fetch 分支也 ok）
+      setup_git_proxy
+      if ! git fetch origin "$GIT_BRANCH" --depth=1 2>/dev/null; then
+        git fetch origin "$GIT_BRANCH" || log_w "fetch 失败，继续尝试 reset（依赖已有远端引用）"
+      fi
+      unset_git_proxy
+
+      # 三步强清理：(1) 恢复已跟踪文件（消除 D / M）；(2) 删掉 untracked files/dirs；(3) 强行对齐远端指针
+      git checkout -f "origin/${GIT_BRANCH}" -- . 2>/dev/null || true
+      # 除 .venv / data / logs / config.yaml / config.yaml.example 以外，都可以清
+      git clean -fd \
+        -e '.venv' -e '.venv/**' \
+        -e 'data' -e 'data/**' \
+        -e 'logs' -e 'logs/**' \
+        -e 'config.yaml' -e 'config.yaml.example' 2>/dev/null || true
+      git reset --hard "origin/${GIT_BRANCH}" || die "YCS_FORCE reset --hard origin/${GIT_BRANCH} 失败（检查仓库/分支/代理）"
+
+      # 写回 config.yaml（只有当我们之前备份过 & reset 后目标路径已经回到仓库里时才做）
+      if [ -n "$backup_cfg" ] && [ -f "$backup_cfg" ]; then
+        cp -f "$backup_cfg" config.yaml
+        log_o "config.yaml 已从备份写回：你的 OKX / AI / shadow_mode 配置未丢失。"
+        rm -f "$backup_cfg"
+      fi
+
+      log_o "强重置完成，当前 HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     else
-      die "检测到本地未提交修改（dirty），为避免覆盖已中断。" \
+      die "检测到本地 dirty（共 ${total_dirty} 处），为避免覆盖你的实盘配置已中止。" \
           "" \
-          "推荐：cd $INSTALL_DIR && git stash 后重跑本脚本" \
-          "强制：YCS_FORCE=1 bash install.sh（自动 stash）"
+          "推荐（保守）：先看上方 dirty 明细确认要不要提交/备份，然后执行：" \
+          "    cd $INSTALL_DIR && git stash push -u" \
+          "强制（推荐 VPS 使用）：YCS_FORCE=1 本脚本会自动备份 config.yaml → reset --hard origin/${GIT_BRANCH} → 恢复 config.yaml → 继续：" \
+          "    curl -fsSL https://raw.githubusercontent.com/liyunlong2008/YCS/main/install.sh | GIT_REPO=https://github.com/liyunlong2008/YCS.git YCS_FORCE=1 bash"
     fi
   fi
 
@@ -231,16 +290,42 @@ else
   fi
   if ! git merge-base --is-ancestor HEAD "origin/$GIT_BRANCH"; then
     if [ "$YCS_FORCE" -eq 1 ]; then
+      # 对齐 YCS_FORCE 语义：备份 config → reset → 恢复 config
+      backup_cfg=""
+      if [ "$YCS_KEEP_LOCAL_CONFIG" -eq 1 ] && [ -f config.yaml ]; then
+        backup_cfg="$(mktemp /tmp/ycs.config.yaml.XXXXXX)"
+        cp -f config.yaml "$backup_cfg"
+      fi
       log_w "本地领先远端；YCS_FORCE=1 → 重置为 origin/$GIT_BRANCH（本地未 push 提交将丢失）"
       git reset --hard "origin/$GIT_BRANCH"
+      if [ -n "$backup_cfg" ] && [ -f "$backup_cfg" ]; then
+        cp -f "$backup_cfg" config.yaml
+        log_o "config.yaml 已写回"
+        rm -f "$backup_cfg"
+      fi
     else
       die "本地 HEAD 领先于远端 origin/$GIT_BRANCH。" \
           "请先 cd $INSTALL_DIR && git push；或使用 YCS_FORCE=1 强制重置。"
     fi
   fi
   if ! git pull --ff-only origin "$GIT_BRANCH"; then
-    die "pull --ff-only 失败：本地与远端存在分叉。" \
-        "请 cd $INSTALL_DIR 手动处理后重跑；或 YCS_FORCE=1 bash install.sh 强制 reset。"
+    if [ "$YCS_FORCE" -eq 1 ]; then
+      backup_cfg=""
+      if [ "$YCS_KEEP_LOCAL_CONFIG" -eq 1 ] && [ -f config.yaml ]; then
+        backup_cfg="$(mktemp /tmp/ycs.config.yaml.XXXXXX)"
+        cp -f config.yaml "$backup_cfg"
+      fi
+      log_w "pull --ff-only 失败且 YCS_FORCE=1 → 直接 reset --hard origin/$GIT_BRANCH 对齐"
+      git reset --hard "origin/$GIT_BRANCH"
+      if [ -n "$backup_cfg" ] && [ -f "$backup_cfg" ]; then
+        cp -f "$backup_cfg" config.yaml
+        log_o "config.yaml 已写回"
+        rm -f "$backup_cfg"
+      fi
+    else
+      die "pull --ff-only 失败：本地与远端存在分叉。" \
+          "请 cd $INSTALL_DIR 手动处理后重跑；或 YCS_FORCE=1 bash install.sh 强制 reset。"
+    fi
   fi
   log_o "更新完成，当前 HEAD=$(git rev-parse --short HEAD)"
   unset_git_proxy
