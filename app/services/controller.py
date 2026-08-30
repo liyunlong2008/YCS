@@ -132,7 +132,11 @@ class TradingController:
     # ------------------------------------------------------------------
     def get_status_dict(self) -> dict[str, Any]:
         """/api/status 中文响应。"""
+        import time as _t
+        now_ts = int(_t.time())
         st = self.state_store.load()
+        # 刷新 throttler 持久化态（冷启动或跨天后保证 to_status_dict 输出正确）
+        self.ai_throttler.load_from(st)
         status_raw = st.get("status") or SystemStatus.STOPPED.value
         try:
             sys_status = SystemStatus(status_raw)
@@ -146,6 +150,25 @@ class TradingController:
         ai_block = self._last_ai_block()
         stats = st.get("stats") or {}
 
+        # AI 节流状态（2026-08-30 新增）：实时算一遍 sentinel/level，把最新 mark 价作为输入让波动%准
+        mark_input = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
+        try:
+            _ = self.ai_throttler.should_call_ai(
+                now_ts=now_ts,
+                system_status_running=(sys_status == SystemStatus.RUNNING),
+                has_position=bool(st.get("position") and (st["position"].get("size") or 0) > 0),
+                allow_trading=bool(
+                    (self.risk.cooldown_until_ts == 0 or now_ts >= self.risk.cooldown_until_ts)
+                    and sys_status == SystemStatus.RUNNING
+                ),
+                mark_price=mark_input if mark_input > 0 else 2466.0,
+                entry_price=float((st.get("position") or {}).get("entry_price", 0.0) or 0.0),
+                liquidation_price=float((st.get("position") or {}).get("liquidation_price", 0.0) or 0.0),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        throttle_block = self.ai_throttler.to_status_dict(now_ts)
+
         return {
             "运行模式": mode_cn,
             "系统状态": _ZH_SYSTEM_STATUS.get(sys_status, str(status_raw)),
@@ -158,6 +181,7 @@ class TradingController:
             "亏损次数": stats.get("losses", 0),
             "累计收益率(%)": round(float(stats.get("total_pnl_pct") or 0), 2),
             "最近AI判断": ai_block,
+            "AI节流状态": throttle_block,
             "风控状态": {
                 "连续亏损次数": self.risk.consecutive_losses,
                 "熔断冷却至(秒时间戳)": self.risk.cooldown_until_ts,

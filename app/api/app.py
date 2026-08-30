@@ -377,6 +377,21 @@ def create_app(
         if len(reason_short) > 120:
             reason_short = reason_short[:120] + "…"
 
+        # 6.5) AI 节流状态（2026-08-30 新增）
+        throttle_ctl = {}
+        if isinstance(status_from_ctl, dict) and isinstance(status_from_ctl.get("AI节流状态"), dict):
+            throttle_ctl = dict(status_from_ctl["AI节流状态"])
+        thr_level = str(throttle_ctl.get("节流级别") or "NORMAL")
+        thr_color = str(throttle_ctl.get("节流颜色") or "#e6f4ea;color:#137333")
+        thr_countdown = int(throttle_ctl.get("倒计时(秒)") or 0)
+        thr_daily_calls = int(throttle_ctl.get("当日调用次数") or 0)
+        thr_early_wakes = int(throttle_ctl.get("当日早叫次数") or 0)
+        thr_failures = int(throttle_ctl.get("连续失败次数") or 0)
+        thr_volatility = float(throttle_ctl.get("最近波动(%)") or 0)
+        thr_reason = str(throttle_ctl.get("级别原因") or "初始化")
+        if len(thr_reason) > 80:
+            thr_reason = thr_reason[:80] + "…"
+
         # 7) 最近交易：优先 journal；Controller 可用时直接 get_recent_trades
         trades_rows: list[dict] = []
         try:
@@ -422,6 +437,15 @@ def create_app(
             "ai_conf": int(ai_block.get("置信度") or 0),
             "ai_direction": direction,
             "ai_reason": reason_short,
+            # 2026-08-30 新增：AI 节流 7 级状态机彩色 tag 信息
+            "thr_level": thr_level,
+            "thr_color": thr_color,
+            "thr_countdown": thr_countdown,
+            "thr_daily_calls": thr_daily_calls,
+            "thr_early_wakes": thr_early_wakes,
+            "thr_failures": thr_failures,
+            "thr_volatility": thr_volatility,
+            "thr_reason": thr_reason,
             "trades": trades_rows,
         }
 
@@ -433,6 +457,13 @@ def create_app(
         d = _collect_dashboard_data(request.app.state.runtime)
         tag_class = "live" if d["mode"] == "实盘模式" else ""
         mode_tag = f'<span class="tag {tag_class}">{d["mode"]}</span>'
+        # 2026-08-30 新增：AI 节流 7 级彩色 tag（紧邻运行模式）
+        thr_tag = (
+            f'<span id="k-thr-tag" class="tag" style="{d["thr_color"]}">'
+            f'AI 节流 · {d["thr_level"]}</span>'
+        )
+        thr_countdown_min, thr_countdown_s = divmod(max(int(d["thr_countdown"]), 0), 60)
+        thr_countdown_str = f"{thr_countdown_min}m{thr_countdown_s:02d}s" if thr_countdown_min else f"{thr_countdown_s}s"
 
         # 最近交易表格行
         rows_html = ""
@@ -488,7 +519,7 @@ def create_app(
           </style>
         </head>
         <body>
-          <h1>云龙挑战赛 · Dashboard {mode_tag}<span id="k-updated" class="updated"></span></h1>
+          <h1>云龙挑战赛 · Dashboard {mode_tag}{thr_tag}<span id="k-updated" class="updated"></span></h1>
 
           <div class="grid">
             <!-- 运行模式 -->
@@ -499,6 +530,21 @@ def create_app(
                 <div class="label">系统状态</div><div id="k-status" class="value">{d['status']}</div>
                 <div class="label">累计收益率 (%)</div><div id="k-total-pnl" class="value {'loss' if d['total_pnl_pct']<0 else 'win'}">{d['total_pnl_pct']:.2f}%</div>
                 <div class="label">已平仓交易</div><div id="k-closed" class="value">{d['closed']} 笔（胜{d['wins']}/败{d['losses']}）</div>
+              </div>
+            </div>
+
+            <!-- AI 节流（2026-08-30 新增：7 级状态机 + 价格哨兵可视化） -->
+            <div class="card">
+              <h2>AI 节 流 · 价 格 哨 兵</h2>
+              <div class="kv">
+                <div class="label">节流级别</div><div id="k-thr-level" class="value">{d['thr_level']}</div>
+                <div class="label">下次调用倒计时</div><div id="k-thr-countdown" class="value">{thr_countdown_str}</div>
+                <div class="label">当日 AI 调用次数</div><div id="k-thr-calls" class="value">{d['thr_daily_calls']} 次</div>
+                <div class="label">早叫触发次数(≥1%)</div><div id="k-thr-early" class="value">{d['thr_early_wakes']} 次</div>
+                <div class="label">最近 1m 价格波动</div><div id="k-thr-vol" class="value">{d['thr_volatility']:.2f}%</div>
+                <div class="label">AI 连续失败</div><div id="k-thr-fail" class="value">{d['thr_failures']} 次</div>
+                <div class="label">级别原因</div>
+                <div id="k-thr-reason" class="value" style="grid-column:1/-1;"><span class="reason-box">{d['thr_reason']}</span></div>
               </div>
             </div>
 
@@ -635,6 +681,27 @@ def create_app(
                 const elR = document.getElementById('k-ai-reason');
                 if (elR) elR.innerHTML = '<span class="reason-box">' + (reason.length > 120 ? reason.slice(0,120)+'…' : reason) + '</span>';
 
+                // AI 节流（2026-08-30 新增：顶部彩色 tag + 卡片）
+                const thr = s['AI节流状态'] || {{}};
+                const thrLevel = String(thr['节流级别'] ?? 'NORMAL');
+                const thrColor = String(thr['节流颜色'] ?? '');
+                const elTag = document.getElementById('k-thr-tag');
+                if (elTag) {{
+                  elTag.textContent = 'AI 节流 · ' + thrLevel;
+                  if (thrColor) elTag.setAttribute('style', thrColor);
+                }}
+                setText('k-thr-level', thrLevel);
+                const cd = Number(thr['倒计时(秒)'] ?? 0);
+                const mm = Math.floor(cd / 60), ss = Math.floor(cd % 60);
+                setText('k-thr-countdown', mm > 0 ? (mm + 'm' + String(ss).padStart(2,'0') + 's') : (ss + 's'));
+                setText('k-thr-calls', (thr['当日调用次数'] ?? 0) + ' 次');
+                setText('k-thr-early', (thr['当日早叫次数'] ?? 0) + ' 次');
+                setText('k-thr-vol', (Number(thr['最近波动(%)'] ?? 0)).toFixed(2) + '%');
+                setText('k-thr-fail', (thr['连续失败次数'] ?? 0) + ' 次');
+                const thrReason = String(thr['级别原因'] ?? '');
+                const elThrR = document.getElementById('k-thr-reason');
+                if (elThrR) elThrR.innerHTML = '<span class="reason-box">' + (thrReason.length > 80 ? thrReason.slice(0,80)+'…' : thrReason) + '</span>';
+
                 // 更新时间
                 const up = document.getElementById('k-updated');
                 if (up) up.textContent = '· 最近刷新 ' + new Date().toLocaleTimeString();
@@ -699,6 +766,9 @@ def create_app(
             shadow = bool(getattr(cfg.risk_limits, "shadow_mode", False))
         if shadow:
             mode_cn = f"{mode_cn}(影子 SHADOW)"
+        # AI 节流默认值（兜底）
+        from app.core.ai_throttle import LEVEL_COLORS as _THR_COLORS  # noqa: PLC0415
+        _lvl = "NORMAL"
         return {
             "运行模式": mode_cn,
             "系统状态": "未初始化（等待 run.py 注入 TradingController）",
@@ -715,6 +785,21 @@ def create_app(
                 "置信度": 0,
                 "理由": "Controller 未初始化",
                 "时间": None,
+            },
+            "AI节流状态": {
+                "节流级别": _lvl,
+                "节流颜色": _THR_COLORS.get(_lvl, "background:#e6f4ea;color:#137333"),
+                "级别原因": "Controller 未初始化（系统启动中）",
+                "倒计时(秒)": 0,
+                "下次调用时间戳": None,
+                "当日调用次数": 0,
+                "当日成本(估USDT)": 0,
+                "当日早叫次数": 0,
+                "连续失败次数": 0,
+                "连续成功次数": 0,
+                "哨兵锚定价": 0,
+                "最近波动(%)": 0,
+                "最近波动时间戳": None,
             },
             "风控状态": {
                 "连续亏损次数": 0,

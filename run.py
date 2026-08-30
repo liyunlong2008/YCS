@@ -267,17 +267,17 @@ async def bg_time_sync(rt: dict[str, Any]) -> None:
 
 
 async def bg_main_loop(rt: dict[str, Any]) -> None:
-    """交易主循环（阶段 4 完整闭环）。
+    """交易主循环（2026-08-30 改版：自适应 AI 节流 7 级状态机 + 价格哨兵）。
 
-    每 MAIN_LOOP_INTERVAL 秒：
-      1) 日切点检测（跨日时重置 daily_start_balance）
-      2) 拉取当前持仓
-         - 空仓 → 调用 analyze() → 读取 AI 判断 & 置信度 → risk.check_can_open → execute_trade_signal
-         - 持仓 → PositionManager.should_close_for_protection → True 时市价平仓并更新统计/风控
-      3) 持久化 risk / position_manager / stats
+    核心改动（解决 VPS 现场『32 分钟 22 次 AI / 失败 4 次也瞎调 / 熔断期也浪费』三痛）：
+      · 轮询间隔从 30s 缩到 10s：价格哨兵更灵敏（≥1% 波动 10s 内就能早叫 AI）
+      · 每轮先 ctl.should_analyze()：返回 should_call=True 才真正 ctl.analyze()
+      · 未到时（冷却中/STOP/熔断/DEGRADED）：完全不调用 AI，只本地价格哨兵 → 日均 960 次砍到 ≤150 次
+      · early_wake（1m 波动≥1%/大波动≥2%）：强制调 AI，熔断/睡眠窗也不漏行情
     """
     from app.core.constants import SystemStatus, OrderSide, MarketRegime, PositionSide
-    loop_interval = 30  # 30s 轮询
+    loop_interval = 10  # 10s 轮询（价格哨兵灵敏档；真正调 AI 仍按 7 级节奏）
+    last_snapshot_bal_ts = 0  # 余额刷新节流：每轮不必全刷，30s 刷新一次即可（避免空转浪费）
     while True:
         try:
             state_store: StateStore = rt["state_store"]
@@ -287,6 +287,7 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
             cfg = rt["config"]
             symbol = cfg.trading.symbol
             st = state_store.load()
+            now_ts = int(time.time())
 
             # ------------------------------------------------------------
             # 1) 日切点
@@ -297,107 +298,128 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                 logger.exception("日切点检测异常")
 
             # ------------------------------------------------------------
-            # 2) 拉持仓 & 利润保护轮询（若已有持仓则触发 should_close_for_protection）
+            # 2) 拉持仓 & 利润保护轮询
             # ------------------------------------------------------------
-            if st.get("status") == SystemStatus.RUNNING.value:
-                pos = await ctl.broker.get_position(symbol)
-                need_close, close_reason = pm.should_close_for_protection(pos)
+            pos = await ctl.broker.get_position(symbol)
+            has_pos = pos.side != PositionSide.FLAT
+            mark_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
+            if mark_price <= 0:
+                mark_price = float((st.get("position") or {}).get("mark_price", 0.0) or 2466.0)
+            entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            liq_price = float(getattr(pos, "liquidation_price", 0.0) or 0.0)
 
-                if pos.side != PositionSide.FLAT:
-                    # 已有持仓 → 只做利润保护/止损，不再开新仓
-                    if need_close:
-                        logger.bind(log_type="trade").warning("利润保护触发（主循环）：{}", close_reason)
-                        realized = await ctl.close_position_for_protection(pos)
-                        logger.success("[主循环] 利润保护平仓完成：已实现盈亏={:.6f}U", realized)
-                else:
-                    # 空仓 → 拉 AI → 风控 → 下单
-                    if (need_close, need_close):  # dummy to avoid unused var
-                        pass
-                    try:
-                        ai_block = await ctl.analyze()
-                    except Exception:
-                        logger.exception("AI 分析异常（跳过本轮开仓）")
-                        ai_block = {}
-                    last_ai = ctl._last_ai
-                    bal = await ctl.broker.get_balance()
-                    now_ts = int(time.time())
-                    # ---- 计算 entry_price（核心改动：尽量用真实最新价，避免 fallback 到虚构 2000 导致
-                    #      R 模型把名义算错；VPS 现场抓包 ETH≈2466 时 2000 会让 sz 计算差 20%）
-                    # 优先级：
-                    #   1) 当前持仓.mark_price（有持仓时 mark 会实时更新）
-                    #   2) state.json 里 position.mark_price（上次快照）
-                    #   3) MarketDataProducer 最新 ticker（若已连接）
-                    #   4) 兜底 2466.0（ETH 2026-08 参考价，比 2000 更准）
-                    entry_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
-                    if entry_price <= 0:
-                        entry_price = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
-                    if entry_price <= 0:
-                        mp = getattr(ctl.market_producer, "last_mark_price", None)
-                        if callable(mp):
-                            try:
-                                v = mp()
-                                if isinstance(v, (int, float)) and v > 0:
-                                    entry_price = float(v)
-                            except Exception:  # noqa: BLE001
-                                pass
-                    if entry_price <= 0:
-                        # 兜底：真实 ETH 2026-08 参考价 2466（避免 2000 让 sz 偏差 ~20%）
-                        entry_price = 2466.0
-                    verdict = await risk.check_can_open(
-                        balance_total=float(bal.total or 0),
-                        balance_available=float(bal.available or 0),
-                        entry_price=entry_price,
-                        now_ts=now_ts,
-                        # 2026-08-30：注入交易所市场规则 + 本笔风控配置（risk_pct/stop_pct/名义上下限/默认杠杆）
-                        market_spec=rt.get("market_spec"),
-                        risk_limits=getattr(cfg, "risk_limits", None) if (cfg := rt.get("config")) else None,
-                        trading_config=getattr(cfg, "trading", None) if (cfg := rt.get("config")) else None,
+            # RUNNING 状态下做持仓利润保护（不控制空仓时还会额外扫）
+            if st.get("status") == SystemStatus.RUNNING.value:
+                need_close, close_reason = pm.should_close_for_protection(pos)
+                if has_pos and need_close:
+                    logger.bind(log_type="trade").warning("利润保护触发（主循环）：{}", close_reason)
+                    realized = await ctl.close_position_for_protection(pos)
+                    logger.success("[主循环] 利润保护平仓完成：已实现盈亏={:.6f}U", realized)
+                    # 平仓后重新刷新 pos（下次进入空仓分支）
+                    pos = await ctl.broker.get_position(symbol)
+                    has_pos = pos.side != PositionSide.FLAT
+
+            # ------------------------------------------------------------
+            # 3) 【2026-08-30 新】AI 自适应节流决策（should_analyze 纯本地 O(1)，不调 AI）
+            #    即便系统≠RUNNING / 风控熔断 / 睡眠窗，也照样跑价格哨兵
+            # ------------------------------------------------------------
+            dec = await ctl.should_analyze(
+                mark_price=mark_price,
+                entry_price=entry_price,
+                liquidation_price=liq_price,
+                has_position=has_pos,
+            )
+            throttle_tag = f"[{dec.level.value}{' early_wake' if dec.early_wake else ''}]"
+
+            if not dec.should_call:
+                # —— 真·降频：本轮不调 AI，只打一条 TRACE 级节流日志（INFO 级别下不刷屏，只保留当日累计指标到 state_store）
+                wait_s = max(dec.next_call_at - now_ts, 0)
+                logger.opt(depth=0).debug(
+                    "{} 跳过本轮 AI 调用（剩 {}s；原因：{}；波动={:.2f}%）",
+                    throttle_tag, wait_s, dec.reason, dec.event_pct,
+                )
+            else:
+                # ===== 真正调 AI：force=dec.early_wake 以标记 early_wake 模式 =====
+                try:
+                    await ctl.analyze(force=dec.early_wake)
+                except Exception:
+                    logger.exception("AI 分析异常（跳过本轮开仓）")
+
+            # ------------------------------------------------------------
+            # 4) 空仓 + RUNNING + allow_trading → 风控 → 下单
+            #    （AI 没调过时用 ctl._last_ai 上一次结果，仍然合规）
+            # ------------------------------------------------------------
+            if (not has_pos) and st.get("status") == SystemStatus.RUNNING.value:
+                last_ai = ctl._last_ai
+                bal = await ctl.broker.get_balance()
+                # entry_price 计算（沿用原有优先级：mark_price→state→market_producer→兜底）
+                e_price = mark_price
+                if e_price <= 0:
+                    e_price = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
+                if e_price <= 0:
+                    mp = getattr(ctl.market_producer, "last_mark_price", None)
+                    if callable(mp):
+                        try:
+                            v = mp()
+                            if isinstance(v, (int, float)) and v > 0:
+                                e_price = float(v)
+                        except Exception:  # noqa: BLE001
+                            pass
+                if e_price <= 0:
+                    e_price = 2466.0
+                verdict = await risk.check_can_open(
+                    balance_total=float(bal.total or 0),
+                    balance_available=float(bal.available or 0),
+                    entry_price=e_price,
+                    now_ts=now_ts,
+                    market_spec=rt.get("market_spec"),
+                    risk_limits=getattr(cfg, "risk_limits", None),
+                    trading_config=getattr(cfg, "trading", None),
+                )
+                if not verdict.allow:
+                    extra = (
+                        f"（名义={verdict.suggested_notional_usdt:.2f}U / 最小={verdict.effective_min_notional_usdt:.2f}U "
+                        f"/ 杠杆={verdict.suggested_leverage}X）"
+                        if verdict.effective_min_notional_usdt > 0 else f"（杠杆={verdict.suggested_leverage}X）"
                     )
-                    if not verdict.allow:
-                        # 中文拒绝原因：RiskEngine 现在会直接给『当前名义上限≈X U，最小名义=Y U，需要余额≈Z U 或调杠杆/R/止损』——不用再拼『张数<0.1』
-                        extra = (
-                            f"（名义={verdict.suggested_notional_usdt:.2f}U / 最小={verdict.effective_min_notional_usdt:.2f}U "
-                            f"/ 杠杆={verdict.suggested_leverage}X）"
-                            if verdict.effective_min_notional_usdt > 0 else f"（杠杆={verdict.suggested_leverage}X）"
-                        )
-                        logger.bind(log_type="trade").info(
-                            "[风控] 本轮跳过开仓：{}{}（连续亏损={}，日切余额={:.2f}U 权益={:.2f}U）",
-                            verdict.reason, extra, risk.consecutive_losses,
-                            risk.daily_start_balance, float(bal.total or 0),
-                        )
-                    elif last_ai is None or last_ai.confidence < 50 or last_ai.market_regime in (
-                        MarketRegime.LOW_VOLATILITY, MarketRegime.RANGE,
-                    ):
-                        logger.bind(log_type="trade").info(
-                            "[AI] 信号或置信度不足（reg={} conf={}），暂不开仓",
-                            last_ai.market_regime.value if last_ai else "None",
-                            last_ai.confidence if last_ai else -1,
-                        )
+                    logger.bind(log_type="trade").info(
+                        "[风控] 本轮跳过开仓：{}{}（连续亏损={}，日切余额={:.2f}U 权益={:.2f}U）",
+                        verdict.reason, extra, risk.consecutive_losses,
+                        risk.daily_start_balance, float(bal.total or 0),
+                    )
+                elif last_ai is None or last_ai.confidence < 50 or last_ai.market_regime in (
+                    MarketRegime.LOW_VOLATILITY, MarketRegime.RANGE,
+                ):
+                    logger.bind(log_type="trade").info(
+                        "[AI] 信号或置信度不足（reg={} conf={}），暂不开仓",
+                        last_ai.market_regime.value if last_ai else "None",
+                        last_ai.confidence if last_ai else -1,
+                    )
+                else:
+                    if last_ai.market_regime == MarketRegime.TREND_UP:
+                        market_side = OrderSide.BUY
+                    elif last_ai.market_regime == MarketRegime.TREND_DOWN:
+                        market_side = OrderSide.SELL
                     else:
-                        # 决定多空
-                        if last_ai.market_regime == MarketRegime.TREND_UP:
-                            market_side = OrderSide.BUY
-                        elif last_ai.market_regime == MarketRegime.TREND_DOWN:
-                            market_side = OrderSide.SELL
-                        else:
-                            market_side = None
-                        if market_side is not None:
-                            logger.bind(log_type="trade").info(
-                                "[主循环] 发起交易信号：side={} entry={} sz={} 名义={:.2f}U sl={} lev={}X "
-                                "(min_notional={:.2f}U, max_notional={:.2f}U)",
-                                market_side.value, entry_price,
-                                f"{verdict.suggested_size:.4f}".rstrip("0").rstrip("."),
-                                verdict.suggested_notional_usdt, verdict.stop_loss_price,
-                                verdict.suggested_leverage,
-                                verdict.effective_min_notional_usdt, verdict.effective_max_notional_usdt,
-                            )
-                            exec_res = await ctl.execute_trade_signal(
-                                ai=last_ai, verdict=verdict,
-                                entry_price=entry_price, market_side=market_side,
-                            )
-                            logger.success("[主循环] execute 结果: status={} via={} qty={:.6f} 原因={}",
-                                           exec_res["status"], exec_res["via"],
-                                           exec_res["qty"], exec_res["reason"])
+                        market_side = None
+                    if market_side is not None:
+                        logger.bind(log_type="trade").info(
+                            "[主循环] 发起交易信号：side={} entry={} sz={} 名义={:.2f}U sl={} lev={}X "
+                            "(min_notional={:.2f}U, max_notional={:.2f}U) {}",
+                            market_side.value, e_price,
+                            f"{verdict.suggested_size:.4f}".rstrip("0").rstrip("."),
+                            verdict.suggested_notional_usdt, verdict.stop_loss_price,
+                            verdict.suggested_leverage,
+                            verdict.effective_min_notional_usdt, verdict.effective_max_notional_usdt,
+                            throttle_tag,
+                        )
+                        exec_res = await ctl.execute_trade_signal(
+                            ai=last_ai, verdict=verdict,
+                            entry_price=e_price, market_side=market_side,
+                        )
+                        logger.success("[主循环] execute 结果: status={} via={} qty={:.6f} 原因={}",
+                                       exec_res["status"], exec_res["via"],
+                                       exec_res["qty"], exec_res["reason"])
 
             # ------------------------------------------------------------
             # 3) 持久化：risk / position_manager / stats 已在各自方法内写 state，这里仅兜底 sync 余额/状态标志

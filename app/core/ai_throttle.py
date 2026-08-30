@@ -249,10 +249,12 @@ class AIThrottler:
 
         interval = LEVEL_INTERVALS[level]
         # ---- 3) 计算 next_call_ts（如还没设 / 已过期，以 now 为起点）----
-        if self.state.next_call_ts <= 0:
+        # 冷启动 (last_call_ts==0 且 next_call_ts==0)：本轮立刻可调用，不设等待
+        cold_start = self.state.last_call_ts == 0 and self.state.next_call_ts <= 0
+        if self.state.next_call_ts <= 0 and not cold_start:
             self.state.next_call_ts = now_ts + interval
-        # early_wake / force 允许越过 next_call_ts
-        time_ripe = (now_ts >= self.state.next_call_ts)
+        # early_wake / force 允许越过 next_call_ts；cold_start 直接 True 不等冷却
+        time_ripe = cold_start or (now_ts >= self.state.next_call_ts)
         should = force or early_wake or time_ripe
 
         # 同步 level 到 state（仅 should==True 时会在 record_outcome 里写 last_call；这里把节流决策 level 保存用于 Dashboard）
