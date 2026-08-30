@@ -5,22 +5,30 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 自动检测 uv run python 路径；需要在 Installer 中替换 WorkingDirectory/ExecStart/User
+# 2026-08-30：从「ExecStart= uv run python run.py」改为「ExecStart=VENV_PYTHON RUN_PY」
+#   直接用 uv sync 产出的 .venv/bin/python 绝对路径，彻底绕开 uv 本身：
+#   · 避免 status=203/EXEC（ProtectHome=true 时 /root/.local/bin/uv 在 namespace 里不可见 → exec ENOENT）
+#   · 避免 status=226/NAMESPACE（下方目录全部提前创建 + 白名单列出）
+#   · 启动更快（省掉 uv 每次解析 pyproject 锁文件的 ~100ms）
 User=__USER__
 Group=__USER__
 WorkingDirectory=__WORKDIR__
 Environment=PYTHONUNBUFFERED=1
 Environment=NO_PROXY=localhost,127.0.0.1,::1
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # ======= 标准目录（由 systemd 自动创建，并按 User= 配权限；完全避免 226/NAMESPACE“不存在目录”报错）=======
-# /var/log/ycs         → 可选：将 file logger 写到这里也可以（当前 app 仍写 <WORKDIR>/logs，同时下面 ReadWritePaths 兜底）
 LogsDirectory=ycs
-# /var/lib/ycs         → 数据/ journals / 状态文件（可选，当前 app 仍写 <WORKDIR>/data）
 StateDirectory=ycs
-# /run/ycs             → PID / socket / 临时态
 RuntimeDirectory=ycs
 RuntimeDirectoryMode=0750
 
-ExecStart=__UV__ run python __RUN_PY__
+# 启动前断言：所有路径真实存在 + Python 可执行 + run.py 可读（等价于 203/EXEC 的预检查）
+ExecCondition=test -x __VENV_PYTHON__
+ExecCondition=test -f __RUN_PY__
+ExecCondition=test -d __WORKDIR__/data
+ExecCondition=test -d __WORKDIR__/logs
+
+ExecStart=__VENV_PYTHON__ __RUN_PY__
 Restart=always
 RestartSec=8
 StartLimitBurst=5
@@ -28,12 +36,12 @@ StartLimitIntervalSec=60
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ycs
-# 安全加固（保持默认 strict：namespace 阶段只读挂载整棵 FS，下面白名单才能写）
+# 安全加固（保持 strict：namespace 阶段只读挂载整棵 FS，下面白名单才能写）
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-# ==== 允许写入：项目区 data/logs/.venv（上面 install_systemd.sh 会 mkdir -p + chown，保证启动前已存在）+ systemd 自建目录 ====
+ProtectHome=tmpfs
+# ==== 写入白名单：项目区 data/logs/.venv（install_systemd.sh 会 mkdir -p + chown，启动前必存在）+ systemd 自建目录 ====
 ReadWritePaths=__WORKDIR__/data __WORKDIR__/logs __WORKDIR__/.venv
 ReadWritePaths=/var/log/ycs /var/lib/ycs /run/ycs
 
