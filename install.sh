@@ -171,6 +171,17 @@ unset_git_proxy() {
 # 5) 首次 / 更新 分流
 # ---------------------------------------------------------------------------
 mkdir -p "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
+# ---------- 关键：无论首次/更新，deploy 前确保 data/logs/.venv 目录存在
+#            因为 systemd ProtectSystem=strict + ReadWritePaths=<dir> 时，namespace 阶段要求目录必须"已存在"，
+#            否则会 status=226/NAMESPACE 导致进程根本起不来（用户看到 curl HTTP 000 + 重启几千次）。
+#            （更新分支也要做：VPS 上次是老代码跑 install.sh，logs 可能从没建过）
+_mk_runtime_dirs() {
+  (
+    cd "$INSTALL_DIR"
+    mkdir -p data logs .venv
+  ) 2>/dev/null || true
+}
+_mk_runtime_dirs
 
 IS_FIRST=0
 if [ ! -d "$INSTALL_DIR/.git" ]; then
@@ -405,6 +416,8 @@ if [ "$IS_FIRST" -eq 1 ]; then
   systemctl status ycs --no-pager --lines=10 || true
 else
   log_i "更新完成 → ycsctl restart（加载新代码）"
+  # 更新分支：重启前再双保险做一次 data/logs/.venv 存在检查（尤其 VPS 老版本遗留下来 logs 没建的情况）
+  _mk_runtime_dirs
   # 主路径：ycsctl restart（UV_BIN 绝对路径 → sudo 下也不会被清 PATH）
   # shellcheck disable=SC2086
   if $SUDO env UV_BIN="$UV_BIN" "$UV_BIN" run python deploy/ycsctl.py restart; then

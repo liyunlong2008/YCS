@@ -7,21 +7,35 @@ Wants=network-online.target
 Type=simple
 # 自动检测 uv run python 路径；需要在 Installer 中替换 WorkingDirectory/ExecStart/User
 User=__USER__
+Group=__USER__
 WorkingDirectory=__WORKDIR__
 Environment=PYTHONUNBUFFERED=1
 Environment=NO_PROXY=localhost,127.0.0.1,::1
+# ======= 标准目录（由 systemd 自动创建，并按 User= 配权限；完全避免 226/NAMESPACE“不存在目录”报错）=======
+# /var/log/ycs         → 可选：将 file logger 写到这里也可以（当前 app 仍写 <WORKDIR>/logs，同时下面 ReadWritePaths 兜底）
+LogsDirectory=ycs
+# /var/lib/ycs         → 数据/ journals / 状态文件（可选，当前 app 仍写 <WORKDIR>/data）
+StateDirectory=ycs
+# /run/ycs             → PID / socket / 临时态
+RuntimeDirectory=ycs
+RuntimeDirectoryMode=0750
+
 ExecStart=__UV__ run python __RUN_PY__
 Restart=always
 RestartSec=8
+StartLimitBurst=5
+StartLimitIntervalSec=60
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ycs
-# 安全加固
+# 安全加固（保持默认 strict：namespace 阶段只读挂载整棵 FS，下面白名单才能写）
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-# 允许写数据 / 日志 / journal 持久化目录
+ProtectHome=true
+# ==== 允许写入：项目区 data/logs/.venv（上面 install_systemd.sh 会 mkdir -p + chown，保证启动前已存在）+ systemd 自建目录 ====
 ReadWritePaths=__WORKDIR__/data __WORKDIR__/logs __WORKDIR__/.venv
+ReadWritePaths=/var/log/ycs /var/lib/ycs /run/ycs
 
 [Install]
 WantedBy=multi-user.target

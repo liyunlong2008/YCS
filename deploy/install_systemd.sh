@@ -120,6 +120,19 @@ if [ ! -d "${PROJECT_ROOT}/.venv" ]; then
 fi
 [ -x "${PROJECT_ROOT}/.venv/bin/python" ] || die ".venv/bin/python 不存在，uv sync 可能失败"
 
+# ======= 必须在渲染 systemd unit 之前，提前创建 ReadWritePaths / WorkingDirectory 内所需目录：
+#         ProtectSystem=strict + ReadWritePaths 时，namespace 阶段要求路径必须存在，
+#         否则直接 status=226/NAMESPACE，进程根本起不来（= 用户看到的 2845 次重启 + curl HTTP 000）
+log "确保写入目录存在：data / logs / .venv …"
+mkdir -p "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/.venv"
+# 兜底：如果 RUN_USER 不是当前文件 owner（例如 git clone 后全是 root，但 RUN_USER=yunlong），统一 chown 一遍
+#   拿到 RUN_USER 对应的主 group：用 id -gn（succinct 且能处理 user 不是 owner 的情况）
+RUN_GROUP="$(id -gn "${RUN_USER}" 2>/dev/null || echo "${RUN_USER}")"
+chown -R "${RUN_USER}:${RUN_GROUP}" "${PROJECT_ROOT}/data" "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/.venv" 2>/dev/null || true
+# 额外：保证项目根本身 RUN_USER 可进入（读文件/exec venv 脚本/写日志时必须）
+chown "${RUN_USER}:${RUN_GROUP}" "${PROJECT_ROOT}" 2>/dev/null || true
+ok "写入目录就绪（data/logs/.venv 存在，owner=${RUN_USER}:${RUN_GROUP}）"
+
 # ---- unit 渲染（通过 Python 做参数注入，避免 sed 边界 bug）----
 log "生成 ${UNIT_DST}（使用 Python 模板注入）…"
 RENDERED="$(python3 - "$TEMPLATE" "$RUN_USER" "$PROJECT_ROOT" "$UV_BIN" "$RUN_PY" <<'PY'
