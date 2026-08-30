@@ -113,14 +113,83 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
 
     Raises:
         FileNotFoundError: 配置文件不存在。
+        yaml.YAMLError: 包含 ParserError：YAML 语法非法；异常消息会附上「文件：具体行：上下文 ±3 行」。
         ValidationError: 配置字段缺失或非法。
     """
     path = Path(config_path) if config_path else default_config_path()
     if not path.exists():
         raise FileNotFoundError(f"配置文件不存在: {path}")
 
-    with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
+    text: str
+    lines: list[str]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise OSError(f"读取配置失败: {path}: {e}") from e
+    lines = text.splitlines()
+
+    try:
+        raw = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        # === 解析失败时把「文件 + 行号 + 上下文 ±3 行」塞进异常 message，避免 install.sh / pytest
+        #     只看到 "while parsing a block mapping" 不知道哪一行写错（VPS 手改缩进错误最常见）。
+        #
+        # 注意：PyYAML 的 ParserError / ScannerError 都继承 MarkedYAMLError，其 __str__() 会
+        # 根据 `.problem / .problem_mark / .context / .context_mark` 四个属性**重新拼 message**，
+        # 所以 `type(e)(msg)` 这种「只传一个字符串」的方式会被 __init__ 当成 problem=None，导致
+        # 自定义 header 完全丢失。必须用 `type(e)(problem, problem_mark, context, context_mark)`
+        # 的标准四参形式构造新异常，custom_problem 里再放我们的中文 header + 原 problem。
+        problem: str | None = getattr(e, "problem", None)
+        context: str | None = getattr(e, "context", None)
+        problem_mark: object | None = getattr(e, "problem_mark", None)
+        context_mark: object | None = getattr(e, "context_mark", None)
+        line_no = getattr(problem_mark, "line", None)
+        col_no = getattr(problem_mark, "column", None)
+        header_prefix = f"【YCS 配置语法错】文件 {path}"
+
+        if isinstance(line_no, int) and line_no >= 0:
+            # PyYAML line/col 均为 0-indexed → 展示用 1-indexed
+            show_line = line_no + 1
+            start = max(0, line_no - 3)
+            end = min(len(lines), line_no + 4)
+            context_lines: list[str] = []
+            for idx in range(start, end):
+                ln = idx + 1
+                marker = ">>>" if ln == show_line else "   "
+                safe = lines[idx].replace("\t", "\\t    ")   # Tab 可视化（YAML 头号坑）
+                context_lines.append(f"  {marker} L{ln:04d}: {safe}")
+            col_tip = ""
+            if isinstance(col_no, int):
+                # 列指针对齐 `L0005: ` 前缀：前缀宽度 = 2 + 3 + 1 + 1 + 4 + 1 + 1 = 13
+                pointer = " " * 13 + " " * col_no + "^"
+                context_lines.append(pointer)
+                col_tip = f" 列 {col_no + 1}"
+            header = (
+                f"{header_prefix}，第 {show_line} 行{col_tip}：\n"
+                f"  最常见原因：缩进混用（2/4/5 空格或 Tab）、无引号字符串里出现『冒号+空格』、或 flow 映射 {{ }} 没闭合。\n"
+                f"  上下文（>>>=报错行）：\n" + "\n".join(context_lines) + "\n"
+                f"  原始报错："
+            )
+            # 关键：把 header 拼到 problem 上，再用 MarkedYAMLError 标准 4 参构造，保证 __str__
+            # 最终输出包含中文行号提示，而不是 PyYAML 默认的 `<unicode string>` 模糊消息。
+            custom_problem = header + (problem or "")
+            new_exc = type(e)(custom_problem, problem_mark, context, context_mark)
+            # 额外保留 note（少数 YAML 子类型会附加）
+            note = getattr(e, "note", None)
+            if note is not None:
+                try:
+                    setattr(new_exc, "note", note)
+                except AttributeError:
+                    pass
+            raise new_exc from e
+        else:
+            # 极少数没有 problem_mark 的 YAMLError：退化为简单前缀拼接
+            fallback_problem = f"{header_prefix}：{problem or e}"
+            try:
+                raise type(e)(fallback_problem, problem_mark, context, context_mark) from e
+            except TypeError:
+                # 非 MarkedYAMLError 兼容兜底（例如 yaml.reader.ReaderError 参数可能不同）
+                raise type(e)(fallback_problem) from e
 
     return AppConfig.model_validate(raw)
 

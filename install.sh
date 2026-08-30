@@ -469,6 +469,68 @@ if [ "$YCS_SKIP_TEST" -eq 1 ]; then
   log_w "YCS_SKIP_TEST=1 → 跳过 pytest（不推荐）"
 else
   log_i "运行 pytest 风控+诊断冒烟子集…"
+  # ============================================================
+  # 【2026-08-30】stage10 之前 5 个用例会同时炸成 yaml.parser.ParserError: while parsing a block mapping
+  #   根因不是代码，而是：
+  #     /opt/ycs/config.yaml 是用户手填实盘配置，手改后常见 Tab/缩进混用/冒号空格等语法错，
+  #     DEFAULT_CONFIG_PATH 直接读项目根 config.yaml → 5 个 case 共用同一脏输入。
+  #   三层防御：
+  #     1) install.sh 先做一次「config.yaml 语法自检」（Python yaml.safe_load + 行号上下文），
+  #        直接 FATAL 指出哪一行写错 —— 比让 5 个 pytest 一起报错清晰 10 倍。
+  #     2) stage10 的 5 个用例现已改成 tmp_path 下独立写入干净 config + CONFIG_PATH 注入，
+  #        即使跳过本自检或手改导致语法错，也只会在自检阶段暴露，不会把 5 个 pytest 带崩。
+  #     3) AppConfig.load_config 捕获 YAMLError 时会补全 文件名 + 行号 + 上下文 ±3 行，
+  #        任何下游模块（dashboard/ycsctl check/restart）再遇到同样报错也能一眼定位。
+  # ============================================================
+  if [ -f config.yaml ]; then
+    log_i "config.yaml YAML 自检（VPS 手改缩进错误最常见，提前抓住=省 30 分钟排错）…"
+    if ! "$UV_BIN" run python - <<'PYCFGCHK'
+import sys, pathlib
+p = pathlib.Path("config.yaml")
+try:
+    import yaml as _y
+    text = p.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    try:
+        _ = _y.safe_load(text)
+    except _y.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        line_no = getattr(mark, "line", None) if mark is not None else None
+        col_no = getattr(mark, "column", None) if mark is not None else None
+        print(f"❌ {p}: YAML 语法错误: {exc}", file=sys.stderr)
+        if isinstance(line_no, int):
+            show = line_no + 1
+            start = max(0, line_no - 3)
+            end = min(len(lines), line_no + 4)
+            print(f"   报错行：第 {show} 行（列 {((col_no + 1) if isinstance(col_no, int) else '?')}）", file=sys.stderr)
+            print("   上下文（>>>=报错行，Tab 已替换为 \\t    方便肉眼识别）：", file=sys.stderr)
+            for i in range(start, end):
+                ln = i + 1
+                marker = ">>>" if ln == show else "   "
+                safe = lines[i].replace("\t", "\\t    ")
+                print(f"   {marker} L{ln:04d}: {safe}", file=sys.stderr)
+                if ln == show and isinstance(col_no, int):
+                    pointer = " " * (4 + 2 + 2 + 1 + col_no) + "^"
+                    print(pointer, file=sys.stderr)
+        print("   常见原因：缩进混用 2/4/5 空格或 Tab；未加引号字符串里出现『冒号+空格』；flow 映射 { } 没闭合。", file=sys.stderr)
+        sys.exit(2)
+except FileNotFoundError:
+    # install.sh 后面项目合法性校验会自然 cp example 生成 config.yaml，这里跳过
+    print("⚠️  config.yaml 不存在（跳过 YAML 自检，后续会从 config.yaml.example 生成）")
+    sys.exit(0)
+except Exception as exc:  # noqa: BLE001
+    print(f"❌ 自检异常：{type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(3)
+print("✅ config.yaml YAML 语法通过")
+PYCFGCHK
+    then
+      log_o "config.yaml YAML 自检通过"
+    else
+      die "config.yaml 有 YAML 语法错误（见上方红色报错具体行），pytest 肯定会失败，已中止。" \
+          "按报错的具体行号修改缩进/冒号后，重跑 install.sh 即可。"
+    fi
+  fi
+
   # 显式 cd 到 $INSTALL_DIR + 把它放到 PYTHONPATH 首位：
   #   这样测试里 Path(__file__).resolve().parent.parent == REPO 始终成立
   #   （兼容 VPS /opt/ycs、容器 /app、本地任意目录部署，不再依赖硬编码 /workspace）

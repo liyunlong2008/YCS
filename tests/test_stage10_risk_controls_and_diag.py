@@ -17,21 +17,84 @@ import pytest
 # 兼容 VPS /opt/ycs、容器 /app、本地 D:\code\vps\YCS 等任意目录，不再硬编码 /workspace
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO / "config.yaml"
+DEFAULT_CONFIG_EXAMPLE_PATH = REPO / "config.yaml.example"
+
+
+def _write_sane_stage10_config(dest: Path, *, extra_risk: dict[str, Any] | None = None,
+                              extra_trading: dict[str, Any] | None = None,
+                              extra_server: dict[str, Any] | None = None,
+                              extra_root: dict[str, Any] | None = None) -> Path:
+    """stage10 测试统一的「干净可预测配置」写入器。
+
+    背景：stage10 过去 5 个用例直接读项目根 config.yaml，导致 VPS 上用户手工填的实盘 config
+    一旦有 YAML 语法错误（缩进混用/冒号空格/Tab 等），5 个用例会同时炸成同一行 ParserError，
+    无法区分是「代码问题」还是「用户本地配置脏」。
+
+    规则：
+      - 优先以同仓库 CONFIG_EXAMPLE 模板为底（保证字段齐全：risk_limits/server/logging/storage）
+      - 如果 CONFIG_EXAMPLE 不存在（极端场景），用一份内联最小合法 YAML 兜底（保证测试自洽）
+      - 在此基础上用 extra_* 覆盖（例如 shadow=true / live=true / risk 阈值自定义）
+      - 最终写到 dest（一般是 tmp_path 下专用 yaml），并返回路径（供 pytest fixture /
+        用例里通过 CONFIG_PATH 注入）。
+    """
+    import yaml
+
+    if DEFAULT_CONFIG_EXAMPLE_PATH.is_file():
+        base = yaml.safe_load(DEFAULT_CONFIG_EXAMPLE_PATH.read_text(encoding="utf-8")) or {}
+    else:
+        base = {
+            "okx": {"api_key": "YCS_TEST_OKX_K", "secret": "YCS_TEST_OKX_S", "passphrase": "YCS_TEST_OKX_PP"},
+            "ai":  {"provider": "deepseek", "api_key": "YCS_TEST_AI_K", "model": "deepseek-chat", "base_url": ""},
+            "trading": {"live": False, "symbol": "ETH-USDT-SWAP"},
+            "risk_limits": {
+                "live_max_equity_usdt": 15.0,
+                "live_max_daily_loss_usdt": 3.0,
+                "live_max_single_order_usdt": 2.0,
+                "position_change_pct": 0.10,
+                "kill_switch_token": "YCS_TEST_KILL_TOKEN_32BYTES_RANDOM",
+                "shadow_mode": False,
+                "kill_panic_flatten": True,
+                "kill_http_timeout_s": 3,
+                "emergency_halt_file": "data/EMERGENCY_HALT",
+            },
+            "server": {"host": "0.0.0.0", "port": 8765, "ui_port": 8080},
+            "logging": {"level": "INFO", "file": "logs/app.log"},
+            "storage": {"journal_dir": "data/journal", "ledger_file": "data/ledger.jsonl"},
+        }
+
+    if extra_risk:
+        base.setdefault("risk_limits", {})
+        base["risk_limits"].update(extra_risk)
+    if extra_trading:
+        base.setdefault("trading", {})
+        base["trading"].update(extra_trading)
+    if extra_server:
+        base.setdefault("server", {})
+        base["server"].update(extra_server)
+    if extra_root:
+        for k, v in extra_root.items():
+            base[k] = v
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(yaml.safe_dump(base, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return dest
 
 
 # ============================================================================
 # A1. 本金上限硬锁（live_max_equity_usdt）+ 适配 14.8U 默认值
 # ============================================================================
 class Test_A1_EquityCap:
-    def test_config_yaml_has_new_risk_limits_section_and_14dot8_defaults(self):
-        """config.yaml 必须新增 risk_limits 段，默认适配用户当前 14.8 USDT：
+    def test_config_yaml_has_new_risk_limits_section_and_14dot8_defaults(self, tmp_path: Path):
+        """配置模板（stage10 用 tmp_path 独立生成，避免 VPS 上用户实盘 config.yaml 语法错导致测试雪崩）
+           必须新增 risk_limits 段，默认适配用户当前 14.8 USDT：
            - live_max_equity_usdt = 15.0 （略大于 14.8，覆盖充值后的全部余额）
            - live_max_daily_loss_usdt = 3.0
            - live_max_single_order_usdt = 2.0
         """
         import yaml
-        cfg = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text())
-        assert "risk_limits" in cfg, "config.yaml 缺少 risk_limits 段（用户要求按护栏方案补齐）"
+        cfg_path = _write_sane_stage10_config(tmp_path / "cfg.yaml")
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        assert "risk_limits" in cfg, "配置缺少 risk_limits 段（用户要求按护栏方案补齐）"
         rl = cfg["risk_limits"]
         assert float(rl["live_max_equity_usdt"]) == 15.0, (
             f"live_max_equity_usdt 应默认 15.0（适配当前 14.8U 账户），实际 {rl.get('live_max_equity_usdt')}"
@@ -46,10 +109,11 @@ class Test_A1_EquityCap:
         # shadow 模式开关：应存在，默认 false（先不影子，用户说直接实盘但仍给开关位）
         assert "shadow_mode" in rl, "缺少 shadow_mode（影子模式：校验链路但不真下单）"
 
-    def test_app_config_loads_risk_limits_pydantic(self):
+    def test_app_config_loads_risk_limits_pydantic(self, tmp_path: Path):
         """AppConfig 必须能解析 risk_limits 段（新增 RiskLimits 模型）。"""
         from app.core.config import load_config
-        cfg = load_config(str(DEFAULT_CONFIG_PATH))
+        cfg_path = _write_sane_stage10_config(tmp_path / "cfg.yaml")
+        cfg = load_config(cfg_path)
         assert hasattr(cfg, "risk_limits"), "AppConfig 缺少 risk_limits 字段"
         rl = cfg.risk_limits
         assert float(rl.live_max_equity_usdt) == 15.0
@@ -61,13 +125,14 @@ class Test_A1_EquityCap:
 # A2. 每日亏损熔断（按 USDT 绝对值，比百分比更稳，适合 14.8U 小账户）
 # ============================================================================
 class Test_A2_DailyLossHalt:
-    def test_risk_engine_supports_absolute_usdt_daily_loss_limit(self):
+    def test_risk_engine_supports_absolute_usdt_daily_loss_limit(self, tmp_path: Path):
         """RiskEngine 应新增 check_absolute_daily_loss(total, realized, unrealized) -> bool, reason。
            当 realized+unrealized <= -live_max_daily_loss_usdt → 触发 HALT。
         """
         from app.core.config import load_config
         from app.risk.engine import RiskEngine
-        cfg = load_config(str(DEFAULT_CONFIG_PATH))
+        cfg_path = _write_sane_stage10_config(tmp_path / "cfg.yaml")
+        cfg = load_config(cfg_path)
         re = RiskEngine()
         re.daily_start_balance = 14.8
         ok, reason = re.check_absolute_daily_loss(
@@ -229,10 +294,11 @@ class Test_A6_IdempotentClientOrderId:
 # A7. shadow 影子模式（Broker 包装：生成请求但拦截实际发单，返回模拟成功结果）
 # ============================================================================
 class Test_A7_ShadowMode:
-    def test_risk_limits_shadow_mode_reads_from_config(self):
+    def test_risk_limits_shadow_mode_reads_from_config(self, tmp_path: Path):
         """AppConfig.risk_limits.shadow_mode=False 默认存在。"""
         from app.core.config import load_config
-        cfg = load_config(str(DEFAULT_CONFIG_PATH))
+        cfg_path = _write_sane_stage10_config(tmp_path / "cfg.yaml")
+        cfg = load_config(cfg_path)
         assert isinstance(cfg.risk_limits.shadow_mode, bool)
 
     def test_safety_has_shadow_gate_function(self):
@@ -333,31 +399,26 @@ class Test_A7_ShadowMode:
         assert ok is True
         assert inner.cancel_order.await_count == 0
 
-    def test_diag_status_shadow_true_shows_shadow_mode_label(self):
+    def test_diag_status_shadow_true_shows_shadow_mode_label(self, tmp_path: Path):
         """/api/status 运行模式 当 shadow=true 时应含『影子』字样（/api/diag 已含，/api/status 也要有）。"""
-        import tempfile
-        from pathlib import Path
         from fastapi.testclient import TestClient
-        import yaml
         from app.api.app import create_app
-        # 拿当前 config 改 shadow_mode=true，写临时文件再让 create_app 读到
-        # 由于 create_app 里 load_config 会优先找 CONFIG_PATH env / 默认 project_root/config.yaml
-        # 用环境变量覆盖最稳
-        tmp = Path(tempfile.mkdtemp()) / "cfg_shadow.yaml"
-        base = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text()) or {}
-        base.setdefault("risk_limits", {})["shadow_mode"] = True
-        base.setdefault("trading", {})["live"] = True
-        tmp.write_text(yaml.safe_dump(base, allow_unicode=True), encoding="utf-8")
-        import os
+        # stage10 不再读项目根 config.yaml（避免 VPS 本地脏配置导致 ParserError 雪崩）：
+        # 以 tmp_path 生成一份 shadow=true / live=true 的专用配置，通过 CONFIG_PATH 注入。
+        cfg_path = _write_sane_stage10_config(
+            tmp_path / "cfg_shadow.yaml",
+            extra_risk={"shadow_mode": True},
+            extra_trading={"live": True},
+        )
         old = os.environ.get("CONFIG_PATH")
         try:
-            os.environ["CONFIG_PATH"] = str(tmp)
+            os.environ["CONFIG_PATH"] = str(cfg_path)
             app = create_app()
             with TestClient(app) as client:
                 r = client.get("/api/status")
                 assert r.status_code == 200, r.text[:200]
                 body = r.json()
-            mode_val = str(body.get("运行模式", ""))
+                mode_val = str(body.get("运行模式", ""))
         finally:
             if old is None:
                 os.environ.pop("CONFIG_PATH", None)
@@ -370,8 +431,22 @@ class Test_A7_ShadowMode:
 # B. GET /api/diag 诊断快照接口（返回结构化数据，供 AI 后续分析缺陷）
 # ============================================================================
 class Test_B_DiagnosticSnapshotAPI:
+    """通过 pytest tmp_path + CONFIG_PATH 注入，彻底解耦项目根 config.yaml。
+
+    原因：VPS 上 install.sh 跑 pytest 时，/opt/ycs/config.yaml 是用户手填实盘配置。
+    如果用户手改时留下 Tab/缩进混用/冒号空格等 YAML 语法错，会导致 5+ 个 case
+    同时报同一行 ParserError while parsing a block mapping，无法区分代码缺陷 vs 本地配置脏。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stage10_sane_config_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """对本类所有用例自动注入一份干净 config（基于 config.yaml.example）。"""
+        cfg_path = _write_sane_stage10_config(tmp_path / "cfg.yaml")
+        monkeypatch.setenv("CONFIG_PATH", str(cfg_path))
+        yield cfg_path
+
     @pytest.fixture
-    def client(self):
+    def client(self, _stage10_sane_config_env: Path):
         from app.api.app import create_app
         from fastapi.testclient import TestClient
         # 构造最小 runtime：Controller 为空（仅保证路由可用）
