@@ -15,11 +15,56 @@ okx:
   passphrase: "YOUR_OKX_PASSPHRASE"
 
 # AI 提供商配置（通过 LiteLLM 统一接入；纸盘无网络时自动降级为离线兜底模型）
+#
+# 2026-08-31 VPS 跨境现场调优（timeout/thinking/stream 的平衡）：
+#   背景：之前 timeout=6s + thinking 默认开启 → VPS 跨境到 DeepSeek 约 60% 请求超时，
+#         且系统一超时就 LOW_VOLATILITY conf=0 → 永远不开仓（风控最低 conf 过不了）。
+#   平衡思路：『TTFT 短 × 有规则兜底 × 节流哨兵早叫』三件套：
+#     ① thinking=disabled：把 TTFT（首字节）从 4~8s 降到 0.8~2s，
+#        只付 content tokens（省 thinking 那部分钱），输出 JSON 也更干净。
+#     ② timeout=15s：跨境 95% 的 deepseek-v4-flash 非思考请求都能接住；
+#        如果开了 thinking=low，建议调到 25s；thinking=high/max 不推荐（TTFT 会压到 12s+）。
+#     ③ max_retries=1：仅给 1 次有限重试（防止"等 15s×3=45s 错过下一波 1~2% 行情"）。
+#     ④ enable_stream=false：本项目只在拿到完整 JSON 后才解析 regime/confidence，
+#        stream 不会让"解析时刻"更早，反而要多维护 stream_timeout 首字节超时和 SSE 帧解析，
+#        对 3 字段短 JSON 是纯亏。
+#     ⑤ 兜底：LiteLLM 超时/5xx/429/网络全挂，会走内置量价规则（T3 兜底），
+#        不再 LOW_VOLATILITY conf=0 躺平；涨跌 ≥±0.8% 直接 TREND_UP/DOWN 方向信号。
+#   节流层（bg_main_loop）还有两件保险：
+#     · 10s 主循环 + 7 档自适应间隔，不会因为 AI 慢就卡死整个循环；
+#     · 价格哨兵（1m 变动 ≥1% 立刻早叫），即使 LONG_HOLD 间隔也不会漏大行情。
 ai:
   provider: "deepseek"        # deepseek / openai / claude / gemini / openrouter
   api_key: "YOUR_AI_API_KEY"
   model: "deepseek-chat"      # 更换模型时仅修改此处
+                              #   · deepseek-chat（别名→deepseek-v4-flash 非思考模式，推荐）
+                              #   · deepseek-v4-flash（显式 ID，默认为 thinking=high，需手动 disabled）
+                              #   · deepseek-v4-pro（更强但贵 3 倍，TTFT 更长）
   base_url: ""                # 可选，自定义 endpoint
+
+  # —— 超时 & 重试 ——
+  # 单笔 LiteLLM 请求总超时（秒）。跨境 VPS 建议：
+  #   thinking=disabled → 15~20
+  #   thinking=low      → 25~30
+  #   thinking=high/max → 不推荐（会让整笔 20s+，错过哨兵早叫轮次）
+  # 下限 1，写 0 也会被代码钳制回 15。
+  timeout_seconds: 15
+  # 超时/5xx 自动重试次数（0~2 范围；写 5 会被钳制到 2，防止"等死错过行情"）。
+  # 默认 1：给 1 次容错机会；跨境抖动通常 1 次重试能救回来。
+  max_retries: 1
+
+  # —— 思考模式 —— 控制 deepseek-v4-flash 的 Chain-of-Thought
+  #   disabled  (默认) 非思考模式 → TTFT 最短、成本最低、JSON 最稳定（推荐）
+  #   enabled            开启思考，走模型默认 effort(=high) → 慢、贵、不推荐
+  #   low/high/max       开启思考 + 指定 reasoning_effort
+  #                         low  可接受：方向判断提升有限，但 TTFT +2~3s
+  #                         high/max 会慢 2~4 倍，且多付几倍 thinking tokens
+  # 注：thinking 打开时，temperature/top_p 会被 DeepSeek 忽略（官方说明）。
+  thinking_mode: "disabled"
+
+  # —— 流式输出 —— 默认 false（本项目"拿到完整 JSON 才判断"，stream 无收益）
+  # 仅当你后续接入『边收边解析』的复杂逻辑时才建议开；此时还需额外 stream_timeout。
+  enable_stream: false
 
 # 交易运行模式
 trading:

@@ -22,11 +22,34 @@ class OKXConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    """AI 提供商配置（LiteLLM 统一接入）。"""
+    """AI 提供商配置（LiteLLM 统一接入）。
+
+    2026-08-31 新增 4 个 VPS 现场调优字段（解决 6s timeout 导致≈60% 超时率的问题）：
+      · timeout_seconds：单笔 LiteLLM 请求的总超时（含 retries 内部不额外叠加，直接 LiteLLM 透传）。
+          - VPS 跨境到 DeepSeek：6s 太短（60% 超时），15s 能把 90% 的正常请求接住，
+            又不会卡住 10s 主循环太久（15s 超时 = 最多延迟 1~2 轮，不会错过趋势）。
+      · max_retries：超时/5xx 仅 1 次有限重试（0=不重试，最多 2）。
+          - 默认 1：既给 1 次容错机会，又绝不"无限等待错过下一轮价格波动哨兵早叫"。
+      · thinking_mode：deepseek-v4-flash 默认"思考开启"，但我们只要 3 字段 JSON 分类，
+          思考阶段会显著拖慢首字节（几倍延时），并多付 thinking tokens 成本。
+          - 默认 disabled：拿到结果的 TTFT 最短、成本最低、输出格式更稳定（<think> 段不会误被 JSON 解析）。
+          - 合法值（按 DeepSeek 官方 + LiteLLM 翻译）：enabled / disabled / low / medium / high / max。
+      · enable_stream：是否开启 SSE 流式。
+          - 默认 False：我们只要『完整 JSON』解析，不需要增量 tokens；stream 不会让"最终解析时刻"更早，
+            反而会增加 SSE 帧解析代码复杂度 + 需要多一个 stream_timeout 首字节超时参数，
+            在"首字节前思考期 3~8s"场景里，stream 和非 stream 的"拿最终完整 JSON 时间"相同。
+    """
     provider: Literal["deepseek", "openai", "claude", "gemini", "openrouter"]
     api_key: str
     model: str = "deepseek-chat"
     base_url: str = ""
+    # 超时 + 重试（平衡点：不卡住主循环，又不轻易放弃正常请求）
+    timeout_seconds: float = 15
+    max_retries: int = 1
+    # 思考模式：默认关闭（只要 3 字段 JSON，不需要 CoT 来消耗 TTFT 与 tokens）
+    thinking_mode: Literal["enabled", "disabled", "low", "medium", "high", "max"] = "disabled"
+    # 流式：默认关（本项目用不到增量渲染）
+    enable_stream: bool = False
 
 
 class TradingConfig(BaseModel):

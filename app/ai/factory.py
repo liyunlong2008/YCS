@@ -37,4 +37,8 @@ def build_ai_provider(cfg: AIConfig, *, force_offline: bool = False) -> AIProvid
         api_key=cfg.api_key,
         model=cfg.model,
         base_url=cfg.base_url,
+        timeout_seconds=float(cfg.timeout_seconds),
+        max_retries=int(cfg.max_retries),
+        thinking_mode=str(cfg.thinking_mode),
+        enable_stream=bool(cfg.enable_stream),
     )
