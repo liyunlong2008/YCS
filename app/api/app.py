@@ -1316,6 +1316,154 @@ def create_app(
         return result_payload
 
     # ------------------------------------------------------------------
+    # A6. GET /api/logs：通过 /docs Try-it-out 直接查看影子/交易日志（省 SSH）
+    # ------------------------------------------------------------------
+    _ALLOWED_LOG_FILES = ("trade", "system", "error")  # 不许任意路径穿越
+    _LOG_FILE_MAP = {
+        "trade": "trade.log",
+        "system": "system.log",
+        "error": "error.log",
+    }
+
+    def _safe_tail_read(p, max_chars: int) -> str:
+        """从文件末尾读最多 max_chars 字符（避免读几 GB 的 rotated log）。"""
+        try:
+            import os as _os  # noqa: PLC0415
+            size = p.stat().st_size
+            if size <= max_chars:
+                return p.read_text(encoding="utf-8", errors="replace")
+            with open(p, "rb") as f:
+                f.seek(size - max_chars, _os.SEEK_SET)
+                # 丢掉可能不完整的首个多字节行（split 会从\n后面开始解析新行，这里无所谓第一个半截行）
+                data = f.read(max_chars)
+            return data.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _read_journal_shell(n: int, kw: str) -> tuple[list[str], int, int]:
+        """非 Windows：journalctl -u ycs -n n*5 → 再 filter 再 tail n。"""
+        import subprocess as _sp  # noqa: PLC0415
+        try:
+            raw_bytes = _sp.check_output(
+                ["journalctl", "-u", "ycs", "-n", str(max(1, int(n)) * 8), "--no-pager"],
+                stderr=_sp.DEVNULL, timeout=6,
+            )
+            text = raw_bytes.decode("utf-8", errors="replace")
+        except (FileNotFoundError, _sp.CalledProcessError, _sp.TimeoutExpired, OSError):
+            return [], 0, 0
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if (kw or "").strip():
+            matched = [ln for ln in lines if kw in ln]
+            return matched, len(matched), len(matched[-max(1, int(n)):])
+        return lines, len(lines), len(lines[-max(1, int(n)):])
+
+    @app.get(
+        "/api/logs",
+        summary="查看影子/交易日志（默认 trade.log：含 [SHADOW] 影子成交序列）",
+        response_description="tail 最近 N 行；可 filter 关键字过滤；默认文件=trade（影子成交日志）。鉴权：X-YCS-Admin-Token == risk_limits.kill_switch_token。",
+    )
+    async def api_logs(
+        request: Request,
+        file: str = "trade",  # 默认 trade.log：影子成交、AI 决策、风控拒单都在这里
+        n: int = 200,
+        filter: str = "",  # noqa: A002 — 保持 query param 名"filter"友好，/docs 一眼看懂
+        x_ycs_admin_token: str = Header(
+            default="",
+            alias="X-YCS-Admin-Token",
+            description="鉴权口令：必须等于配置 risk_limits.kill_switch_token（与 /api/kill 同口）。",
+        ),
+    ):
+        """三文件：
+        - **trade** :trade.log → 影子成交 [SHADOW]、AI 决策、风控拒单（影子联调最常用）
+        - **system**: system.log → 启动/恢复/节流通用日志（排障用）
+        - **error** : error.log → 仅 ERROR 级别（第一现场排查 fatal 用）
+
+        也支持 file=journal → 调 journalctl -u ycs -n N（需 systemd）。
+        """
+        from fastapi import status as _st
+        rt = request.app.state.runtime or {}
+        cfg = rt.get("config")
+        expected_token = ""
+        if cfg is not None and hasattr(cfg, "risk_limits"):
+            expected_token = str(getattr(cfg.risk_limits, "kill_switch_token", "") or "")
+        got_token = str(x_ycs_admin_token or request.headers.get("x-ycs-admin-token") or "")
+        if expected_token and got_token != expected_token:
+            raise HTTPException(
+                status_code=_st.HTTP_401_UNAUTHORIZED,
+                detail="X-YCS-Admin-Token 不匹配（配置 risk_limits.kill_switch_token）",
+            )
+        # 1) 枚举校验
+        file_norm = str(file or "").strip().lower().replace(".log", "")
+        if file_norm == "journal":
+            _kw = (filter or "").strip()
+            _n = max(1, int(n))
+            all_l, total_matched, _ret = _read_journal_shell(n=_n, kw=_kw)
+            if _kw:
+                matched = [ln for ln in all_l if _kw in ln]
+                returned = matched[-_n:]
+                return {
+                    "file": "journal", "source": "systemd journalctl -u ycs",
+                    "total_matched": len(matched), "returned": len(returned),
+                    "filter_used": _kw or None, "n_requested": _n,
+                    "lines": returned,
+                }
+            return {
+                "file": "journal", "source": "systemd journalctl -u ycs",
+                "total_matched": total_matched, "returned": min(total_matched, _n),
+                "filter_used": None, "n_requested": _n,
+                "lines": all_l[-_n:],
+            }
+        if file_norm not in _ALLOWED_LOG_FILES:
+            raise HTTPException(
+                status_code=_st.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"file 非法：{file!r}。"
+                    f"允许值: {' / '.join(_ALLOWED_LOG_FILES)} / journal（systemd）。默认=trade。"
+                ),
+            )
+        actual_file = _LOG_FILE_MAP[file_norm]
+
+        # 2) 定位 logs_root：按优先级
+        #   a) runtime["logs_root"]（测试注入）
+        #   b) runtime["runtime_root"] / "logs"（create_app 常规参数）
+        #   c) PROJECT_ROOT / "logs"（PROJECT_ROOT = app/api/app.py 的 parent.parent.parent）
+        from pathlib import Path as _P2  # noqa: PLC0415
+        logs_root = rt.get("logs_root") or None
+        if logs_root:
+            logs_root_p = _P2(str(logs_root))
+        elif rt.get("runtime_root"):
+            logs_root_p = _P2(str(rt["runtime_root"])) / "logs"
+        else:
+            logs_root_p = _P2(__file__).resolve().parent.parent.parent / "logs"
+        target_path = logs_root_p / actual_file
+
+        # 3) tail + 过滤
+        all_lines: list[str] = []
+        try:
+            if target_path.exists() and target_path.is_file():
+                raw = _safe_tail_read(target_path, max_chars=max(200_000, n * 800))
+                all_lines = [ln.rstrip("\r\n") for ln in raw.split("\n") if ln != ""]
+        except Exception:  # noqa: BLE001
+            all_lines = []
+        _f = (filter or "").strip()
+        if _f:
+            matched = [ln for ln in all_lines if _f in ln]
+            total_matched = len(matched)
+            returned_lines = matched[-max(1, int(n)):]
+        else:
+            total_matched = len(all_lines)
+            returned_lines = all_lines[-max(1, int(n)):]
+        return {
+            "file": actual_file,
+            "source": str(target_path),
+            "total_matched": total_matched,
+            "returned": len(returned_lines),
+            "filter_used": _f or None,
+            "n_requested": int(n),
+            "lines": returned_lines,
+        }
+
+    # ------------------------------------------------------------------
     # B. GET /api/diag 诊断快照（供 AI 分析项目缺陷 / 用户远程自查）
     # ------------------------------------------------------------------
     @app.get("/api/diag", summary="诊断快照：返回 system/broker/controller/pm/journal/safety/fixtures/risks 8 大类结构化数据")

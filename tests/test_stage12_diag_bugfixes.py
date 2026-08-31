@@ -948,3 +948,97 @@ class Test_11_RiskHardeningForLiveReady:
         )
 
 
+# ============================================================================
+# ⑫ 用户诉求 B+D：/api/logs 接口供 /docs 看影子模式日志
+#     12.1 /api/logs 默认走 trade.log（影子成交就在这个里），支持 tail n 行、filter 过滤
+#     12.2 缺 / 错文件枚举 返回 400；空文件 / 空目录 返回 200 空数组
+#     12.3 X-YCS-Admin-Token 鉴权（缺或错 → 401）
+# ============================================================================
+class Test_12_ApiLogsForDocs:
+    """通过 /docs Try it out 就能看影子日志 → 省得再 SSH 上去 tail。"""
+
+    def _app(self, tmp_path: Path):
+        """临时 app：把 runtime 的 PROJECT_ROOT/logs 指向 tmp_path，避免用真 /workspace/logs。"""
+        from fastapi.testclient import TestClient
+        from app.api.app import create_app
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        # 写入 12 条测试日志（模拟影子成交）
+        lines = []
+        for i in range(1, 13):
+            tag = "[SHADOW] " if i % 2 == 0 else "         "
+            lines.append(f"2026-08-31 17:00:{i:02d}.000 | INFO    | app | 第{i}条 {tag}内容={i}")
+        (logs_dir / "trade.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (logs_dir / "system.log").write_text("system line1\nsystem line2\n", encoding="utf-8")
+        (logs_dir / "error.log").write_text("", encoding="utf-8")
+        # PROJECT_ROOT 替换：FastAPI app 里其实是 runtime["runtime_root"] or ProjectRoot const，
+        #   先看真实 app 的实现再决定怎么注入；这里先用运行时传参方式（一般 runtime dict 注入）。
+        # 先给 app 打个 runtime["logs_root"] attr：注入模式
+        app = create_app()
+        # create_app 后还没 startup；我们只测 sync endpoint 逻辑，需要 override _LogReader 读的根路径。
+        app.state.runtime.setdefault("logs_root", str(logs_dir))
+        # 还需要一个假 config 给 kill_switch_token 做鉴权（传 "abcd"）
+        class _Cfg:
+            class _Risk:
+                kill_switch_token = "abcd"
+            class _Trading:
+                pass
+            risk_limits = _Risk()
+            trading = _Trading()
+            class _Server:
+                kill_enabled = True
+            server = _Server()
+        app.state.runtime["config"] = _Cfg()
+        return TestClient(app), logs_dir
+
+    # ----- 12.1 默认 trade.log + tail_n + filter -----
+    def test_12_1_default_trade_log_tail_and_filter(self, tmp_path):
+        tc, _ = self._app(tmp_path)
+        # 默认 → 读 trade.log，n=5 → 返回最后 5 行 = [行 8, 9, 10, 11, 12]（1-indexed）
+        r = tc.get("/api/logs", headers={"X-YCS-Admin-Token": "abcd"}, params={"n": 5})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["file"] == "trade.log"
+        assert len(data["lines"]) == 5
+        # 最后一条 = 第 12 条（对）
+        assert "第12条" in data["lines"][-1]
+        # tail-5 的边界外 = 第 7 条：不应该出现在返回里的任何一条
+        all_text = "\n".join(data["lines"])
+        assert "第7条" not in all_text, f"tail-5 不应包含第7条。返回: {all_text}"
+        # filter=SHADOW → 只返回偶数条（共 6 条 = i=2,4,6,8,10,12）；n=3 → 取最后 3 = [8, 10, 12]
+        r2 = tc.get("/api/logs", headers={"X-YCS-Admin-Token": "abcd"},
+                    params={"file": "trade", "n": 3, "filter": "SHADOW"})
+        assert r2.status_code == 200, r2.text
+        d2 = r2.json()
+        assert len(d2["lines"]) == 3
+        for l in d2["lines"]:
+            assert "[SHADOW]" in l
+        assert d2["total_matched"] == 6  # 总共 6 条含 SHADOW
+        assert d2["returned"] == 3
+
+    # ----- 12.2 缺 / 错枚举 / 空文件 -----
+    def test_12_2_invalid_file_returns_400(self, tmp_path):
+        tc, _ = self._app(tmp_path)
+        r = tc.get("/api/logs", headers={"X-YCS-Admin-Token": "abcd"},
+                   params={"file": "nonsense"})
+        assert r.status_code == 400
+        # 空 error.log → 返回空数组
+        r2 = tc.get("/api/logs", headers={"X-YCS-Admin-Token": "abcd"},
+                    params={"file": "error", "n": 100})
+        assert r2.status_code == 200
+        assert r2.json()["lines"] == []
+        assert r2.json()["returned"] == 0
+
+    # ----- 12.3 缺 / 错 X-YCS-Admin-Token → 401 -----
+    def test_12_3_auth_required_401(self, tmp_path):
+        tc, _ = self._app(tmp_path)
+        # 缺 token
+        r = tc.get("/api/logs")
+        assert r.status_code == 401
+        # 错 token
+        r2 = tc.get("/api/logs", headers={"X-YCS-Admin-Token": "wrong"})
+        assert r2.status_code == 401
+        # config 没有设置 kill_switch_token（空字符串/None → 默认放行不开）：
+        #   这里只验证上面的错/缺是401，具体『已设 vs 未设』留给 app 逻辑。
+
+

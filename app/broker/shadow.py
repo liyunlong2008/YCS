@@ -181,16 +181,30 @@ class ShadowBroker(Broker):
         ct_val: float,
         mmr: float = _DEFAULT_MMR,
     ) -> float:
-        """估算强平价（简化版：保证金全亏完到维持保证金）。"""
+        """估算强平价（简化版：IMR 全亏完 + 维持保证金（MMR）缓冲）。
+
+        公式（OKX 永续简化版，仅供展示；上实盘后会优先取真实 broker 返回的 liq_price）：
+          LONG  : 价 ↓ 爆仓 → bankrupt = entry × (1 − 1/lev)；再加 MM → 略微抬升（仍<entry）
+          SHORT : 价 ↑ 爆仓 → bankrupt = entry × (1 + 1/lev)；再减 MM → 略微拉低（仍>entry）
+        紧凑写法: bankrupt = entry × (1 − dir_sign / lev)，dir_sign=+1(LONG) −1(SHORT)。
+        """
         if size_sz <= 0 or entry_price <= 0 or leverage <= 0 or side == PositionSide.FLAT:
             return 0.0
         lev = max(1, int(leverage))
-        # IMR = 1/lev；MMR 按固定；破产价 = entry * (1 - 1/lev * dir)
         dir_sign = 1.0 if side == PositionSide.LONG else -1.0
-        # 简化：liq ≈ entry * (1 - dir_sign/lev * (1 - mmr*lev))
-        # 更保守直接按破产价 + 一点 MM 缓冲：OKX 真正公式更复杂，展示用精度足够
-        bankrupt = entry_price * (1.0 - dir_sign * (1.0 - 1.0 / lev))
-        liq = bankrupt + dir_sign * entry_price * mmr * 0.5
+        # bankrupt = entry × (1 − dir_sign / lev)
+        #   LONG (+1): 1 − 1/lev  ✓
+        #   SHORT (−1): 1 + 1/lev ✓
+        bankrupt = entry_price * (1.0 - dir_sign / lev)
+        # MM 缓冲：方向同向加缓冲，确保 liq 在"刚好爆 vs 真被强平"之间有安全垫
+        #   LONG: bankrupt + (entry * mmr / 2) → 略高于破产价（离破产价近，缓冲到还剩半档MM）
+        #   SHORT: bankrupt − (entry * mmr / 2) → 略低于破产价（仍在 entry 上方）
+        liq = bankrupt + dir_sign * entry_price * (mmr * 0.5)
+        # 方向合理性兜底：LONG 必须<entry；SHORT 必须>entry（即使 MMR 调太大也不越界）
+        if side == PositionSide.LONG and liq >= entry_price:
+            liq = entry_price * (1.0 - 1.0 / lev / 2.0)
+        if side == PositionSide.SHORT and liq <= entry_price:
+            liq = entry_price * (1.0 + 1.0 / lev / 2.0)
         if liq <= 0:
             liq = 0.0
         return float(liq)
