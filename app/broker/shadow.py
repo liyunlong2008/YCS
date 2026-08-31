@@ -384,8 +384,29 @@ class ShadowBroker(Broker):
         ts = int(time.time() * 1000)
         cid = client_order_id or f"{_SHADOW_ORDER_ID_PREFIX}{ts}-{id(self) & 0xffff:04x}"
         filled = float(amount)
-        # 市价单：允许 avg_fill_price 为 0（上层不校验市价单价格），这里兜底补 price=0 时用 entry_price 缓存
+        # 2026-08-31 修复：MARKET + price=0 时，之前 avg_fill_price=0 → _apply_fill 被跳过，
+        #   导致虚拟仓位根本没写入（get_position 仍 FLAT）。现在兜底到 inner 的最新报价 / 已镜像持仓 entry：
         avg_fill_price = float(price) if price and type != OrderType.MARKET else (float(price) if price else 0.0)
+        if avg_fill_price <= 0 and filled > 0:
+            try:
+                if hasattr(self._inner, "get_ticker_price") and callable(getattr(self._inner, "get_ticker_price")):
+                    _tp = await self._inner.get_ticker_price(symbol)
+                    if float(_tp or 0.0) > 0:
+                        avg_fill_price = float(_tp)
+            except Exception:  # noqa: BLE001
+                avg_fill_price = 0.0
+        if avg_fill_price <= 0 and filled > 0:
+            try:
+                _ppos = await self._inner.get_position(symbol)
+                _mp = float(getattr(_ppos, "mark_price", 0.0) or 0.0)
+                _ep = float(getattr(_ppos, "entry_price", 0.0) or 0.0)
+                avg_fill_price = _mp or _ep or 0.0
+            except Exception:  # noqa: BLE001
+                avg_fill_price = 0.0
+        if avg_fill_price <= 0 and filled > 0:
+            # 再兜底：virtual 已有 entry
+            self._ensure_virtual(symbol)
+            avg_fill_price = float(self._virtual_positions[symbol].entry_price or 0.0) or _DEFAULT_CT_VAL * 2466.0
         order = Order(
             client_order_id=cid,
             order_id=cid,  # shadow: 无需真 exchange id
@@ -427,6 +448,75 @@ class ShadowBroker(Broker):
             symbol, client_order_id,
         )
         return True
+
+    # 2026-08-31：Bug B 修复 - cancel_all / close_all 显式实现
+    #   （否则基类 cancel_all → 取 get_open_orders → inner.open_orders，
+    #     但 shadow 侧挂单都在本地瞬时 FILLED → 用 0 也 OK，但显式语义更清晰）
+    async def cancel_all_orders(self, symbol: str) -> int:
+        """Shadow：撤单都视为『已撤』，先查本地未完成影子单，再透传 inner 的 cancel_all。"""
+        cnt_local = 0
+        # 本地影子订单账本里：PENDING/PARTIAL 视作"已撤"，计数（仅日志语义）
+        for o in list(self._shadow_orders.values()):
+            st = getattr(o, "status", None)
+            stv = st.value if hasattr(st, "value") else str(st)
+            if stv in ("PENDING", "PARTIAL"):
+                try:
+                    from ..core.constants import OrderStatus  # noqa: PLC0415
+                    o.status = OrderStatus.CANCELED
+                    o.updated_at = int(__import__("time").time() * 1000)
+                except Exception:  # noqa: BLE001
+                    pass
+                cnt_local += 1
+        # inner 也取消（如果 inner 有 cancel_all）—— 实盘 shadow 模式：对 inner 不触碰但 cancel 无害
+        inner_cnt = 0
+        if hasattr(self._inner, "cancel_all_orders") and callable(getattr(self._inner, "cancel_all_orders")):
+            try:
+                inner_cnt = int(await self._inner.cancel_all_orders(symbol) or 0)
+            except Exception:  # noqa: BLE001
+                inner_cnt = 0
+        logger.warning(
+            "[SHADOW MODE] cancel_all_orders(symbol={})：本地影子撤 {} 单，inner.cancel_all 返回 {}",
+            symbol, cnt_local, inner_cnt,
+        )
+        return max(cnt_local, inner_cnt)
+
+    async def close_all_positions(self, symbol: str) -> Position:
+        """Shadow：把本地虚拟持仓『全额反向 MARKET 伪成交』，强制归 FLAT。"""
+        from ..core.constants import OrderSide, OrderType, PositionSide  # noqa: PLC0415
+        pos_before = await self.get_position(symbol)
+        size = float(getattr(pos_before, "size", 0.0) or 0.0)
+        side = getattr(pos_before, "side", PositionSide.FLAT)
+        side_val = side.value if hasattr(side, "value") else str(side)
+        if size <= 0 or side_val == PositionSide.FLAT.value:
+            # 已空仓
+            return Position(
+                symbol=symbol, side=PositionSide.FLAT, size=0.0,
+                entry_price=0.0, mark_price=float(getattr(pos_before, "mark_price", 0.0) or 0.0),
+                leverage=getattr(pos_before, "leverage", 1) or 1,
+            )
+        # 反向市价伪成交一笔（复用 place_order 写影子账本 + 应用 fill 到 virtual）
+        close_side = OrderSide.SELL if side_val == PositionSide.LONG.value else OrderSide.BUY
+        try:
+            await self.place_order(
+                symbol=symbol, side=close_side, type=OrderType.MARKET,
+                amount=size, price=0.0,
+                client_order_id=f"_shadow_close_all_{int(__import__('time').time()*1000)}",
+            )
+        except Exception:  # noqa: BLE001
+            # place_order 失败兜底：直接清空 virtual
+            self._ensure_virtual(symbol)
+            self._virtual_positions[symbol] = Position(
+                symbol=symbol, side=PositionSide.FLAT, size=0.0,
+                leverage=getattr(pos_before, "leverage", 1) or 1,
+            )
+        pos_after = await self.get_position(symbol)
+        logger.warning(
+            "[SHADOW MODE] close_all_positions: before {}x{}, after side={} size={}",
+            side_val, size,
+            pos_after.side.value if hasattr(pos_after.side, "value") else pos_after.side,
+            pos_after.size,
+        )
+        return pos_after
 
     # ---- 可选：PaperBroker 专属 apply_ticker 等需要透传（否则 paper 模式下也套着会丢行情）----
     def __getattr__(self, item: str):

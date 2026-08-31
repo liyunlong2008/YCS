@@ -206,3 +206,61 @@ class Broker(ABC):
     @abstractmethod
     async def cancel_order(self, symbol: str, client_order_id: str) -> bool:
         """撤销订单。成功返回 True。"""
+
+    # 2026-08-31：强平前主动平仓 / shadow→实盘扫场 的统一入口（Bug B 修复）。
+    #   - cancel_all_orders：撤 symbol 所有 PENDING/PARTIAL 挂单，返回撤单数
+    #   - close_all_positions：按当前持仓方向打反向市价单全平，返回平仓后 Position
+    # 基类给默认实现（逐单循环 + place_order 反向全平），实盘子类可重写走交易所批量接口
+    async def cancel_all_orders(self, symbol: str) -> int:
+        """撤销 symbol 所有挂单。返回撤单成功数。"""
+        cnt = 0
+        try:
+            orders = await self.get_open_orders(symbol)
+        except Exception:  # noqa: BLE001
+            return 0
+        for o in orders:
+            cid = getattr(o, "client_order_id", None)
+            if not cid:
+                continue
+            try:
+                ok = await self.cancel_order(symbol, cid)
+                if ok:
+                    cnt += 1
+            except Exception:  # noqa: BLE001
+                pass
+        return cnt
+
+    async def close_all_positions(self, symbol: str) -> Position:
+        """对 symbol 当前持仓发反向 MARKET 全平，返回平仓后的 Position。"""
+        from ..core.constants import OrderSide, OrderType, PositionSide  # noqa: PLC0415（避免循环导入）
+        try:
+            pos = await self.get_position(symbol)
+        except Exception:  # noqa: BLE001
+            return Position(symbol=symbol, side=PositionSide.FLAT, size=0.0)
+        size = float(getattr(pos, "size", 0.0) or 0.0)
+        side = getattr(pos, "side", PositionSide.FLAT)
+        side_val = side.value if hasattr(side, "value") else str(side)
+        if size <= 0 or side_val == PositionSide.FLAT.value:
+            # 空仓，直接返回 FLAT
+            return Position(
+                symbol=symbol, side=PositionSide.FLAT, size=0.0,
+                leverage=getattr(pos, "leverage", 1) or 1,
+            )
+        # 反向：LONG → SELL，SHORT → BUY
+        close_side = OrderSide.SELL if side_val == PositionSide.LONG.value else OrderSide.BUY
+        try:
+            await self.place_order(
+                symbol=symbol,
+                side=close_side,
+                type=OrderType.MARKET,
+                amount=size,
+                price=0.0,
+                client_order_id=f"_force_close_all_{int(__import__('time').time()*1000)}",
+            )
+        except Exception:  # noqa: BLE001
+            # 失败也透传当前 position，调用方再核一次
+            pass
+        try:
+            return await self.get_position(symbol)
+        except Exception:  # noqa: BLE001
+            return Position(symbol=symbol, side=PositionSide.FLAT, size=0.0)

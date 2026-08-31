@@ -245,19 +245,29 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     except Exception:
         logger.exception("启动恢复失败，以 STOPPED 继续启动 Dashboard（请检查 OKX 网络/密钥）")
 
-    # 6.5) 兜底写 started_at：无论 recoverer 是否异常路径，都保证 state_store.started_at 为 int epoch 秒
-    #      · 若已有合法 int started_at（恢复流程已写入或上次进程残留）→ 不覆盖
-    #      · 若 started_at 为 None / 非法字符串 / 0 → 写当前时间
+    # 6.5) 兜底写 started_at：**每一次新 PID 进程启动，都覆盖为 now**（Bug A 核心修复）。
+    #      之前逻辑「started_at 合法 int 就保留」导致 systemd 重启后崩溃前的老 epoch（2h~24h 前）
+    #      被延续到新进程，Dashboard 显示『启动时间 19:58:28 / 运行时长 2h+』这种错位。
+    #      额外兼容：started_at 若为字符串老格式也先审计日志，再一律 overwrite。
     import datetime as _dtb, time as _tb
     st_snap = state_store.load()
     raw_ts = st_snap.get("started_at")
+    _new_epoch = int(_tb.time())
+    # 写审计（不使用老值，仅打印差异方便排查）
     if isinstance(raw_ts, str):
         try:
-            st_snap["started_at"] = int(_dtb.datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").timestamp())
+            _old_e = int(_dtb.datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S").timestamp())
+            logger.info("[BugA修复-started_at] 迁移老字符串『{}』→ 重写为当前进程启动 epoch {}（约{}s前的老时间，不再保留）",
+                        raw_ts, _new_epoch, max(0,_new_epoch-_old_e))
         except Exception:  # noqa: BLE001
-            st_snap["started_at"] = int(_tb.time())
-    elif not isinstance(raw_ts, int) or raw_ts <= 0:
-        st_snap["started_at"] = int(_tb.time())
+            logger.info("[BugA修复-started_at] started_at 非法字符串『{}』→ 重写为当前 epoch {}", raw_ts, _new_epoch)
+    elif isinstance(raw_ts, (int,float)) and raw_ts > 0:
+        _old_e = int(raw_ts)
+        logger.info("[BugA修复-started_at] 覆盖老 started_at={}（约{}s前的旧进程残留）→ 当前进程启动时刻 {}",
+                    _old_e, max(0,_new_epoch-_old_e), _new_epoch)
+    else:
+        logger.info("[BugA修复-started_at] started_at 为空/非法 → 初始化为当前进程启动时刻 {}", _new_epoch)
+    st_snap["started_at"] = _new_epoch
     state_store.save(st_snap)
 
     # 6.6) 【2026-08-31 上实盘前硬化】影子→实盘切换闸门（safety_sweep）
@@ -386,48 +396,105 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
             # RUNNING 状态下做持仓利润保护（不控制空仓时还会额外扫）
             if st.get("status") == SystemStatus.RUNNING.value:
                 # ---- 2026-08-31 强平前主动平仓（优先级 HIGHEST，比利润保护更先判） ----
+                # Bug E 修复：
+                #   E1) has_pos 前先判冷却 state_store['_liq_close_last_fail_ts'] 60s，
+                #       避免 cancel_all 抛 AttributeError 后每 10s 狂刷一次 ERROR
+                #   E2) 默认阈值从 10% 放宽到 20%（离强平价 20% 内就提前平，给价格极端波动留缓冲，
+                #       现场 SHORT 空单 9.65% 才触发已经太贴了，20% 时还有 ~500 点距离)
+                #   E3) 空仓 size=0/FLAT 短路跳过（比 has_pos 守卫更早一层：防止 state_store 有仓
+                #       但 broker 已平的"逻辑空仓"误触发）
+                #   E4) cancel_all/close_all 抛异常后必须：
+                #       · 写 _liq_close_last_fail_ts = now（下一轮冷却 60s 不再判）
+                #       · 切 status = HALT/ERROR（再不是 RUNNING，has_pos 不进入）
+                #       · 仅 sleep 一轮，避免 10s × N 刷屏
                 if has_pos:
-                    from app.services.controller import TradingController as _TC
-                    lev_here = int(getattr(pos, "leverage", 0) or 0)
-                    must_liq_close, liq_reason = _TC.is_liq_proximity_close(
-                        side=pos.side, mark_price=mark_price,
-                        entry_price=entry_price, liq_price=liq_price,
-                        leverage=lev_here,
-                    )
-                    if must_liq_close:
-                        logger.bind(log_type="trade").error(
-                            "[强平前主动平仓] {}", liq_reason
+                    # 短路 E3：再次 broker 实判 size，size≤0 就算 state_store 里有残留也跳
+                    side_now = getattr(pos, "side", None)
+                    side_v = side_now.value if hasattr(side_now, "value") else str(side_now)
+                    sz_now = float(getattr(pos, "size", 0.0) or 0.0)
+                    # 冷却 E1：60s 窗口内上一次 close_all 失败过 → 整段跳过（不刷屏）
+                    import time as _t_liq
+                    _COOLDOWN_S = 60
+                    _THR_PCT = 20.0   # E2：阈值 20%
+                    _now_liq = int(_t_liq.time())
+                    _last_fail = int((st.get("_liq_close_last_fail_ts") or 0))
+                    still_cooling = (_last_fail > 0) and ((_now_liq - _last_fail) < _COOLDOWN_S)
+                    if still_cooling:
+                        logger.info(
+                            "[强平前主动平仓] 冷却跳过（上一次失败 {}s 前，{}s 冷却未到）",
+                            _now_liq - _last_fail, _COOLDOWN_S,
                         )
-                        try:
-                            # 立即执行：取消挂单 → 全平
-                            await ctl.broker.cancel_all_orders(symbol)
-                            await ctl.broker.close_all_positions(symbol)
-                            logger.success("[强平前主动平仓] 全平完成 → 进入冷启动观察")
-                        except Exception:  # noqa: BLE001
-                            logger.exception("[强平前主动平仓] 平仓失败！立即尝试 kill 状态")
-                        # 强制设 HALT（不重启本步，下次进入 recoverer 再核）
-                        try:
-                            await ctl.kill_switch(reason=liq_reason[:200], caller="bg_main_loop:liq_proximity")
-                        except Exception:  # noqa: BLE001
-                            pass
-                        # 2026-08-31 修：st.status = HALT 也必须包住；
-                        #   之前 SystemStatus 枚举缺 HALT 时这行直接抛 AttributeError，
-                        #   把整个 bg_main_loop 崩掉（journal/error.log 连打 traceback）。
-                        try:
-                            st = state_store.load()
-                            st["status"] = SystemStatus.HALT.value
-                            state_store.save(st)
-                        except Exception:  # noqa: BLE001
-                            logger.exception("[强平前主动平仓] 写 HALT 状态失败，退化写 ERROR")
+                    elif sz_now <= 0 or side_v == "FLAT":
+                        pass  # 空仓短路 E3，静默（说明 state_store 残留 has_pos）
+                    else:
+                        from app.services.controller import TradingController as _TC
+                        lev_here = int(getattr(pos, "leverage", 0) or 0)
+                        must_liq_close, liq_reason = _TC.is_liq_proximity_close(
+                            side=pos.side, mark_price=mark_price,
+                            entry_price=entry_price, liq_price=liq_price,
+                            leverage=lev_here,
+                            thr_pct=_THR_PCT,  # E2: 20%（参数名对齐 controller 签名 thr_pct）
+                        )
+                        if must_liq_close:
+                            logger.bind(log_type="trade").error(
+                                "[强平前主动平仓] 阈值={}%（放宽）→ {}", _THR_PCT, liq_reason
+                            )
+                            _close_ok = False
                             try:
-                                st = state_store.load()
-                                st["status"] = SystemStatus.ERROR.value
-                                state_store.save(st)
+                                # E3 短路后此处有仓：先撤挂单 → 再全平
+                                await ctl.broker.cancel_all_orders(symbol)
+                                _after = await ctl.broker.close_all_positions(symbol)
+                                _sz_a = float(getattr(_after, "size", 0.0) or 0.0)
+                                _sd_a = getattr(_after, "side", None)
+                                _sda_v = _sd_a.value if hasattr(_sd_a, "value") else str(_sd_a)
+                                _close_ok = (_sz_a <= 0 or _sda_v == "FLAT")
+                                if _close_ok:
+                                    logger.success(
+                                        "[强平前主动平仓] 全平完成 → 进入冷启动观察（side={} size={}）",
+                                        _sda_v, _sz_a,
+                                    )
+                                    # 成功：清失败时间戳（下一次万一又触发，不用等冷却）
+                                    try:
+                                        st = state_store.load()
+                                        if "_liq_close_last_fail_ts" in st:
+                                            del st["_liq_close_last_fail_ts"]
+                                            state_store.save(st)
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                            except Exception as _e_liq:  # noqa: BLE001
+                                logger.exception(
+                                    "[强平前主动平仓] 平仓失败（{}）！进入冷却 {}s + 写 HALT，"
+                                    "防止下一轮每 10s 刷一次 ERROR",
+                                    type(_e_liq).__name__, _COOLDOWN_S,
+                                )
+                                # E4a) 失败 → 写冷却时间戳（绝对有效，即便 status 守卫没拦）
+                                try:
+                                    st = state_store.load()
+                                    st["_liq_close_last_fail_ts"] = _now_liq
+                                    state_store.save(st)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            # E4b) 不管成功失败，先切状态让下次 bg_main_loop RUNNING 守卫不过
+                            try:
+                                await ctl.kill_switch(reason=liq_reason[:200],
+                                                     caller="bg_main_loop:liq_proximity")
                             except Exception:  # noqa: BLE001
                                 pass
-                        # 本步直接 sleep 掉（下一轮从 recoverer / 人工重启恢复）
-                        await asyncio.sleep(loop_interval)
-                        continue
+                            try:
+                                st = state_store.load()
+                                st["status"] = SystemStatus.HALT.value
+                                state_store.save(st)
+                            except Exception:  # noqa: BLE001
+                                logger.exception("[强平前主动平仓] 写 HALT 失败，退化写 ERROR")
+                                try:
+                                    st = state_store.load()
+                                    st["status"] = SystemStatus.ERROR.value
+                                    state_store.save(st)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            # 睡眠一轮（即便 RUNNING 守卫 / 冷却 都坏，也至少 10s 不连刷两次）
+                            await asyncio.sleep(loop_interval)
+                            continue
                 # --- 老的利润保护 ---
                 need_close, close_reason = pm.should_close_for_protection(pos)
                 if has_pos and need_close:

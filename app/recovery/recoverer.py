@@ -82,22 +82,33 @@ class SystemRecoverer:
     # 状态恢复（设计文档 · 第十七节 · 交易所状态优先）
     # ------------------------------------------------------------------
     async def recover(self) -> dict:
-        """按顺序执行完整恢复：时间 → 余额 → 持仓 → 挂单 → 覆盖 state。"""
-        logger.info("=== 系统恢复开始（交易所状态优先）===")
+        """按顺序执行完整恢复：时间 → 余额 → 持仓 → 挂单 → 覆盖 state。
+
+        2026-08-31 Bug A 修复：**每一次进程启动（systemd 重启 / 手工拉起）必须把 started_at 重置为当前 now**。
+          · 之前逻辑「started_at 已是 int > 0 → 保留」导致崩溃前的老 epoch（可能 2h/24h 前）
+            被延续到新进程，Dashboard 显示「启动时间 19:58:28 / 运行时长 2h07m50s」。
+          · 正确行为：started_at 语义 = 当前 PID 进程真正启动的时刻，不是 state.json 上次留下的值。
+          · 兼容：老字符串仍然迁移；但不管之前什么类型，都覆盖成当前 time.time()。
+        """
+        return await self.try_recover()
+
+    async def try_recover(self) -> dict:
+        """recover() 的显式别名（Bug A 修复点在本函数开头 started_at 覆盖逻辑），
+        便于调用方/测试方用 try_recover 表达『一次恢复尝试』语义。"""
+        logger.info("=== 系统恢复开始（交易所状态优先，started_at 强制重写为当前进程启动时刻）===")
         st = self._state_store.load()
         st["status"] = SystemStatus.RECOVERING.value
-        # 统一 started_at 为「epoch 秒整数」便于 uptime 计算；避免与 /api/diag uptime_seconds 做减法时类型不一致
-        existing = st.get("started_at")
-        if isinstance(existing, str):
-            # 兼容老格式「YYYY-MM-DD HH:MM:SS」字符串 → 反解为 epoch（老数据迁移一次）
-            try:
-                import datetime as _dt
-                st["started_at"] = int(_dt.datetime.strptime(existing, "%Y-%m-%d %H:%M:%S").timestamp())
-            except Exception:  # noqa: BLE001
-                st["started_at"] = int(time.time())
-        elif not isinstance(existing, int) or existing <= 0:
-            st["started_at"] = int(time.time())
+        # 无论之前 started_at 是 int / str / None，一律覆盖为当前时刻（Bug A 关键修复）
+        _now_epoch = int(time.time())
+        # 仅记录一下 old 用于日志差异审计，不做保留
+        _old = st.get("started_at")
+        st["started_at"] = _now_epoch
         self._state_store.save(st)
+        if isinstance(_old, (int, float)) and _old > 0:
+            logger.info("[BugA修复] 覆盖老 started_at={old_epoch}(约{diff_s}s前) → 新进程启动时刻 {new_epoch}",
+                        old_epoch=int(_old), diff_s=max(0, _now_epoch - int(_old)), new_epoch=_now_epoch)
+        elif isinstance(_old, str):
+            logger.info("[BugA修复] 迁移并重写老 started_at 字符串『{}』→ 当前 epoch {}", _old, _now_epoch)
 
         # 1) 时间同步（若失败则进入异常）
         try:
