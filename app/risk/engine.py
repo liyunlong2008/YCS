@@ -396,7 +396,11 @@ class RiskEngine:
         stop_loss_price = max(0.01, float(entry_price) - sl_price_delta)  # 默认按多空再调，此处给多头基准
 
         qty_by_risk = max_loss_usdt / max(per_contract_sl * leverage, 1e-9)
-        qty_by_margin = (float(avail) * leverage) / max(per_contract, 1e-9)
+        # 2026-08-31 上实盘前硬化：保证金只用到 95% 可用，留 5% 给 taker 0.05% 手续费 / 滑点 / OKX 最小收取。
+        #   旧 (avail × lev) / per → margin 占满 100% avail → 手续费叠加后交易所『保证金不足』直接拒。
+        #   14.83U 小本金尤其致命，必须提前闸。
+        _MARGIN_SAFE_PCT = 0.95
+        qty_by_margin = (float(avail) * _MARGIN_SAFE_PCT * leverage) / max(per_contract, 1e-9)
 
         # 名义上限：min( 交易所 max sz × per_contract, 配置层 max_notional_cfg, 安全兜底 )
         exch_max_sz = spec.effective_max_sz(is_market=False)

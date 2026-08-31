@@ -128,6 +128,149 @@ class TradingController:
         return d.get(key, default) or default
 
     # ------------------------------------------------------------------
+    # 2026-08-31 上实盘前硬化 #11.2：距强平价 ≤ 10% 强制主动平仓
+    # ------------------------------------------------------------------
+    @staticmethod
+    def is_liq_proximity_close(
+        side: object,
+        *,
+        mark_price: float,
+        entry_price: float,
+        liq_price: float,
+        leverage: int | float,
+        thr_pct: float = 10.0,
+    ) -> tuple[bool, str]:
+        """判断当前持仓是否已逼近强平价 → 主动平仓（不把钱给交易所保险基金）。
+
+        Args:
+            side: PositionSide (LONG / SHORT)。FLAT 直接返回 False。
+            mark_price: 当前标记价。
+            entry_price: 开仓均价。
+            liq_price: 交易所返回的强平价。若为 0，用 1/lev 简化公式兜底推导。
+            leverage: 当前杠杆。
+            thr_pct: 距离阈值 (%)。默认 10% = 距离强平距离 < 10% 的剩余安全幅度就主动平。
+        Returns:
+            (必须平仓=True/False, 中文原因)
+        """
+        from ..core.constants import PositionSide  # noqa: PLC0415
+        if side in (PositionSide.FLAT, "FLAT", None):
+            return False, "空仓，无需判断强平距离"
+        if not liq_price or liq_price <= 0:
+            # 简化强平价估算：多头 entry*(1 - 1/lev)；空头 entry*(1 + 1/lev)
+            # （OKX 真强平价考虑资金费/手续费，略更苛刻；这里用宽松一点的估算也比让用户爆仓强）
+            lev = max(1, float(leverage or 1))
+            if side in (PositionSide.LONG, "LONG"):
+                liq_price = float(entry_price) * (1.0 - 1.0 / lev)
+            else:
+                liq_price = float(entry_price) * (1.0 + 1.0 / lev)
+        mark = float(mark_price or 0.0)
+        entry = float(entry_price or 0.0)
+        if mark <= 0 or entry <= 0 or liq_price <= 0:
+            return False, f"输入非法（mark={mark} entry={entry} liq={liq_price}），跳过强平距离判断"
+        # 方向决定『剩余安全距离』的计算方向
+        if side in (PositionSide.LONG, "LONG"):
+            # 多单：mark ↓ 到 liq_price → 爆仓。安全距离 = (mark - liq_price) / mark
+            if mark <= liq_price:
+                return True, f"🔥 强平触发：标记价 {mark:.2f} ≤ 强平价 {liq_price:.2f}，立即全平多单"
+            safety_dist_pct = (mark - liq_price) / max(mark, 1e-9) * 100
+        else:  # SHORT
+            # 空单：mark ↑ 到 liq_price → 爆仓。安全距离 = (liq_price - mark) / mark
+            if mark >= liq_price:
+                return True, f"🔥 强平触发：标记价 {mark:.2f} ≥ 强平价 {liq_price:.2f}，立即全平空单"
+            safety_dist_pct = (liq_price - mark) / max(mark, 1e-9) * 100
+        if safety_dist_pct < thr_pct:
+            return True, (
+                f"⚠️ 距强平价仅 {safety_dist_pct:.2f}% < 阈值 {thr_pct:.2f}% "
+                f"（mark={mark:.2f} liq={liq_price:.2f} side={side}），"
+                "为避免资金被 OKX 保险基金没收，主动触发全平"
+            )
+        return False, (
+            f"安全：距强平 {safety_dist_pct:.2f}% ≥ 阈值 {thr_pct:.2f}% "
+            f"（mark={mark:.2f} liq={liq_price:.2f} side={side}）"
+        )
+
+    # ------------------------------------------------------------------
+    # 2026-08-31 上实盘前硬化 #11.3：影子→实盘切换前自动扫场（cancel_all + close_all）
+    # ------------------------------------------------------------------
+    @staticmethod
+    async def safety_sweep_exchange_before_real_live(
+        *,
+        broker: object,
+        symbol: str,
+        shadow_mode: bool,
+    ) -> bool:
+        """切换到真实交易前做一次『清理挂单+残留仓位』，避免影子账本/实盘账本叠加。
+
+        安全规则：
+          - 影子模式（shadow_mode=True）：绝对不碰真实交易所（用户的真钱真单不能动）
+          - 实盘模式（shadow_mode=False）且发现 残留挂单/残留非空仓 → cancel_all + close_all
+          - 实盘但干净（无单+空仓） → 不做动作（返回 False）
+        Returns:
+            True = 实际执行了 sweep（cancel/close）
+        """
+        import logging as _lg
+        _log = _lg.getLogger("safety_sweep")
+        if shadow_mode:
+            _log.debug("[sweep] shadow_mode=True → 不触碰任何真实挂单/仓位（保护用户真实资产）")
+            return False
+        symbol = symbol or ""
+        pos = None
+        orders: list = []
+        try:
+            pos = await broker.get_position(symbol)
+        except Exception:  # noqa: BLE001
+            _log.warning("[sweep] 查询 position 失败，跳过（但仍尝试后续 cancel_all+close_all 兜底）")
+            pos = None
+        try:
+            orders = await broker.fetch_open_orders(symbol) or []
+        except Exception:  # noqa: BLE001
+            _log.warning("[sweep] 查询 open_orders 失败（继续尝试 cancel_all 兜底）")
+            orders = []
+
+        from ..core.constants import PositionSide as _PS3  # noqa: PLC0415
+        has_residual_pos = False
+        side_s = "FLAT"
+        if pos is not None:
+            side_s = str(getattr(pos, "side", "FLAT") or "FLAT")
+            sz = float(getattr(pos, "size", 0.0) or 0.0)
+            if side_s != _PS3.FLAT.value and sz > 0:
+                has_residual_pos = True
+        needs_sweep = has_residual_pos or len(orders) > 0
+        if not needs_sweep:
+            _log.info("[sweep] 交易所干净（空仓+无挂单）→ 无需扫场")
+            return False
+        # 必须扫场：先取消所有挂单 → 再平掉所有残留仓位
+        _log.warning(
+            "[sweep] 检测到残余 持仓=[side=%s size=%.4f] 挂单=%d 笔 → 自动 cancel_all + close_all",
+            side_s,
+            float(getattr(pos, "size", 0.0) or 0.0) if pos else 0.0,
+            len(orders),
+        )
+        ok_cancel = True
+        ok_close = True
+        if len(orders) > 0:
+            try:
+                await broker.cancel_all_orders(symbol)
+            except Exception as e:  # noqa: BLE001
+                ok_cancel = False
+                _log.exception("[sweep] cancel_all_orders 失败：%s", e)
+        if has_residual_pos:
+            try:
+                await broker.close_all_positions(symbol)
+            except Exception as e:  # noqa: BLE001
+                ok_close = False
+                _log.exception("[sweep] close_all_positions 失败：%s", e)
+        if ok_cancel and ok_close:
+            _log.warning("[sweep] 扫场完成：挂单已取消，残余仓位已平 → 启动主循环")
+        else:
+            _log.error(
+                "[sweep] 扫场部分失败：cancel_ok=%s close_ok=%s → 主循环仍启动（run.py 会再核持仓状态）",
+                ok_cancel, ok_close,
+            )
+        return True
+
+
+    # ------------------------------------------------------------------
     # 数据源：中文
     # ------------------------------------------------------------------
     def get_status_dict(self) -> dict[str, Any]:

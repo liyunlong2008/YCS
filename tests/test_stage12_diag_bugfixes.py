@@ -808,3 +808,143 @@ class Test_10_SleepByLiquidityNotUtc:
         assert dec.interval_s > 0
 
 
+# ============================================================================
+# ⑪ 上实盘前风控再硬化 3 条（实盘 14.83U 小本金必过）
+#   11.1 下单保证金 ≤ 可用 × 0.95（留 5% 给 taker 手续费/滑点，避免 OKX 直接拒）
+#   11.2 持仓距离强平价 < 10% → 主动全平（别把钱送给 OKX 保险基金）
+#   11.3 影子→实盘切换闸门（切换瞬间自动取消全部挂单+全平残留仓位，避免影子/实盘双开）
+# ============================================================================
+class Test_11_RiskHardeningForLiveReady:
+    """上实盘前的 3 条硬风控（用户核心诉求：把风控做好直接上实盘验证）。"""
+
+    # ----- 11.1 保证金 0.95 闸 -----
+    def test_11_1_margin_does_not_exceed_95pct_of_available(self):
+        """当 available=balance_total 时，sz_by_margin 只能使用可用资金的 95%，
+        其余 5% 预留给 taker 手续费/滑点，避免交易所层面『保证金不足』拒单。"""
+        from app.risk.engine import RiskEngine
+        from app.broker.base import MarketSpec
+        re = RiskEngine()
+        # 构造一个 ETH 永续规格：ctVal=0.01（OKX 实际） minSz=0.1 lotSz=0.1
+        spec = MarketSpec(
+            symbol="ETH-USDT-SWAP", source="unit-test",
+            ct_val=0.01, min_sz=0.1, lot_sz=0.1, max_sz=2000,
+            max_lever=125, min_notional_usdt=2.5, tick_sz=0.1,
+        )
+        entry = 2400.0  # ETH 现价
+        avail = 14.83   # 与 VPS 真余额一致
+        bal_total = 14.83
+        # check_can_open 是 async 函数 → 用 asyncio.run
+        import asyncio
+        v = asyncio.run(re.check_can_open(
+            balance_total=bal_total, balance_available=avail,
+            entry_price=entry, now_ts=1,
+            market_spec=spec,
+        ))
+        per_contract = 0.01 * entry  # = 24.0 U/张名义
+        # margin 每张 = per_contract / leverage (verify: 24/10 = 2.4U 保证金/张）
+        # 允许的最大 margin = avail * 0.95 = 14.0885U
+        # → sz_by_margin 上限 = 14.0885 / (24 / 10) = 5.87 张
+        # 如果仍然是旧 1.0 系数 → sz_margin=14.83/(24/10)=6.179 张（保证金占满，手续费会爆）
+        # 注意：sz_by_margin 未被 R 模型截断前会显示在 verdict 的字段里
+        raw_margin_pct_used = (v.sz_by_margin * per_contract / v.suggested_leverage) / max(avail, 1e-9)
+        assert raw_margin_pct_used <= 0.951, (
+            f"保证金占用超过 95%！sz_by_margin={v.sz_by_margin} "
+            f"margin每张={per_contract / v.suggested_leverage:.3f}U "
+            f"合计占用 {v.sz_by_margin * (per_contract / v.suggested_leverage):.3f}U / 可用 {avail}U "
+            f"= {raw_margin_pct_used*100:.2f}%"
+        )
+        # 且应该仍然能下到最小单（用户 14.83U 已经足够 min=2.5U 名义）
+        # 这里 sz 可能被 R 模型截断，但通过的话 sz 必须 ≥ 0.1
+        if v.allow:
+            assert v.suggested_size >= 0.1
+
+    def test_11_2_liquidation_proximity_triggers_close(self):
+        """『离强平价 ≤ 10%』要触发『必须主动平仓』判定（controller.is_liq_proximity_close）。
+        场景：ETH=2450 持多单 entry=2500 lev=10 → 强平价≈2275；现价 2310 → 距离 ≈ (2310-2275)/2275=1.54% < 10% → 必须主动平。"""
+        from app.core.constants import PositionSide
+        from app.services.controller import TradingController
+        # 不需全构造 TradingController：is_liq_proximity_close 是静态帮助函数
+        # 如果它是方法，直接用类函数签名调用即可
+        self._ensure_helper_exists()
+        entry_price = 2500.0
+        lev = 10
+        # 多头强制平仓价 ≈ entry*(1-1/lev) = 2500*0.9 = 2250（简化 OKX 模型）
+        liq_price = entry_price * (1 - 1.0/lev)
+        mark_price_very_close = liq_price * 1.03  # 涨 3% 离开强平 → 距离=(2317.5-2250)/2250=3% → <10%
+        must_close, reason = TradingController.is_liq_proximity_close(
+            PositionSide.LONG, mark_price=mark_price_very_close,
+            entry_price=entry_price, liq_price=liq_price, leverage=lev,
+        )
+        assert must_close is True, f"距离强平仅 3%，应主动平仓！{reason}"
+        assert "强平" in reason
+        # 安全场景：距离 20% → 不应触发
+        mark_safe = entry_price * 0.97  # 2425，距离 2250 = 175 → (2425-2250)/2250 ≈ 7.8%？再离远点
+        mark_safe = entry_price * 1.0   # 2500，正盈：(2500-2250)/2250≈11.1% → >10%
+        must_close2, _ = TradingController.is_liq_proximity_close(
+            PositionSide.LONG, mark_price=mark_safe,
+            entry_price=entry_price, liq_price=liq_price, leverage=lev,
+        )
+        assert must_close2 is False
+
+    def test_11_3_shadow_to_real_switch_safety_sweep(self):
+        """影子→实盘闸门：当 bootstrap_runtime 检测到『上一轮 state 有残留真实持仓/挂单 + 切到非影子模式』，
+        必须先自动 cancel_all_orders + close_all_positions 再启动主循环，避免 2 个账本叠加。"""
+        from types import SimpleNamespace
+        from app.core.constants import PositionSide
+        # 构造一个假 Broker 记录 cancel/close 是否被调用
+        class _SweepTrapBroker:
+            def __init__(self):
+                self.cancel_all_called = 0
+                self.close_all_called = 0
+                self._pos = SimpleNamespace(
+                    symbol="ETH-USDT-SWAP", side=PositionSide.LONG, size=0.5,
+                    entry_price=2400.0, mark_price=2450.0, leverage=10,
+                    unrealized_pnl=2.5, liquidation_price=2160.0,
+                )
+            async def get_position(self, symbol):
+                return self._pos
+            async def fetch_open_orders(self, symbol):
+                return [{"id":"fake"}]  # 残留挂单 → 触发闸
+            async def cancel_all_orders(self, symbol):
+                self.cancel_all_called += 1
+                return True
+            async def close_all_positions(self, symbol):
+                self.close_all_called += 1
+                return True
+        self._ensure_sweep_exists()
+        from app.services.controller import TradingController
+        brk = _SweepTrapBroker()
+        import asyncio
+        did = asyncio.run(
+            TradingController.safety_sweep_exchange_before_real_live(
+                broker=brk, symbol="ETH-USDT-SWAP", shadow_mode=False,
+            )
+        )
+        assert did is True  # 真执行过 sweep
+        assert brk.cancel_all_called >= 1, "残留挂单必须 cancel_all"
+        assert brk.close_all_called >= 1, "残留真实持仓必须 close_all"
+        # 场景 B：影子模式（shadow=True）→ 即使有残留也不闸（影子不发实盘），避免误操作用户实盘
+        brk2 = _SweepTrapBroker()
+        did2 = asyncio.run(
+            TradingController.safety_sweep_exchange_before_real_live(
+                broker=brk2, symbol="ETH-USDT-SWAP", shadow_mode=True,
+            )
+        )
+        assert did2 is False
+        assert brk2.cancel_all_called == 0, "影子模式不应碰用户真实挂单/仓位"
+        assert brk2.close_all_called == 0
+
+    # ----- helper exist checks (避免测试写了代码没补函数的假阳性通过) -----
+    def _ensure_helper_exists(self):
+        from app.services.controller import TradingController
+        assert hasattr(TradingController, "is_liq_proximity_close"), (
+            "TradingController.is_liq_proximity_close 静态方法未添加！"
+        )
+
+    def _ensure_sweep_exists(self):
+        from app.services.controller import TradingController
+        assert hasattr(TradingController, "safety_sweep_exchange_before_real_live"), (
+            "TradingController.safety_sweep_exchange_before_real_live 静态方法未添加！"
+        )
+
+

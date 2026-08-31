@@ -260,6 +260,30 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
         st_snap["started_at"] = int(_tb.time())
     state_store.save(st_snap)
 
+    # 6.6) 【2026-08-31 上实盘前硬化】影子→实盘切换闸门（safety_sweep）
+    # 注意：
+    #   - 若 broker 是 ShadowBroker（shadow_mode=True）：绝不能扫用户真实仓位，
+    #     ShadowBroker._inner 指向真实 OKX broker，也不能动它。
+    #   - 若 shadow_mode=False（真做实盘）：必须扫『真实 broker』的挂单/仓位，
+    #     有 broker._inner 就用 _inner（防止把 ShadowBroker 误传真进去导致扫影子账本没效果）。
+    if not cfg.trading.shadow_mode:
+        import asyncio as _aios
+        from app.services.controller import TradingController as _TC2
+        # 解析『真』broker：ShadowBroker(OKXBroker) → 取 _inner；裸 OKXBroker 则原样
+        real_broker = getattr(broker, "_inner", None) or broker
+        try:
+            _aios.get_event_loop().run_until_complete(
+                _TC2.safety_sweep_exchange_before_real_live(
+                    broker=real_broker,
+                    symbol=symbol,
+                    shadow_mode=False,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[sweep] 扫场异常（忽略，继续启动，主循环会再核真实仓位）")
+    else:
+        logger.info("[sweep] shadow_mode=True → 跳过交易所扫场（不触碰用户真实挂单/仓位）")
+
     # 7) 注入 FastAPI runtime
     app.state.runtime.update({
         "config": cfg,
@@ -358,6 +382,38 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
 
             # RUNNING 状态下做持仓利润保护（不控制空仓时还会额外扫）
             if st.get("status") == SystemStatus.RUNNING.value:
+                # ---- 2026-08-31 强平前主动平仓（优先级 HIGHEST，比利润保护更先判） ----
+                if has_pos:
+                    from app.services.controller import TradingController as _TC
+                    lev_here = int(getattr(pos, "leverage", 0) or 0)
+                    must_liq_close, liq_reason = _TC.is_liq_proximity_close(
+                        side=pos.side, mark_price=mark_price,
+                        entry_price=entry_price, liq_price=liq_price,
+                        leverage=lev_here,
+                    )
+                    if must_liq_close:
+                        logger.bind(log_type="trade").error(
+                            "[强平前主动平仓] {}", liq_reason
+                        )
+                        try:
+                            # 立即执行：取消挂单 → 全平
+                            await ctl.broker.cancel_all_orders(symbol)
+                            await ctl.broker.close_all_positions(symbol)
+                            logger.success("[强平前主动平仓] 全平完成 → 进入冷启动观察")
+                        except Exception:  # noqa: BLE001
+                            logger.exception("[强平前主动平仓] 平仓失败！立即尝试 kill 状态")
+                        # 强制设 HALT（不重启本步，下次进入 recoverer 再核）
+                        try:
+                            await ctl.kill_switch(reason=liq_reason[:200], caller="bg_main_loop:liq_proximity")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        st = state_store.load()
+                        st["status"] = SystemStatus.HALT.value
+                        state_store.save(st)
+                        # 本步直接 sleep 掉（下一轮从 recoverer / 人工重启恢复）
+                        await asyncio.sleep(loop_interval)
+                        continue
+                # --- 老的利润保护 ---
                 need_close, close_reason = pm.should_close_for_protection(pos)
                 if has_pos and need_close:
                     logger.bind(log_type="trade").warning("利润保护触发（主循环）：{}", close_reason)
