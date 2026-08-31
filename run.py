@@ -336,7 +336,23 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
             has_pos = pos.side != PositionSide.FLAT
             mark_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
             if mark_price <= 0:
-                mark_price = float((st.get("position") or {}).get("mark_price", 0.0) or 2466.0)
+                mark_price = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
+            # 2026-08-31：空仓时 pos.mark_price / state_store.position.mark_price 常为 0，
+            #   → 旧代码兜底 2466 写死 → 最小名义卡死 2.466U 不跟随现价（用户投诉点）。
+            #   现在先独立调 broker.get_ticker_price() 拉最新价，再做最后的兜底（兜底打 WARNING）。
+            if mark_price <= 0:
+                try:
+                    if hasattr(ctl.broker, "get_ticker_price") and callable(getattr(ctl.broker, "get_ticker_price")):
+                        _tp = await ctl.broker.get_ticker_price(symbol)
+                        if float(_tp or 0.0) > 0:
+                            mark_price = float(_tp)
+                except Exception:  # noqa: BLE001
+                    pass
+            if mark_price <= 0:
+                mark_price = 2466.0
+                logger.bind(log_type="trade").warning(
+                    "[MARK_PRICE] 拿不到真实现价，已兜底=2466（最小开仓名义=2.466U，注意不是实时！）"
+                    "请检查 broker ticker/position 接口能否正常拉取 ETH 现价")
             entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
             liq_price = float(getattr(pos, "liquidation_price", 0.0) or 0.0)
 

@@ -165,6 +165,20 @@ class Broker(ABC):
         默认实现返回 fallback 的 ETH-USDT-SWAP 默认值，供 PaperBroker / 测试兜底。"""
         return MarketSpec(symbol=(symbol or SYMBOL))
 
+    # 2026-08-31：新增；空仓时持仓 mark_price 常常为 0，需要一个独立的『当前最新市场价』读口。
+    #   用于 RiskEngine 最小开仓名义计算（用户吐槽最小名义卡 2.466U 不跟随现价）
+    #   以及 ShadowBroker 空仓时合成 Position 的 mark_price（否则 PnL 计算会错）。
+    async def get_ticker_price(self, symbol: Optional[str] = None) -> float:
+        """获取 symbol 的最新交易价 / 标记价（>0 有效）。失败 / 无数据时返回 0。
+
+        默认实现：尝试调 get_position(symbol).mark_price，失败则 0。
+        实盘子类应重写：ccxt.fetch_ticker.last / mark / bid-ask mid 等。"""
+        try:
+            p = await self.get_position((symbol or SYMBOL))
+            return float(getattr(p, "mark_price", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     # ------------------------------------------------------------------
     # 交易
     # ------------------------------------------------------------------

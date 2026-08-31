@@ -655,3 +655,61 @@ class Test_8_DynamicVolatilityIntervals:
         )
 
 
+# ============================================================================
+# Test_9_MinNotionalTracksCurrentPrice（用户反馈：最小名义永远=2.466U）
+#
+# 用户原话：「名义 2.466U ≥ min 2.466U 怎么一直是2.466 最小开仓不是根据现价定的吗
+#          比如现价2488 最小2.5」
+#   根因：run.py entry_price 兜底 2466 + last_verdict 快照不刷新 → 最小名义卡死。
+# ============================================================================
+class Test_9_MinNotionalTracksCurrentPrice:
+    def _mk_eng(self):
+        from app.risk.engine import RiskEngine
+        return RiskEngine()
+
+    def test_entry_price_2466_min_notional_equals_2dot466(self):
+        """ETH=2466 → 最小名义 = 0.1张 × 0.01ETH × 2466 = 2.466U（用户看到的旧值）。"""
+        import asyncio
+        from app.broker.base import MarketSpec
+        eng = self._mk_eng()
+        eng.daily_start_balance = 100.0
+        v = asyncio.run(eng.check_can_open(
+            balance_total=14.83, balance_available=14.83, entry_price=2466.0,
+            now_ts=1_750_000_000, market_spec=MarketSpec(),
+        ))
+        # 若允许：再单独按公式重算对照；若被拒绝也要保证最小名义跟随 entry_price
+        assert abs(v.effective_min_notional_usdt - 2.466) < 0.02, (
+            f"entry=2466 → 期望 min≈2.466U（0.1×0.01×2466），实际 {v.effective_min_notional_usdt}"
+        )
+
+    def test_entry_price_2488_min_notional_rises_to_2dot488(self):
+        """现价涨到 2488 → 最小名义必须同步涨到 ≈2.488U（不能还停留在旧 2.466U）。"""
+        import asyncio
+        from app.broker.base import MarketSpec
+        eng = self._mk_eng()
+        eng.daily_start_balance = 100.0
+        v = asyncio.run(eng.check_can_open(
+            balance_total=14.83, balance_available=14.83, entry_price=2488.0,
+            now_ts=1_750_000_001, market_spec=MarketSpec(),
+        ))
+        assert v.effective_min_notional_usdt >= 2.48, (
+            f"entry=2488 → 期望 min≥2.48U（0.1×0.01×2488=2.488），实际 {v.effective_min_notional_usdt}"
+            "（用户吐槽：永远 2.466=没跟随现价！）"
+        )
+        # 与 2.466 必须拉开：这里不能等于老值（断言差距 > 0.015U，避免浮点误差）
+        assert v.effective_min_notional_usdt - 2.466 > 0.015, (
+            f"entry=2488 必须比 entry=2466 的 min 名义大，实际差距={v.effective_min_notional_usdt - 2.466}"
+        )
+
+    def test_effective_min_notional_method_formula(self):
+        """MarketSpec.effective_min_notional(entry_price) 直接按现价计算。"""
+        from app.broker.base import MarketSpec
+        spec = MarketSpec()
+        m2466 = spec.effective_min_notional(2466.0)
+        m2488 = spec.effective_min_notional(2488.0)
+        assert 2.46 <= m2466 <= 2.48, f"2466 → {m2466}（期望≈2.466）"
+        assert 2.485 <= m2488 <= 2.50, f"2488 → {m2488}（期望≈2.488）"
+        # 两次必须不同（不能写成固定值）
+        assert abs(m2466 - m2488) > 0.01, "2466 vs 2488 得到相同最小名义→写死了常数不是联动现价！"
+
+

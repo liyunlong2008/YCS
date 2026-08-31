@@ -359,54 +359,9 @@ class TradingController:
                 "是否允许开仓": "是" if (self.risk.cooldown_until_ts == 0 or time.time() >= self.risk.cooldown_until_ts) and sys_status == SystemStatus.RUNNING else "否",
                 # 2026-08-30 新增：Dashboard 直读「最近一次风控结论/建议名义/缺口」，解决用户反馈的
                 #   '风控显示允许但实盘影子从启动至今没开仓' 的可观测黑盒
-                "最近一次风控": {
-                    "时间戳": (
-                        int(self.risk.last_verdict_at) if isinstance(getattr(self.risk, "last_verdict_at", 0), (int, float)) else 0
-                    ),
-                    "结论":
-                        "通过" if (
-                            self.risk.last_verdict is not None
-                            and bool(getattr(self.risk.last_verdict, "allow", False))
-                        ) else (
-                            "拒绝" if self.risk.last_verdict is not None else "未执行"
-                        ),
-                    "原因": (
-                        str(getattr(self.risk.last_verdict, "reason", ""))
-                        if self.risk.last_verdict is not None
-                        else "系统尚未发起风控评估（等下一轮主循环 10s 内）"
-                    ),
-                    "建议杠杆(X)":
-                        int(getattr(self.risk.last_verdict, "suggested_leverage", 0) or 0)
-                        if self.risk.last_verdict is not None else None,
-                    "建议名义价值(USDT)": round(
-                        float(getattr(self.risk.last_verdict, "suggested_notional_usdt", 0.0) or 0.0), 4
-                    ) if self.risk.last_verdict is not None else None,
-                    "最小名义(USDT)": round(
-                        float(getattr(self.risk.last_verdict, "effective_min_notional_usdt", 0.0) or 0.0), 4
-                    ) if self.risk.last_verdict is not None else None,
-                    "缺口本金(USDT)": (
-                        # 缺口 = 摸到最小单还需要补多少本金（= (min_notional - 当前目标名义)/leverage）
-                        round(max(0.0, (
-                            float(getattr(self.risk.last_verdict, "effective_min_notional_usdt", 0.0) or 0.0)
-                            - float(getattr(self.risk.last_verdict, "suggested_notional_usdt", 0.0) or 0.0)
-                        )) / max(1, int(getattr(self.risk.last_verdict, "suggested_leverage", 1) or 1)), 4)
-                        if (self.risk.last_verdict is not None and not bool(getattr(self.risk.last_verdict, "allow", False)))
-                        else None
-                    ),
-                    "AI_信号状态": (
-                        "不足(reg=%s conf=%s，≥50且TREND才开)" % (
-                            (ai_block.get("市场状态") or "?"),
-                            (ai_block.get("置信度") if isinstance(ai_block, dict) else 0),
-                        )
-                        if (not isinstance(ai_block, dict)
-                            or int(ai_block.get("置信度") or 0) < 50
-                            or (ai_block.get("市场状态") or "") in ("低波动", "震荡区间", "暂无"))
-                        else "到位: %s conf=%s" % (
-                            (ai_block.get("市场状态") or "?"),
-                            (ai_block.get("置信度") if isinstance(ai_block, dict) else 0),
-                        )
-                    ),
-                },
+                "最近一次风控": self._build_risk_snapshot(
+                    pos_mark_input, current_position_block, ai_block
+                ),
                 # 最近一次通过风控+AI双确认→进入下单流程的时间戳；=0 意味着从未准备下单
                 "最近一次交易信号就绪时间戳": int(getattr(self.risk, "last_pass_trade_signal_at", 0) or 0),
             },
@@ -489,6 +444,97 @@ class TradingController:
                 "附加信息": r.extra,
             })
         return out
+
+    # ------------------------------------------------------------------
+    # 2026-08-31：Dashboard『最近一次风控』快照 helper
+    #   - 用户反馈："最小名义永远 2.466U，现价 2488 应该 2.5U 左右"
+    #     根因：之前直接读 last_verdict.effective_min_notional_usdt（旧价格评估时的快照），
+    #           现价变了但 last_verdict 没刷新 → Dashboard 永远显示 2.466U。
+    #   - 修复：最小名义 / 现价最小名义（以当前 mark_price 重新计算）都展示，
+    #           且缺口本金以"现价联动最小名义"为准。
+    # ------------------------------------------------------------------
+    def _build_risk_snapshot(
+        self,
+        current_mark_price: float,
+        current_position_block: dict,
+        ai_block: Any,
+    ) -> dict[str, Any]:
+        lv = self.risk.last_verdict
+        lv_at = getattr(self.risk, "last_verdict_at", 0) or 0
+
+        # 1) 现价：current_position_block（broker 实时持仓）→ current_mark_price → last_verdict 时价 → 兜底 0
+        price_for_min = float(current_position_block.get("标记价", 0.0) or 0.0) if isinstance(current_position_block, dict) else 0.0
+        if price_for_min <= 0:
+            price_for_min = float(current_mark_price or 0.0)
+        # 如果有 last_verdict 且带 suggested_entry_price（暂时 RiskVerdict 里没有，先用老值兜底回推）
+        if price_for_min <= 0 and lv is not None:
+            # 从 old effective_min_notional 反推 ≈ 旧 entry_price（仅当公式有效时），再按公式不使用
+            try:
+                from ..broker.base import MarketSpec
+                _spec_guess = MarketSpec()
+                old_min = float(getattr(lv, "effective_min_notional_usdt", 0.0) or 0.0)
+                if old_min > 0:
+                    est = old_min / max(float(_spec_guess.min_sz or 0.1) * float(_spec_guess.ct_val or 0.01), 1e-12)
+                    if est > 0:
+                        pass  # 只估不填：还是等 broker 实时 ticker（避免继续卡旧价）
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 2) 取 spec（交易规则）+ config_min：优先用 broker 的（但 get_status_dict 是 sync，
+        #    没有 broker 就只能用默认 MarketSpec 兜底。run.py 会再用真 broker spec 覆盖，
+        #    这里 Dashboard 给一个"现价对照最小名义"方便排查"2.466 不更新"场景）。
+        from ..broker.base import MarketSpec  # noqa: PLC0415
+        try:
+            spec = MarketSpec()
+            cfg_rl = getattr(self.config, "risk_limits", None)
+            cfg_min = float(getattr(cfg_rl, "min_order_notional_usdt", 0) or 0.0) if cfg_rl else 0.0
+        except Exception:  # noqa: BLE001
+            spec = MarketSpec()
+            cfg_min = 0.0
+
+        old_min = float(getattr(lv, "effective_min_notional_usdt", 0.0) or 0.0) if lv is not None else 0.0
+        cur_min = spec.effective_min_notional(price_for_min, cfg_min) if price_for_min > 0 else old_min
+
+        suggested_notional = float(getattr(lv, "suggested_notional_usdt", 0.0) or 0.0) if lv is not None else 0.0
+        leverage = int(getattr(lv, "suggested_leverage", 1) or 1) if lv is not None else 1
+
+        # 缺口本金 = (当前联动现价的最小名义 - 建议名义) / 杠杆；仅当"风控拒绝且需要更多本金"时展示
+        gap_capital: float | None = None
+        if lv is not None and not bool(getattr(lv, "allow", False)) and cur_min > suggested_notional:
+            gap_capital = round(max(0.0, (cur_min - suggested_notional) / max(1, leverage)), 4)
+
+        return {
+            "时间戳": int(lv_at) if isinstance(lv_at, (int, float)) else 0,
+            "结论": (
+                "通过" if (lv is not None and bool(getattr(lv, "allow", False)))
+                else ("拒绝" if lv is not None else "未执行")
+            ),
+            "原因": (
+                str(getattr(lv, "reason", ""))
+                if lv is not None
+                else "系统尚未发起风控评估（等下一轮主循环 10s 内）"
+            ),
+            "建议杠杆(X)": int(getattr(lv, "suggested_leverage", 0) or 0) if lv is not None else None,
+            "建议名义价值(USDT)": round(suggested_notional, 4) if lv is not None else None,
+            # 最小名义：两条都展示，用户一眼就能判断是不是"没联动现价"
+            "最小名义(USDT)": round(old_min, 4) if lv is not None else None,
+            "最小名义_按现价(USDT)": round(cur_min, 4) if cur_min > 0 else None,
+            "现价参考(USDT)": round(price_for_min, 4) if price_for_min > 0 else None,
+            "缺口本金(USDT)": gap_capital,
+            "AI_信号状态": (
+                "不足(reg=%s conf=%s，≥50且TREND才开)" % (
+                    (ai_block.get("市场状态") or "?"),
+                    (ai_block.get("置信度") if isinstance(ai_block, dict) else 0),
+                )
+                if (not isinstance(ai_block, dict)
+                    or int(ai_block.get("置信度") or 0) < 50
+                    or (ai_block.get("市场状态") or "") in ("低波动", "震荡区间", "暂无"))
+                else "到位: %s conf=%s" % (
+                    (ai_block.get("市场状态") or "?"),
+                    (ai_block.get("置信度") if isinstance(ai_block, dict) else 0),
+                )
+            ),
+        }
 
     # ------------------------------------------------------------------
     # AI 节流 + 价格哨兵（新增 2026-08-30：7 级状态机自适应调用频率）

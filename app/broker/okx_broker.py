@@ -209,6 +209,34 @@ class OKXBroker(Broker):
             ))
         return out
 
+    # 2026-08-31：独立 ticker 价格（解决空仓时 get_position.mark_price=0 → 最小名义卡 2.466U 不跟随现价）。
+    #   优先级：ticker.last > mark_price > (bid+ask)/2。全失败才返回 0（交由上层兜底）。
+    async def get_ticker_price(self, symbol: Optional[str] = None) -> float:
+        """拉取 symbol 的最新成交价 / 标记价。失败返回 0。"""
+        key = symbol or self.symbol
+        ex = self._ensure_client()
+        try:
+            t = await ex.fetch_ticker(key)
+            if t:
+                last = float(t.get("last") or 0.0)
+                if last > 0:
+                    return last
+                mark = float(t.get("info", {}).get("markPx") or 0.0) if isinstance(t.get("info"), dict) else 0.0
+                if mark > 0:
+                    return mark
+                bid = float(t.get("bid") or 0.0)
+                ask = float(t.get("ask") or 0.0)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+        except Exception:  # noqa: BLE001
+            pass
+        # 再兜底：走 position 的 mark（若有持仓）
+        try:
+            p = await self.get_position(key)
+            return float(p.mark_price or 0.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     # ------------------------------------------------------------------
     # MarketSpec：交易所最小下单 / 面值 / 杠杆上限（2026-08-30 新增）
     # ------------------------------------------------------------------

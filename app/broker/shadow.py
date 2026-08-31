@@ -300,7 +300,21 @@ class ShadowBroker(Broker):
             real_pos: Position = await self._inner.get_position(symbol)
         except Exception:  # noqa: BLE001
             real_pos = Position(symbol=symbol)
-        mark_price = float(real_pos.mark_price or 0.0) or float(vpos.entry_price or 0.0)
+        # 2026-08-31 Bug Fix：空仓时 real_pos.mark_price 常为 0，vpos.entry_price 也为 0 → 两者都 0
+        #   → 最终 mark=0 → run.py 兜底死 2466 → 最小名义卡死 2.466U。
+        #   新增 3 级价格来源：先 ticker（最准）→ 再 real_pos.mark → 再 virtual entry（最后再 0 交给上层）。
+        mark_price = 0.0
+        try:
+            if hasattr(self._inner, "get_ticker_price") and callable(getattr(self._inner, "get_ticker_price")):
+                _tp = await self._inner.get_ticker_price(symbol)
+                if float(_tp or 0.0) > 0:
+                    mark_price = float(_tp)
+        except Exception:  # noqa: BLE001
+            pass
+        if mark_price <= 0:
+            mark_price = float(real_pos.mark_price or 0.0)
+        if mark_price <= 0:
+            mark_price = float(vpos.entry_price or 0.0)
         ct_val = self._ct_val(symbol)
         # 计算虚拟仓位的未实现盈亏 & 强平价
         unreal = 0.0
