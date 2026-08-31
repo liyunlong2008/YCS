@@ -37,4 +37,7 @@ def build_ai_provider(cfg: AIConfig, *, force_offline: bool = False) -> AIProvid
         api_key=cfg.api_key,
         model=cfg.model,
         base_url=cfg.base_url,
+        connect_timeout_s=int(getattr(cfg, "ai_connect_timeout_s", 0) or 0),
+        timeout_s=int(getattr(cfg, "ai_timeout_s", 0) or 0),
+        thinking_enabled=getattr(cfg, "ai_thinking_enabled", None),
     )
