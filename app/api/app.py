@@ -1579,22 +1579,12 @@ def create_app(
             else:
                 uptime_human = f"{s}s"
 
-        system_block: dict[str, Any] = {
-            "runtime_mode": mode_cn,
-            "started_at": started_at,
-            "started_at_local": started_at_local,
-            "uptime_seconds": uptime_seconds,
-            "uptime_human": uptime_human,
-            "pid": _os.getpid(),
-            "python_version": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
-            "version": version,
-            "cwd": str(_P.cwd()),
-            "platform": _sys.platform,
-            "live_max_equity_usdt": max_eq,
-            "live_max_daily_loss_usdt": max_daily_loss,
-        }
-        # 2026-08-30: 不开仓可观测：把最近风控结论/建议名义/缺口/双过时间戳写入 system（curl 粘贴直接可读）
-        # 2026-08-31 Bug D 修复：await 异步原生 aget_status_dict()，避免 nest_asyncio → uvloop reuse RuntimeError
+        # 2026-09-01 Bug A'/D' 修复：
+        #   /api/diag 必须先拿『ctl.aget_status_dict()』，它是 /api/status 的同一真源：
+        #   · 启动时间 started_at 必须=ctl.state_store（recoverer + run.py 写入），不能用 runtime.state_store 独立推算；
+        #   · 系统状态必须=ctl 读的 state_store.status（HALT/ERROR/RUNNING），不能漏；
+        #   · 风控 / AI / 最近持仓 全用 status_from_ctl 的中文结构，和 Dashboard 一致，避免两份逻辑分叉。
+        #  拿不到 ctl 才回退 runtime.state_store。
         status_from_ctl: dict[str, Any] | None = None
         if ctl is not None:
             _has_async = hasattr(ctl, "aget_status_dict") and callable(getattr(ctl, "aget_status_dict", None))
@@ -1605,6 +1595,71 @@ def create_app(
                     status_from_ctl = ctl.get_status_dict() or None
             except Exception:  # noqa: BLE001
                 status_from_ctl = None
+
+        # ---- 真源优先级：status_from_ctl（ctl 侧） >> ctl.state_store >> runtime state_store fallback ----
+        ctl_store_snapshot: dict[str, Any] = {}
+        if ctl is not None and hasattr(ctl, "state_store"):
+            try:
+                if hasattr(ctl.state_store, "load"):
+                    ctl_store_snapshot = ctl.state_store.load() or {}
+            except Exception:  # noqa: BLE001
+                ctl_store_snapshot = {}
+
+        # · started_at 真源链：ctl.aget_status_dict → ctl.state_store.started_at → 老逻辑 store.started_at 兜底
+        if isinstance(status_from_ctl, dict) and isinstance(status_from_ctl.get("启动时间戳(epoch秒)"), int) and int(status_from_ctl.get("启动时间戳(epoch秒)") or 0) > 0:
+            started_at = int(status_from_ctl["启动时间戳(epoch秒)"])
+        elif isinstance(ctl_store_snapshot.get("started_at"), int) and int(ctl_store_snapshot["started_at"]) > 0:
+            started_at = int(ctl_store_snapshot["started_at"])
+        elif isinstance(ctl_store_snapshot.get("started_at"), str):
+            try:
+                import datetime as _dt_m2
+                started_at = int(_dt_m2.datetime.strptime(ctl_store_snapshot["started_at"], "%Y-%m-%d %H:%M:%S").timestamp())
+            except Exception:  # noqa: BLE001
+                started_at = None
+        # 其余：保留原 started_at（从 runtime.state_store / fallback=time.time()）
+
+        # · uptime 重新算（保证和 started_at 配对，不显示 0s）
+        if isinstance(started_at, int) and started_at > 0:
+            uptime_seconds = max(0, int(_t.time()) - started_at)
+            try:
+                started_at_local = _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(started_at))
+            except Exception:  # noqa: BLE001
+                started_at_local = None
+            if uptime_seconds >= 0:
+                h, rem = divmod(uptime_seconds, 3600); m, s2 = divmod(rem, 60)
+                if h > 0: uptime_human = f"{h}h{m:02d}m{s2:02d}s"
+                elif m > 0: uptime_human = f"{m}m{s2:02d}s"
+                else: uptime_human = f"{s2}s"
+
+        # · 系统状态：status_from_ctl["系统状态"] 优先（ctl 真源：ZH_SYSTEM_STATUS 映射 → 含 HALT）
+        ctl_sys_status_cn: str | None = None
+        ctl_sys_status_raw: str | None = None
+        if isinstance(status_from_ctl, dict) and status_from_ctl.get("系统状态"):
+            ctl_sys_status_cn = str(status_from_ctl["系统状态"])
+        if isinstance(ctl_store_snapshot.get("status"), str) and ctl_store_snapshot["status"]:
+            ctl_sys_status_raw = str(ctl_store_snapshot["status"])
+
+        # runtime_mode：ctl 优先（shadow/live 标签已在 ctl 中处理）
+        if isinstance(status_from_ctl, dict) and status_from_ctl.get("运行模式"):
+            mode_cn = str(status_from_ctl["运行模式"])
+
+        system_block: dict[str, Any] = {
+            "runtime_mode": mode_cn,
+            "started_at": started_at,
+            "started_at_local": started_at_local,
+            "uptime_seconds": uptime_seconds,
+            "uptime_human": uptime_human,
+            "status_cn": ctl_sys_status_cn,
+            "status": ctl_sys_status_raw,
+            "pid": _os.getpid(),
+            "python_version": f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+            "version": version,
+            "cwd": str(_P.cwd()),
+            "platform": _sys.platform,
+            "live_max_equity_usdt": max_eq,
+            "live_max_daily_loss_usdt": max_daily_loss,
+        }
+        # 2026-08-30: 不开仓可观测：把最近风控结论/建议名义/缺口/双过时间戳写入 system（curl 粘贴直接可读）
         if isinstance(status_from_ctl, dict):
             rsk_ctl = status_from_ctl.get("风控状态") or {}
             if isinstance(rsk_ctl, dict):
@@ -1639,41 +1694,60 @@ def create_app(
                     system_block["ai_signal_status"] = (
                         f"到位[{regime} conf={conf}]" if signal_ok else f"不足[{regime or '暂无'} conf={conf}]"
                     )
-                    # 2026-08-31 修复：先判「当前是否真的空仓」，再决定是否输出 why_no_position
-                    #   (broker_block 还没 build，提前读一次 broker position 判断 has_pos)
-                    pos_snapshot = {"side": "FLAT", "size": 0.0, "entry_price": 0.0, "mark_price": 0.0,
-                                    "leverage": 1, "unrealized_pnl": 0.0}
-                    if ctl is not None and hasattr(ctl, "broker"):
-                        try:
-                            sym_check = (getattr(getattr(cfg, "trading", None), "symbol", None) if cfg else None) or "ETH-USDT-SWAP"
-                            p_tmp = await ctl.broker.get_position(sym_check)
-                            pos_snapshot = {
-                                "side": str(p_tmp.side.value) if hasattr(p_tmp.side, "value") else str(p_tmp.side),
-                                "size": float(p_tmp.size or 0.0),
-                                "entry_price": float(p_tmp.entry_price or 0.0),
-                                "mark_price": float(p_tmp.mark_price or 0.0),
-                                "leverage": int(getattr(p_tmp, "leverage", 1) or 1),
-                                "unrealized_pnl": float(getattr(p_tmp, "unrealized_pnl", 0.0) or 0.0),
-                            }
-                        except Exception:  # noqa: BLE001
-                            pass
-                    has_pos_now = pos_snapshot["side"] not in ("FLAT", None) and pos_snapshot["size"] > 0
-                    # 已持仓：why_no_position 直接显示「现有持仓概况」，不再误报「信号已发仍未持仓」
+                    # 2026-09-01 why_no_position 分支顺序（现场 HALT 不再误导）：
+                    #   1. 持仓 → 显示概况
+                    #   2. 系统非运行（HALT/STOPPED/ERROR/RECOVERING）→ 说明『停机保护/熔断/未启动』
+                    #   3. 风控拒绝 → 说明拒绝原因
+                    #   4. 风控通过+AI到位 → 信号应已发送（真的是在成交 / broker 侧故障时的提示）
+                    #   5. 风控通过 → 等 AI
+                    #   6. 风控未执行 → 启动中
+                    sys_status_now_raw = ctl_sys_status_raw or ""
+                    sys_status_now_cn = ctl_sys_status_cn or ""
+                    is_sys_not_running = (
+                        bool(sys_status_now_raw) and sys_status_now_raw not in ("RUNNING",)
+                    ) or ("停机" in sys_status_now_cn or "保护" in sys_status_now_cn or "停止" in sys_status_now_cn or "异常" in sys_status_now_cn)
+                    # has_pos：复用 status_from_ctl 的『当前持仓』（省一次 broker get_position 网络 IO）
+                    pos_block_sf = status_from_ctl.get("当前持仓") or {}
+                    has_pos_now = False
+                    if isinstance(pos_block_sf, dict) and pos_block_sf:
+                        has_pos_now = (
+                            str(pos_block_sf.get("方向") or "") not in ("空仓", "FLAT", "")
+                            and float(pos_block_sf.get("数量") or 0.0) > 0
+                        )
+                    side_cn = str(pos_block_sf.get("方向") or "空仓") if isinstance(pos_block_sf, dict) else "空仓"
+                    sz = float((pos_block_sf or {}).get("数量") or 0.0) if isinstance(pos_block_sf, dict) else 0.0
+                    ep = float((pos_block_sf or {}).get("开仓均价") or 0.0) if isinstance(pos_block_sf, dict) else 0.0
+                    mp = float((pos_block_sf or {}).get("标记价") or 0.0) if isinstance(pos_block_sf, dict) else 0.0
+                    lev = int((pos_block_sf or {}).get("杠杆") or 1) if isinstance(pos_block_sf, dict) else 1
+                    upl_p = float((pos_block_sf or {}).get("未实现盈亏") or 0.0) if isinstance(pos_block_sf, dict) else 0.0
                     if has_pos_now:
-                        side_cn = "多单(LONG)" if pos_snapshot["side"] in ("LONG",) else (
-                            "空单(SHORT)" if pos_snapshot["side"] in ("SHORT",) else str(pos_snapshot["side"])
-                        )
-                        upl_sgn = f"+{pos_snapshot['unrealized_pnl']:.4f}U" if pos_snapshot["unrealized_pnl"] >= 0 else f"{pos_snapshot['unrealized_pnl']:.4f}U"
+                        upl_sgn = f"+{upl_p:.4f}U" if upl_p >= 0 else f"{upl_p:.4f}U"
                         system_block["why_no_position"] = (
-                            f"✅ 已持仓 {pos_snapshot['size']:.1f} 张({side_cn})，成本 {pos_snapshot['entry_price']:.1f}$ / "
-                            f"现价 {pos_snapshot['mark_price']:.1f}$ / {pos_snapshot['leverage']}X / 浮盈亏 {upl_sgn}"
+                            f"✅ 已持仓 {sz:.1f} 张({side_cn})，成本 {ep:.1f}$ / "
+                            f"现价 {mp:.1f}$ / {lev}X / 浮盈亏 {upl_sgn}"
                         )
+                    elif is_sys_not_running:
+                        # 2026-09-01 现场：HALT 进入停机保护后，每一轮 /api/diag 都应明确告诉用户
+                        #   "为什么空仓？→ 因为系统不是 RUNNING，下单守卫 (status==RUNNING) 直接跳过。"
+                        reason_tokens: list[str] = []
+                        if sys_status_now_raw: reason_tokens.append(sys_status_now_raw)
+                        if sys_status_now_cn and sys_status_now_cn != sys_status_now_raw:
+                            reason_tokens.append(sys_status_now_cn)
+                        if "HALT" in (sys_status_now_raw or "") or "停机" in sys_status_now_cn or "保护" in sys_status_now_cn:
+                            reason_tokens.append("(上一交易日：强平前主动平仓 → 为避免继续亏损自动停机；次日会自动恢复 RUNNING，或手动 ycsctl resume)")
+                        elif sys_status_now_raw == "STOPPED" or "停止" in sys_status_now_cn:
+                            reason_tokens.append("(系统被手动 STOP；如需恢复请 ycsctl resume)")
+                        elif sys_status_now_raw == "ERROR" or "异常" in sys_status_now_cn:
+                            reason_tokens.append("(ERROR 路径进入；查 journalctl -u ycs 首条 ERROR 堆栈，并 ycsctl restart)")
+                        system_block["why_no_position"] = (
+                            "空仓原因：系统状态=" + " / ".join(reason_tokens) + "，未进入 RUNNING，bg_main_loop 『风控+AI+下单』分支（仅 status=RUNNING 时执行） 已跳过；等系统恢复 RUNNING 后再判信号。"
+                        )
+                    elif isinstance(last_r, dict) and last_r.get("结论") == "拒绝":
+                        system_block["why_no_position"] = "风控拒绝：" + (str(last_r.get("原因") or "")[:200])
                     elif isinstance(last_r, dict) and last_r.get("结论") == "通过" and signal_ok:
                         system_block["why_no_position"] = (
                             "风控+AI双过，信号应已发送；仍未持仓 → 查日志 grep '[主循环]' / '[开仓]' / 'SHADOW' / execute 结果"
                         )
-                    elif isinstance(last_r, dict) and last_r.get("结论") == "拒绝":
-                        system_block["why_no_position"] = "风控拒绝：" + (str(last_r.get("原因") or "")[:200])
                     elif isinstance(last_r, dict) and last_r.get("结论") == "通过":
                         system_block["why_no_position"] = f"风控通过(名义 {last_r.get('建议名义价值(USDT)')}U ≥ min {last_r.get('最小名义(USDT)')}U @ {last_r.get('建议杠杆(X)')}X)，等 AI信号到位或成交"
                     elif last_r.get("结论") == "未执行" if isinstance(last_r, dict) else True:

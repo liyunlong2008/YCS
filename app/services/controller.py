@@ -39,6 +39,7 @@ _ZH_SYSTEM_STATUS = {
     SystemStatus.STOPPED: "停止",
     SystemStatus.RECOVERING: "恢复中",
     SystemStatus.ERROR: "异常",
+    SystemStatus.HALT: "停机保护(HALT)",
 }
 _ZH_POSITION = {PositionSide.LONG: "做多", PositionSide.SHORT: "做空", PositionSide.FLAT: "空仓"}
 _ZH_ORDER_STATUS = {
@@ -1302,7 +1303,14 @@ class TradingController:
     def apply_daily_reset_if_needed(self, today: str | None = None) -> bool:
         """检测日期变化 → 触发 risk.recompute_daily_start_if_suspicious()；
         另外即便日期没切，也照样做一次 daily_start 异常值纠偏（防止 state.json 被旧值污染）。
-        返回 True 表示发生了 daily_start_balance 写入 / 或纠正动作。
+
+        2026-09-01 增强两条：
+          1) **不碰 run_until_complete**：若检测到已有 running event loop（bg_main_loop / FastAPI 调进来），
+             broker.get_balance 取不到就直接跳过（留 state_store.balance 兜底），避免 uvloop 下
+             『cannot reuse already awaited coroutine』风暴；
+          2) **下一交易日自动恢复 HALT → RUNNING**：现场 05:01 强平前主动平仓后写 HALT，
+             到 UTC+8 次日 00:00（北京时间新交易日）自动切回 RUNNING，不需要用户手动 ycsctl resume。
+        返回 True 表示发生了 daily_start_balance 写入 / 或纠正动作 / 或跨日自动恢复。
         """
         import datetime as _dt
         import logging as _logging
@@ -1311,12 +1319,22 @@ class TradingController:
         last_day = st.get("daily_reset_day")
         day_match = bool(last_day) and str(last_day) == str(today)
         bal_total = float((st.get("balance") or {}).get("total", 0.0))
-        if bal_total <= 0:
+        if bal_total <= 0 and self.broker is not None:
             try:
-                import asyncio as _aio
-                bal = _aio.get_event_loop().run_until_complete(self.broker.get_balance())
-                bal_total = float(getattr(bal, "total", 0.0) or 0)
-            except Exception:
+                import asyncio as _aio_safe
+                try:
+                    _aio_safe.get_running_loop()
+                    in_loop = True
+                except RuntimeError:
+                    in_loop = False
+                if in_loop:
+                    # 有 running loop：绝对不用 run_until_complete（会触发 RuntimeError: reuse coroutine），
+                    # bal_total 留 0，recompute_daily_start_if_suspicious 内部会走"state_store 兜底或等下一轮刷新"。
+                    pass
+                else:
+                    bal = _aio_safe.run(self.broker.get_balance())
+                    bal_total = float(getattr(bal, "total", 0.0) or 0)
+            except Exception:  # noqa: BLE001
                 bal_total = 0.0
         reset, reason = self.risk.recompute_daily_start_if_suspicious(
             bal_total,
@@ -1327,11 +1345,33 @@ class TradingController:
         st["daily_reset_day"] = today
         # 风控状态回写（daily_start_balance 若被 reset 时已经在 risk 对象里改了）
         st.setdefault("risk", {}).update(self.risk.to_dict())
+
+        # 2026-09-01：跨日切自动解除 HALT / ERROR_STOP → RUNNING
+        # 理由：强平保护是"当日紧急止损"，新交易日资金/风控/盈亏都归零，理应自动恢复交易循环，
+        # 否则用户睡一觉起来发现系统仍 HALT 一整天空仓，错过开盘行情。
+        auto_resumed = False
+        if not day_match:
+            old_status = st.get("status") or ""
+            if old_status in (SystemStatus.HALT.value,):
+                st["status"] = SystemStatus.RUNNING.value
+                auto_resumed = True
+                # 清除强平前主动平仓的 60s 冷却时间戳，避免新交易日首轮还被冷却挡住
+                st.pop("_liq_close_last_fail_ts", None)
+            elif old_status in (SystemStatus.ERROR.value,):
+                # ERROR：若用户没人工介入，跨日也至少切回 RECOVERING，不再卡死
+                st["status"] = SystemStatus.RECOVERING.value
+                auto_resumed = True
+
         self.state_store.save(st)
         _logger = _logging.getLogger(__name__)
-        if reset:
-            _logger.info("[日切点] %s", reason)
+        if auto_resumed:
+            _logger.info(
+                "[日切点] 新交易日(%s) 状态自动恢复：%s → %s（强平保护/停机保护只作用到当日收盘）",
+                today, old_status, st.get("status"),
+            )
+        if reset or auto_resumed:
+            _logger.info("[日切点] %s%s", reason, f"；HALT→RUNNING 自动恢复" if auto_resumed else "")
         else:
             # 日期未切且无需纠偏 → TRACE，避免刷屏
             _logger.debug("[日切点] %s", reason)
-        return reset or not day_match
+        return reset or auto_resumed or not day_match
