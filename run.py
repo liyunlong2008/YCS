@@ -266,18 +266,21 @@ async def bootstrap_runtime(app) -> dict[str, Any]:
     #     ShadowBroker._inner 指向真实 OKX broker，也不能动它。
     #   - 若 shadow_mode=False（真做实盘）：必须扫『真实 broker』的挂单/仓位，
     #     有 broker._inner 就用 _inner（防止把 ShadowBroker 误传真进去导致扫影子账本没效果）。
-    if not cfg.trading.shadow_mode:
-        import asyncio as _aios
+    # 2026-08-31 修：shadow_mode 在 cfg.risk_limits.shadow_mode（NOT cfg.trading.*，
+    #   之前错路径会抛 AttributeError → on_startup 直接崩 → 进程退出 code=1，
+    #   现场日志表现：日切完成后立刻炸「on_startup 回调异常」）。
+    # 2026-08-31 再修：在 async lifespan 里绝不能 .run_until_complete(已 running loop 报错)，
+    #   直接 await 即可（bootstrap_runtime 本身就是 async）。
+    _shadow = bool(getattr(cfg.risk_limits, "shadow_mode", False))
+    if not _shadow:
         from app.services.controller import TradingController as _TC2
         # 解析『真』broker：ShadowBroker(OKXBroker) → 取 _inner；裸 OKXBroker 则原样
         real_broker = getattr(broker, "_inner", None) or broker
         try:
-            _aios.get_event_loop().run_until_complete(
-                _TC2.safety_sweep_exchange_before_real_live(
-                    broker=real_broker,
-                    symbol=symbol,
-                    shadow_mode=False,
-                )
+            await _TC2.safety_sweep_exchange_before_real_live(
+                broker=real_broker,
+                symbol=symbol,
+                shadow_mode=False,
             )
         except Exception:  # noqa: BLE001
             logger.exception("[sweep] 扫场异常（忽略，继续启动，主循环会再核真实仓位）")

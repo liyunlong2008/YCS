@@ -1,19 +1,20 @@
 {
-  "status": "ERROR",
-  "started_at": null,
+  "status": "RUNNING",
+  "started_at": 1788177508,
   "balance": {
     "total": 1000.0,
     "available": 1000.0,
-    "unrealized_pnl": 0.0,
-    "currency": "USDT"
+    "unrealized_pnl": 0.0
   },
   "position": {
+    "symbol": "ETH-USDT-SWAP",
     "side": "FLAT",
     "size": 0.0,
     "entry_price": 0.0,
     "mark_price": 2000.0,
+    "unrealized_pnl": 0.0,
     "leverage": 3,
-    "unrealized_pnl": 0.0
+    "liquidation_price": 0.0
   },
   "last_ai": {
     "market_regime": "LOW_VOLATILITY",
@@ -24,7 +25,8 @@
   "risk": {
     "consecutive_losses": 0,
     "cooldown_until_ts": 0,
-    "daily_start_balance": 1000.0
+    "daily_start_balance": 1000.0,
+    "known_order_ids": []
   },
   "stats": {
     "trades_total": 0,
@@ -61,5 +63,24 @@
     "last_sync_at": 1787962159,
     "drifted_pause": false
   },
-  "daily_reset_day": "2026-08-29"
+  "daily_reset_day": "2026-08-31",
+  "ai_throttler": {
+    "last_call_ts": 0,
+    "next_call_ts": 0,
+    "level": "NORMAL",
+    "last_reason": "初始化",
+    "consec_failures": 0,
+    "consec_success": 0,
+    "daily_call_count": 0,
+    "daily_cost_usdt": 0.0,
+    "daily_date": "2026-08-31",
+    "sentinel_mark_price": 2466.0,
+    "sentinel_anchor_ts": 1788177508,
+    "last_event_pct": 0.0,
+    "last_event_at": 0,
+    "daily_early_wakes": 0,
+    "last_spread_pct": 0.0,
+    "last_volume_1m": 0.0,
+    "last_liq_score": 0
+  }
 }

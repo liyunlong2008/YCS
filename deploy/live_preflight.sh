@@ -204,9 +204,9 @@ if [ "$fail" -eq 0 ]; then
   echo "  → 切实盘 4 步："
   echo "    1. cd $ROOT"
   echo "    2. ycsctl stop"
-  echo "    3. vim config.yaml → trading.shadow_mode: false"
-  echo "       * 同时确认 trading.live: true；OKX API Key/Secret/Passphrase 均为真实非占位值"
-  echo "       * 『第一手真单建议』先把 trading.default_leverage 压到 2X~3X 跑 12 小时，观察无异常再回 5X~10X"
+  echo "    3. vim config.yaml → risk_limits.shadow_mode: false
+       * 同时确认 trading.live: true；OKX API Key/Secret/Passphrase 均为真实非占位值
+       * 『第一手真单建议』先把 trading.default_leverage 压到 2X~3X 跑 12 小时，观察无异常再回 5X~10X"
   echo "    4. ycsctl start   (扫场闸门自动 cancel_all + close_all 残留，然后进入 RUNNING)"
   echo
   echo "  → 切实盘后第一小时监控："
