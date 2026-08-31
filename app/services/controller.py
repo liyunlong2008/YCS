@@ -538,11 +538,28 @@ class TradingController:
 
     # ------------------------------------------------------------------
     # 流动性输入抓取（2026-08-31：SLEEP 按流动性不按 UTC；缺任何字段返回 0，节流端自动退化兼容）
+    # 2026-08-31 优化：带 30s TTL 实例缓存。背景：
+    #   bg_main_loop 的同一 10s 周期里，should_analyze() → 若过节流则 analyze()
+    #   两边都调 _fetch_liq_inputs()，导致同一 ticker/ohlcv 在毫秒级间隔里被抓 2 次。
+    #   而 1m OHLCV 每 60s 才变一次、买卖价差 30s 内也不会从"极窄"翻成"极宽"，
+    #   所以 30s TTL 缓存安全，HOT 档（每 10s 调 AI）节省 50% 的网络 REST 往返。
     # ------------------------------------------------------------------
-    async def _fetch_liq_inputs(self) -> tuple[float, float, float]:
+    async def _fetch_liq_inputs(self, *, force_refresh: bool = False, _ttl_s: int = 30):
         """返回 (bid_price, ask_price, recent_volume_contracts_1m)。失败=0。
         只做 best-effort，不抛异常（AI 节流在输入为 0 时走更宽松的旧判定，不会 SLEEP 误杀）。
+
+        Args:
+            force_refresh: True 跳过缓存（手动分析接口要精确最新数据时传）。
+            _ttl_s: 缓存有效期秒数（默认 30s，平衡时效性与网络开销）。
         """
+        import time as _t
+        now = int(_t.time())
+        cache = getattr(self, "_liq_inputs_cache", None)
+        if (not force_refresh
+            and isinstance(cache, tuple) and len(cache) == 4
+            and int(cache[0]) + int(_ttl_s) > now):
+            # cache = (ts, bid, ask, vol1m)
+            return (float(cache[1]), float(cache[2]), float(cache[3]))
         bid = 0.0; ask = 0.0; vol_1m = 0.0
         sym = self.config.trading.symbol
         try:
@@ -552,6 +569,7 @@ class TradingController:
             if hasattr(bkr, "_inner") and getattr(bkr, "_inner", None) is not None:
                 bkr = bkr._inner  # type: ignore[assignment]
             tkr: Any = None
+            ex: Any = None
             if hasattr(bkr, "_ensure_client") and callable(getattr(bkr, "_ensure_client", None)):
                 try:
                     ex = bkr._ensure_client()  # type: ignore[attr-defined]
@@ -577,7 +595,13 @@ class TradingController:
                         vol_1m = max(1.0, vol_24h / 1440.0)
         except Exception:  # noqa: BLE001
             pass
-        return float(bid), float(ask), float(vol_1m)
+        bid = float(bid); ask = float(ask); vol_1m = float(vol_1m)
+        # 写缓存（即便是 0 结果也缓存，避免网络重试刷屏）
+        try:
+            self._liq_inputs_cache = (now, bid, ask, vol_1m)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        return bid, ask, vol_1m
 
     # ------------------------------------------------------------------
     # AI 节流 + 价格哨兵（新增 2026-08-30：7 级状态机自适应调用频率）
@@ -663,7 +687,18 @@ class TradingController:
         return dec
 
     # ------------------------------------------------------------------
-    async def analyze(self, force: bool = False) -> dict[str, Any]:
+    async def analyze(
+        self,
+        force: bool = False,
+        *,
+        # 2026-08-31 性能优化：bg_main_loop 同一 10s 轮次已经抓过 position 了，直接透传省一次 broker REST。
+        #   传 None / 0 / False = 未知，内部自动查 broker（兼容旧调用方 / 手动触发 API）。
+        preloaded_pos: object = None,
+        preloaded_mark_price: float = 0.0,
+        preloaded_entry_price: float = 0.0,
+        preloaded_liq_price: float = 0.0,
+        preloaded_has_position: Optional[bool] = None,
+    ) -> dict[str, Any]:
         """拉行情 → 调 AI → 记录节流状态 → 返回中文展示。
 
         - force=True 绕过节流（价格哨兵早叫 / API 手动触发）；
@@ -674,17 +709,37 @@ class TradingController:
         now_ts = int(time.time())
 
         # 1) 节流决策（哪怕 force=True 也要跑一遍，以持久化 early_wake 统计）
+        # 2026-08-31 优化：bg_main_loop 已经抓过 pos/mark/entry/liq → 直接复用，避免同 10s 重复 REST
         mark_price = 0.0
         has_pos = False
         entry = 0.0; liq = 0.0
-        try:
-            pos = await self.broker.get_position(self.config.trading.symbol)
-            mark_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
-            has_pos = pos.side != PositionSide.FLAT
-            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
-            liq = float(getattr(pos, "liquidation_price", 0.0) or 0.0)
-        except Exception:  # noqa: BLE001
-            pos = None  # type: ignore[assignment]
+        pos = preloaded_pos
+        if preloaded_has_position is not None:
+            has_pos = bool(preloaded_has_position)
+        if float(preloaded_mark_price or 0.0) > 0:
+            mark_price = float(preloaded_mark_price)
+        if float(preloaded_entry_price or 0.0) > 0:
+            entry = float(preloaded_entry_price)
+        if float(preloaded_liq_price or 0.0) > 0:
+            liq = float(preloaded_liq_price)
+        # 预加载的数据不全时，才真正调 broker.get_position()（手动 API / 利润保护平仓后的数据刷新场景）
+        _need_broker_pos = (
+            (pos is None)
+            or (preloaded_has_position is None)
+            or (mark_price <= 0)
+        )
+        if _need_broker_pos:
+            try:
+                pos = await self.broker.get_position(self.config.trading.symbol)
+                mark_price = float(getattr(pos, "mark_price", 0.0) or 0.0)
+                from ..core.constants import PositionSide as _PS2  # noqa: PLC0415
+                has_pos = (pos.side != _PS2.FLAT)
+                if entry <= 0:
+                    entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+                if liq <= 0:
+                    liq = float(getattr(pos, "liquidation_price", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                pos = None  # type: ignore[assignment]
         st_dec = self.state_store.load()
         self.ai_throttler.load_from(st_dec)
         status_raw = (st_dec.get("status") or "") if isinstance(st_dec, dict) else ""

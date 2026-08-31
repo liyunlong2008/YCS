@@ -389,7 +389,16 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
             else:
                 # ===== 真正调 AI：force=dec.early_wake 以标记 early_wake 模式 =====
                 try:
-                    await ctl.analyze(force=dec.early_wake)
+                    # 2026-08-31 性能优化：把本循环开头抓的 pos/mark/entry/liq/has_pos 原样透传，
+                    #   省掉 analyze() 内部重复 broker.get_position() 的网络往返。
+                    await ctl.analyze(
+                        force=dec.early_wake,
+                        preloaded_pos=pos,
+                        preloaded_mark_price=mark_price,
+                        preloaded_entry_price=entry_price,
+                        preloaded_liq_price=liq_price,
+                        preloaded_has_position=has_pos,
+                    )
                 except Exception:
                     logger.exception("AI 分析异常（跳过本轮开仓）")
 
@@ -397,9 +406,12 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
             # 4) 空仓 + RUNNING + allow_trading → 风控 → 下单
             #    （AI 没调过时用 ctl._last_ai 上一次结果，仍然合规）
             # ------------------------------------------------------------
+            bal_reusable: Any = None  # 2026-08-31 余额刷新节流：风控前查过 bal，末尾 state 同步时直接复用
+            _round_opened_trade = False  # True=本轮执行了下单 → 余额/持仓快照必须刷新不能复用
             if (not has_pos) and st.get("status") == SystemStatus.RUNNING.value:
                 last_ai = ctl._last_ai
                 bal = await ctl.broker.get_balance()
+                bal_reusable = bal  # ← 保存引用，末尾 L493 处先尝试用这个（省 1 次 REST）
                 # entry_price 计算（沿用原有优先级：mark_price→state→market_producer→兜底）
                 e_price = mark_price
                 if e_price <= 0:
@@ -470,6 +482,7 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                             ai=last_ai, verdict=verdict,
                             entry_price=e_price, market_side=market_side,
                         )
+                        _round_opened_trade = True  # 下单后余额/持仓快照必须查新的（margin 会锁、available 会变）
                         logger.success("[主循环] execute 结果: status={} via={} qty={:.6f} 原因={}",
                                        exec_res["status"], exec_res["via"],
                                        exec_res["qty"], exec_res["reason"])
@@ -482,7 +495,11 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
             st.setdefault("position_manager", {}).update(pm.to_dict())
             # 最新余额刷新（FastAPI status 展示取 state 的余额快照会用）
             try:
-                bal2 = await ctl.broker.get_balance()
+                # 2026-08-31 余额刷新节流：风控前已查过 bal_reusable && 本轮没下单 → 直接复用省 REST
+                if bal_reusable is not None and (not _round_opened_trade):
+                    bal2 = bal_reusable
+                else:
+                    bal2 = await ctl.broker.get_balance()
                 st["balance"] = {
                     "total": float(bal2.total or 0),
                     "available": float(bal2.available or 0),
