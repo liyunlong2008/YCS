@@ -45,6 +45,7 @@ class SystemStatus(str, Enum):
     STOPPED = "STOPPED"       # 已停止
     RECOVERING = "RECOVERING" # 恢复中
     ERROR = "ERROR"           # 异常
+    HALT = "HALT"             # 停机保护：强平前主动平仓 / 紧急 kill 后进入，recoverer 需人工确认或重启
 
 
 class RunMode(str, Enum):

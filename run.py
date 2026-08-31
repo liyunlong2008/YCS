@@ -410,9 +410,21 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                             await ctl.kill_switch(reason=liq_reason[:200], caller="bg_main_loop:liq_proximity")
                         except Exception:  # noqa: BLE001
                             pass
-                        st = state_store.load()
-                        st["status"] = SystemStatus.HALT.value
-                        state_store.save(st)
+                        # 2026-08-31 修：st.status = HALT 也必须包住；
+                        #   之前 SystemStatus 枚举缺 HALT 时这行直接抛 AttributeError，
+                        #   把整个 bg_main_loop 崩掉（journal/error.log 连打 traceback）。
+                        try:
+                            st = state_store.load()
+                            st["status"] = SystemStatus.HALT.value
+                            state_store.save(st)
+                        except Exception:  # noqa: BLE001
+                            logger.exception("[强平前主动平仓] 写 HALT 状态失败，退化写 ERROR")
+                            try:
+                                st = state_store.load()
+                                st["status"] = SystemStatus.ERROR.value
+                                state_store.save(st)
+                            except Exception:  # noqa: BLE001
+                                pass
                         # 本步直接 sleep 掉（下一轮从 recoverer / 人工重启恢复）
                         await asyncio.sleep(loop_interval)
                         continue
