@@ -479,6 +479,17 @@ class TradingController:
                 uptime_s = 0
                 uptime_human = "0s"
 
+        # 2026-08-31：先算一遍 risk_snapshot，既供"风控状态.最近一次风控"，
+        # 又供 Dashboard 顶层直读的 3 个字段（避免 JS 再 drill 3 层 dict）。
+        risk_snapshot_dict = self._build_risk_snapshot(
+            pos_mark_input, current_position_block, ai_block
+        )
+        # AI 节流级别：throttle_block["节流级别"] 一定非空（AIThrottler 默认 NORMAL）
+        ai_throttle_level_cn = str(throttle_block.get("节流级别") or "NORMAL")
+        # 最近风控结论/原因：优先读 risk_snapshot_dict 的"结论/原因"
+        last_risk_conclusion = str(risk_snapshot_dict.get("结论") or "未执行")
+        last_risk_reason = str(risk_snapshot_dict.get("原因") or "系统尚未发起风控评估")
+
         return {
             "运行模式": mode_cn,
             "系统状态": _ZH_SYSTEM_STATUS.get(sys_status, str(status_raw)),
@@ -493,6 +504,11 @@ class TradingController:
             "盈利次数": stats.get("wins", 0),
             "亏损次数": stats.get("losses", 0),
             "累计收益率(%)": round(float(stats.get("total_pnl_pct") or 0), 2),
+            # 2026-08-31 顶层展开 3 个常用字段：Dashboard JS refresh() 直接读，
+            # 避免之前"嵌套只读 '—'"的 VPS 现场 Bug（test_vps_bugs_0831.py test_B）。
+            "最近风控结论": last_risk_conclusion,
+            "最近风控原因": last_risk_reason,
+            "AI节流级别": ai_throttle_level_cn,
             "最近AI判断": ai_block,
             "AI节流状态": throttle_block,
             "时间同步状态": time_sync_block,
@@ -502,9 +518,7 @@ class TradingController:
                 "是否允许开仓": "是" if (self.risk.cooldown_until_ts == 0 or time.time() >= self.risk.cooldown_until_ts) and sys_status == SystemStatus.RUNNING else "否",
                 # 2026-08-30 新增：Dashboard 直读「最近一次风控结论/建议名义/缺口」，解决用户反馈的
                 #   '风控显示允许但实盘影子从启动至今没开仓' 的可观测黑盒
-                "最近一次风控": self._build_risk_snapshot(
-                    pos_mark_input, current_position_block, ai_block
-                ),
+                "最近一次风控": risk_snapshot_dict,
                 # 最近一次通过风控+AI双确认→进入下单流程的时间戳；=0 意味着从未准备下单
                 "最近一次交易信号就绪时间戳": int(getattr(self.risk, "last_pass_trade_signal_at", 0) or 0),
             },
