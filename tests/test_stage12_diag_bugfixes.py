@@ -568,3 +568,90 @@ class Test_7_DashboardConsistencyAfterAug31Fixes:
             f"ShadowBroker SHORT 持仓 mark_price={pos.mark_price} = 0，Dashboard 现价显示 0.00 是乱码 Bug D"
         )
 
+
+# ============================================================================
+# Test_8_20260831_VolatilityBasedIntervals（用户反馈：固定节流会错过行情）
+#
+# 用户原话：「固定时间节流不合适吧 偶尔会错过 应该根据行情」
+#   期望行为：
+#   A) NORMAL 档位下，近 1m 波动越大 → 间隔要越短（例如 event_pct=1.8% → interval ≤ 60s*0.6=36s）
+#   B) 横盘 event_pct<0.2% → 间隔要主动拉长（≤2×基础档），省 AI 成本
+#   C) UTC 0-6 亚洲深夜(SLEEP)，也要保留「行情波动 ≥1% 就早叫」的口子，
+#      不能像旧逻辑：SLEEP 只认 big_event_1m_pct(2%) → 1.8% 急跌就错过（用户痛点）
+# ============================================================================
+class Test_8_DynamicVolatilityIntervals:
+    def _mk_throttler_at(self, utc_hour: int):
+        """构造一个 AIThrottler，并把 sentinel 锚定到基准价=2000，返回 (thr, base_ts)。"""
+        from app.core.ai_throttle import AIThrottler
+        import time as _t, calendar as _cal
+        # 2025-01-01 {utc_hour}:00:00 UTC 的时间戳（calendar.timegm 纯 UTC，不受本地时区影响）
+        base_ts = _cal.timegm((2025, 1, 1, utc_hour, 0, 0))
+        assert _t.gmtime(base_ts).tm_hour == utc_hour, (
+            f"测试工具 bug：造出的 ts gmtime.hour={_t.gmtime(base_ts).tm_hour}，期望 {utc_hour}"
+        )
+        thr = AIThrottler()
+        # 预填锚定价(基准=2000) & 锚定时间戳
+        thr.state.sentinel_mark_price = 2000.0
+        thr.state.sentinel_anchor_ts = base_ts - 30  # 30s 前（1m 窗口内）
+        thr.state.last_call_ts = base_ts - 120  # 预热：不是 cold_start
+        thr.state.next_call_ts = 0  # 保证新轮决策
+        return thr, base_ts
+
+    # ---- (A) 高波动 → 更短间隔 ----
+    def test_normal_high_volatility_shortens_interval(self):
+        """NORMAL 档位 + event_pct≈1.85% → 间隔必须 < 60s，明显比横盘短。
+        旧代码：永远 60s = 固定，必然错过。"""
+        from app.core.ai_throttle import ThrottleLevel
+        thr, now = self._mk_throttler_at(utc_hour=12)  # UTC 白天 → 不命中 SLEEP
+        # mark=2037 → vs 2000 anchor → event=1.85%
+        dec = thr.should_call_ai(
+            now_ts=now, system_status_running=True, allow_trading=True,
+            has_position=False, mark_price=2037.0, entry_price=0,
+        )
+        assert dec.level == ThrottleLevel.NORMAL, (
+            f"空仓 running 场景应该是 NORMAL（没到 3% HOT 档），实际 {dec.level}"
+        )
+        base_60s = 60
+        assert int(dec.interval_s) <= int(base_60s * 0.65), (
+            f"event=1.85% 应当明显缩短(≤{base_60s*0.65:.0f}s)，实际 interval={dec.interval_s}s（用户吐槽：固定时间节流错过行情）"
+        )
+        # 决策要给出「为什么是 Xs」的理由（给 Dashboard 解释用）
+        assert "动态" in dec.reason or "波动" in dec.reason, (
+            f"reason 必须含「动态/波动」字样来解释为什么缩短了 interval：{dec.reason!r}"
+        )
+
+    # ---- (B) 横盘 → 更长间隔（省成本） ----
+    def test_normal_sideways_lengthens_interval(self):
+        """NORMAL 档位 + event_pct≈0.05%（横盘）→ 间隔要主动拉长到 >60s。"""
+        thr, now = self._mk_throttler_at(utc_hour=12)
+        # mark=2001 → event=0.05%（几乎横盘）
+        dec = thr.should_call_ai(
+            now_ts=now, system_status_running=True, allow_trading=True,
+            has_position=False, mark_price=2001.0, entry_price=0,
+        )
+        base_60s = 60
+        assert int(dec.interval_s) > int(base_60s), (
+            f"横盘 0.05% 应当拉长间隔(>{base_60s}s)，实际 interval={dec.interval_s}s（旧固定 60s=浪费 AI 成本）"
+        )
+
+    # ---- (C) SLEEP 窗 1.8% 也必须早叫（旧版只认 2% 会错过） ----
+    def test_sleep_window_1p8pct_still_triggers_early_wake(self):
+        """SLEEP(UTC 0-6) + event=1.8% → early_wake=True（用户：亚洲深夜也不能漏 1~2% 急跌/暴涨）。
+        旧逻辑：SLEEP 只当 big_event_1m_pct=2% 才早叫 → 1.8% 被静默错过。"""
+        thr, now = self._mk_throttler_at(utc_hour=2)  # UTC 2:00 = 典型 SLEEP 窗
+        # mark=2036 → event=1.8%（<2% 旧 SLEEP 不早叫的「坑」）
+        dec = thr.should_call_ai(
+            now_ts=now, system_status_running=True, allow_trading=True,
+            has_position=False, mark_price=2036.0, entry_price=0,
+        )
+        assert dec.level.value == "SLEEP", (
+            f"UTC 2:00 必须命中 SLEEP 档位，实际 {dec.level}"
+        )
+        assert bool(dec.early_wake) is True, (
+            f"SLEEP 窗 + 波动 1.8% 必须 early_wake=True（不能等 2% 才早叫=错过急跌爆发行情），实际 early_wake={dec.early_wake}"
+        )
+        assert int(dec.interval_s) <= int(600 * 0.5), (
+            f"SLEEP+1.8% 间隔也要缩短到 ≤300s（原 600s 太长），实际 {dec.interval_s}"
+        )
+
+

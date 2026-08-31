@@ -49,6 +49,12 @@ LEVEL_INTERVALS: dict[ThrottleLevel, int] = {
     ThrottleLevel.CAPPED: 3600,
 }
 
+# 动态倍率上下限（= 极端行情不下探到 1s 轮询 API；横盘时不睡到 30min 漏消息）
+DYN_MULT_MAX = 2.0
+DYN_MULT_MIN = 0.25
+# 波动率参考阈值：event 等于这个值时倍率恰好 =1（=基础档节奏）
+DYN_VOL_PIVOT_PCT = 1.0
+
 # Dashboard 彩色 tag（JS 同步使用）
 LEVEL_COLORS: dict[str, str] = {
     "HOT": "background:#fce8e6;color:#c5221f",
@@ -90,6 +96,9 @@ class ThrottleDecision(BaseModel):
     # 早叫相关：True=这轮命中了『1% 波动哨兵』，即便在熔断期也要调 AI（用户要的"熔断期间也不能漏机会"）
     early_wake: bool = False
     event_pct: float = 0.0
+    # 2026-08-31 动态行情驱动：基础档间隔 / 波动率 / 最终倍率 / 最终动态间隔
+    base_interval_s: int = 0
+    dyn_mult: float = 1.0
     # 给 Dashboard：下一次调用 ts（方便刷新倒计时）
     debug_summary: dict[str, Any] = {}
 
@@ -97,11 +106,15 @@ class ThrottleDecision(BaseModel):
 _DEFAULT_CFG = {
     # 可调（后续也可放 RiskLimits；先内置安全默认值）
     "event_1m_pct": 1.0,         # 1m 涨跌≥1% → 早叫
-    "big_event_1m_pct": 2.0,     # 2% → 即使 SLEEP 也早叫
+    "big_event_1m_pct": 2.0,     # 2% → 即使默认 SLEEP 也早叫(+额外更激进动态倍率)
+    "sleep_wake_pct": 1.0,       # 2026-08-31 新增：SLEEP 窗的早叫阈值(原固定=big_event_1m_pct → 会错过 1.8% 急跌)
     "hot_proximity_pct": 1.0,    # 持仓接近止盈/止损/强平 ≤1% → HOT 盯盘
     "max_daily_calls": 500,      # 单日调用超过 → CAPPED (防止 bug 疯刷)
     "max_daily_cost_usdt": 5.0,  # 单日成本预估超过 → CAPPED (小账户 14.83U 的 30%=4.45U 预算)
     "degrade_after_failures": 2, # 连失败 2 次 → DEGRADED (降级)
+    "dyn_mult_max": 2.0,         # 横盘倍率上限（最长 ≤ 2× 基础档）
+    "dyn_mult_min": 0.25,        # 高波动倍率下限（最短 ≥ 25% 基础档）
+    "dyn_vol_pivot_pct": 1.0,    # 波动率=此值时 倍率=1（=基础档节奏）
 }
 
 
@@ -113,6 +126,32 @@ class AIThrottler:
         if cfg:
             self.cfg.update({k: v for k, v in cfg.items() if k in _DEFAULT_CFG})
         self.state = AIThrottlerState()
+
+    # ------------------------------------------------------------------
+    # 内部 helper：根据行情波动率(event_pct)算出「动态倍率 × 基础档 = 真正间隔」
+    #   - 波动越大，倍率越小 → 间隔越短（盯盘更紧）
+    #   - 横盘 0.2% 以下倍率越大 → 间隔越长（省 AI 成本）
+    #   - CAPPED 档不参与倍率计算(硬性日成本上限)
+    # ------------------------------------------------------------------
+    def _dyn_mult(self, event_pct: float) -> tuple[float, str]:
+        """返回 (multiplier, 简短中文解释)。"""
+        pivot = float(self.cfg["dyn_vol_pivot_pct"])
+        mx = float(self.cfg["dyn_mult_max"])
+        mn = float(self.cfg["dyn_mult_min"])
+        ev = max(0.0, float(event_pct or 0.0))
+        if ev <= 0:  # 没参考波动 → 横盘拉满
+            return mx, f"无锚定波动→横盘倍率×{mx:.2f}"
+        # 反比例：倍率 ≈ pivot / ev（ev=pivot 时恰好 =1）；再 clamp 到 [mn, mx]
+        raw = pivot / ev if ev > 1e-9 else mx
+        mult = max(mn, min(mx, raw))
+        # 中文解释：给 Dashboard/日志一眼看懂
+        if ev >= float(self.cfg["dyn_vol_pivot_pct"]):
+            kind = "高波动缩短"
+        elif ev <= float(self.cfg["event_1m_pct"]) * 0.5:
+            kind = "横盘拉长"
+        else:
+            kind = "常态锚定"
+        return mult, f"{kind}(波动{ev:.2f}% 倍率×{mult:.2f})"
 
     # ------------------------------------------------------------------
     # 持久化：和 TradingController 共用 state_store
@@ -174,17 +213,24 @@ class AIThrottler:
             event_pct = abs((mark - anchor) / anchor) * 100.0
             self.state.last_event_pct = event_pct
             self.state.last_event_at = now_ts
-            # 等级阈值：SLEEP 要 2%，其它 1% 以上触发 early_wake
+            # 2026-08-31 升级：SLEEP / 其他档 分三级阈值
+            #   · ≥big_event_1m_pct(默认 2%)：任何档早叫(最激进)
+            #   · ≥sleep_wake_pct(默认 1%)：仅 SLEEP 窗早叫(解决旧 SLEEP 只认 2% → 1.8% 漏行情)
+            #   · ≥event_1m_pct(默认 1%)：非 SLEEP 档早叫
             big_thr = float(self.cfg["big_event_1m_pct"])
+            sleep_thr = float(self.cfg["sleep_wake_pct"])
             normal_thr = float(self.cfg["event_1m_pct"])
+            in_sleep = (self.state.level == ThrottleLevel.SLEEP.value) or (time.gmtime(now_ts).tm_hour < 6)
             if event_pct >= big_thr:
                 early_wake = True
                 self.state.daily_early_wakes += 1
-            elif event_pct >= normal_thr:
-                # SLEEP 级别不早叫(除非大波动)
-                if self.state.level != ThrottleLevel.SLEEP.value:
-                    early_wake = True
-                    self.state.daily_early_wakes += 1
+            elif in_sleep and event_pct >= sleep_thr:
+                # SLEEP 窗波动达标：新逻辑立刻早叫（亚洲深夜 1.5% 急跌不再错过）
+                early_wake = True
+                self.state.daily_early_wakes += 1
+            elif (not in_sleep) and event_pct >= normal_thr:
+                early_wake = True
+                self.state.daily_early_wakes += 1
 
         # ---- 2) 决定目标 level（状态机）----
         #  优先级: 当日超预算 CAPPED > 连续失败 DEGRADED > 睡眠窗 SLEEP >
@@ -256,8 +302,26 @@ class AIThrottler:
                 else:
                     reason = "IDLE 风控 allow=False（冷却中），AI 仅在 ≥1% 波动时早叫"
 
-        interval = LEVEL_INTERVALS[level]
-        # ---- 3) 计算 next_call_ts（如还没设 / 已过期，以 now 为起点）----
+        base_interval = LEVEL_INTERVALS[level]
+        # ---- 3) 行情驱动：动态倍率（CAPPED 档不参与，硬性日成本上限必须严格）----
+        dyn_mult = 1.0
+        dyn_reason = ""
+        if level != ThrottleLevel.CAPPED:
+            dyn_mult, dyn_reason = self._dyn_mult(event_pct)
+        # 2026-08-31 用户痛点：SLEEP/IDLE 触发 early_wake 时，不能光"这次早叫"就完了，
+        #   随后几轮也要主动更紧（否则刚触发 1.8%，下一轮又睡 600s → 1.8% 暴涨阶段完全错过）
+        #   → 如果这轮是 early_wake 且档是 SLEEP/IDLE/DEGRADED，再额外 ×0.75（紧一点）
+        bonus_reason = ""
+        if early_wake and level in (ThrottleLevel.SLEEP, ThrottleLevel.IDLE, ThrottleLevel.DEGRADED):
+            bonus = 0.75
+            dyn_mult = dyn_mult * bonus
+            bonus_reason = f" · 命中早叫档(≥{float(self.cfg['sleep_wake_pct']):g}%)再×0.75奖励"
+        interval = max(5, int(round(base_interval * dyn_mult)))  # 保底 5s（防止 bug 卡 0）
+        # 合并解释：用户吐槽"固定时间节流错过行情" → 必须一眼看到波动、倍率、最终间隔
+        if dyn_reason:
+            reason = f"{reason} · {dyn_reason}{bonus_reason} → 动态间隔 {interval}s（基础档 {base_interval}s）"
+
+        # ---- 4) 计算 next_call_ts（如还没设 / 已过期，以 now 为起点）----
         # 冷启动 (last_call_ts==0 且 next_call_ts==0)：本轮立刻可调用，不设等待
         cold_start = self.state.last_call_ts == 0 and self.state.next_call_ts <= 0
         if self.state.next_call_ts <= 0 and not cold_start:
@@ -285,6 +349,8 @@ class AIThrottler:
             next_call_at=self.state.next_call_ts,
             early_wake=early_wake,
             event_pct=event_pct,
+            base_interval_s=base_interval,
+            dyn_mult=round(dyn_mult, 4),
             debug_summary=debug_summary,
         )
 
@@ -341,4 +407,15 @@ class AIThrottler:
             "哨兵锚定价": round(self.state.sentinel_mark_price, 6) if self.state.sentinel_mark_price else 0,
             "最近波动(%)": round(self.state.last_event_pct, 3),
             "最近波动时间戳": self.state.last_event_at or None,
+            # 2026-08-31 行情驱动：给 Dashboard 展示基础档/倍率/动态间隔
+            "基础档间隔(秒)": LEVEL_INTERVALS.get(ThrottleLevel(lvl) if lvl in {e.value for e in ThrottleLevel} else ThrottleLevel.NORMAL, 60),
+            "动态倍率": round(self._calc_last_dyn_mult(), 4),
         }
+
+    def _calc_last_dyn_mult(self) -> float:
+        """根据最近波动算出的动态倍率（Dashboard 展示用，不做 clamp 之外的副作用）。"""
+        try:
+            mult, _ = self._dyn_mult(self.state.last_event_pct or 0.0)
+            return mult
+        except Exception:  # noqa: BLE001
+            return 1.0
