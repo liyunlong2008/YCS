@@ -22,23 +22,11 @@ class OKXConfig(BaseModel):
 
 
 class AIConfig(BaseModel):
-    """AI 提供商配置（LiteLLM 统一接入）。
-
-    2026-08-31 按 deepseek-v4-flash 官方文档补充：
-      - connect_timeout=5s  (公网 DNS/TLS 抖动，不要 <3s)
-      - timeout=30s         (高峰期排队 + thinking 开启后排队，10/15s 会大量误报 Timeout；生产 30-45s)
-      - thinking_enabled    (deepseek-v4-flash 默认开启 reasoning；其它模型按需开关)
-    """
+    """AI 提供商配置（LiteLLM 统一接入）。"""
     provider: Literal["deepseek", "openai", "claude", "gemini", "openrouter"]
     api_key: str
     model: str = "deepseek-chat"
     base_url: str = ""
-
-    # 超时（可配置；留 0 表示走 Provider 默认规则：deepseek-v4-flash 自动 5s/30s）
-    ai_connect_timeout_s: int = 0
-    ai_timeout_s: int = 0
-    # thinking 模式：None = 自动（model 含 v4-flash 才开启）；True=强制开；False=强制关
-    ai_thinking_enabled: bool | None = None
 
 
 class TradingConfig(BaseModel):
