@@ -320,11 +320,20 @@ def create_app(
                 mode_cn = f"{mode_cn}(影子 SHADOW)"
 
         # 2) Controller 实时数据（首屏优先，没启动则 fallback state_store）
+        # 2026-08-31 Bug D 修复：FastAPI async handler 必须用『异步原生版』await ctl.aget_status_dict()，
+        #   绝不能调同步 ctl.get_status_dict() —— 后者在已有 running loop 里会走 nest_asyncio 重入同一 loop，
+        #   在 uvloop + 真实 OKX 异步网络 I/O 场景触发 『cannot reuse already awaited coroutine』
+        #   每 5s 一次（Dashboard JS 刷新周期），Journal 日志风暴。
+        #   若 aget_status_dict 缺失 → 退回同步；同步出错 → state_store 兜底。
         ctl = rt.get("controller")
         status_from_ctl: dict[str, Any] | None = None
-        if ctl is not None and hasattr(ctl, "get_status_dict"):
+        if ctl is not None:
+            _has_async = hasattr(ctl, "aget_status_dict") and callable(getattr(ctl, "aget_status_dict", None))
             try:
-                status_from_ctl = ctl.get_status_dict() or {}
+                if _has_async:
+                    status_from_ctl = (await ctl.aget_status_dict()) or {}
+                elif hasattr(ctl, "get_status_dict"):
+                    status_from_ctl = ctl.get_status_dict() or {}
                 if isinstance(status_from_ctl, dict) and status_from_ctl.get("运行模式"):
                     mode_cn = status_from_ctl["运行模式"]
             except Exception:
@@ -1073,7 +1082,22 @@ def create_app(
     async def api_status(request: Request) -> dict:
         ctl = request.app.state.runtime.get("controller")
         if ctl is not None:
-            return ctl.get_status_dict()
+            # 2026-08-31 Bug D 修复：异步 handler 走异步原生 aget_status_dict()（不碰 nest_asyncio），
+            #   避免 uvloop 下 5s 周期 Task exception was never retrieved / coroutine reuse。
+            if hasattr(ctl, "aget_status_dict") and callable(getattr(ctl, "aget_status_dict", None)):
+                try:
+                    return await ctl.aget_status_dict()
+                except Exception:  # noqa: BLE001
+                    # 兜底：同步 get_status_dict（若仍炸，再回状态快照）
+                    try:
+                        return ctl.get_status_dict()
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                try:
+                    return ctl.get_status_dict()
+                except Exception:  # noqa: BLE001
+                    pass
 
         # 兜底：Controller 尚未初始化（如：仅 create_app 跑骨架、或前端刚打开 Dashboard）。
         # 仍保证"运行模式"字段可被监控脚本 / 自检读到——这是影子模式判定的关键入口。
@@ -1570,10 +1594,15 @@ def create_app(
             "live_max_daily_loss_usdt": max_daily_loss,
         }
         # 2026-08-30: 不开仓可观测：把最近风控结论/建议名义/缺口/双过时间戳写入 system（curl 粘贴直接可读）
+        # 2026-08-31 Bug D 修复：await 异步原生 aget_status_dict()，避免 nest_asyncio → uvloop reuse RuntimeError
         status_from_ctl: dict[str, Any] | None = None
-        if ctl is not None and hasattr(ctl, "get_status_dict"):
+        if ctl is not None:
+            _has_async = hasattr(ctl, "aget_status_dict") and callable(getattr(ctl, "aget_status_dict", None))
             try:
-                status_from_ctl = ctl.get_status_dict() or None
+                if _has_async:
+                    status_from_ctl = (await ctl.aget_status_dict()) or None
+                elif hasattr(ctl, "get_status_dict"):
+                    status_from_ctl = ctl.get_status_dict() or None
             except Exception:  # noqa: BLE001
                 status_from_ctl = None
         if isinstance(status_from_ctl, dict):

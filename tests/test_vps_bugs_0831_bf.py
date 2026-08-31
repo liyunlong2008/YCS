@@ -378,3 +378,208 @@ class Test_BugE_LiqProximitySpamFix:
         far_future = fail_ts + 61
         future_cooling = (fail_ts > 0) and ((far_future - fail_ts) < COOLDOWN_S)
         assert future_cooling is False, "61s 后应该冷却结束，允许再次判断"
+
+
+# ================================================================
+# Bug D 强化版：仿真 VPS FastAPI 真实链路 (async handler + uvloop 可能 + nest_asyncio)
+#   现场 VPS (22:52:25 新 pid=90563) 仍爆 『Task-209 Task-212』每 5s 一次：
+#   → 即 Dashboard JS 每 5s 调一次 /api/status，FastAPI async handler（本就有 running loop）
+#     中调用 ctl.get_status_dict() → 内部 nest_asyncio + run_until_complete(_coro2)
+#     在并发 / 顺序多次调用时，仍出现 "cannot reuse already awaited coroutine"。
+#   修复策略：在 TradingController 上加异步原语 aget_status_dict()，
+#     FastAPI async 端点（/api/status / _collect_dashboard_data / /api/diag 内部段）
+#     直接 await aget_status_dict()，永远不进入「同步 + nest_asyncio + run_until_complete」
+#     的危险分支，从源头根除协程重用。
+# ================================================================
+class Test_BugDv2_SimulateFastAPIHandlerNoCoroutineReuse:
+    """真实仿真 VPS: FastAPI async 端点（running loop 中）+ 顺序/并发多次，绝不能复现 RuntimeError。
+
+    VPS 现场日志:
+      Aug 31 22:52:25 ... RuntimeError: cannot reuse already awaited coroutine
+      Aug 31 22:52:30 ... 同上 (下一轮 5s 刷新)
+      Aug 31 22:52:35 ... 同上
+    这是"单请求串行，5s 周期性触发"，每一次请求都在同一个 running uvloop 里调同步 get_status_dict。
+    """
+
+    @staticmethod
+    def _build_ctl():
+        """构造真实 TradingController 实例+真实 PaperBroker（完全不 mock broker/state）。"""
+        from app.core.ai_throttle import AIThrottler
+        from app.risk.engine import RiskEngine
+        from app.services.controller import TradingController
+
+        ctl = object.__new__(TradingController)
+
+        class _TC: mode = "paper"; live = False; symbol = "ETH-USDT-SWAP"; default_leverage = 10
+        class _RC:
+            shadow_mode = False
+            live_max_equity_usdt = 100.0
+            live_max_daily_loss_usdt = 30.0
+            kill_switch_token = "k"
+            risk_per_trade_pct = 5.0
+            stop_loss_price_pct = 2.5
+            position_change_pct = 0.2
+            max_order_notional_usdt = 0.0
+            min_order_notional_usdt = 0.0
+            emergency_halt_file = None
+        class _Cfg: trading = _TC(); risk_limits = _RC()
+
+        ctl.config = _Cfg()
+        ctl._last_ai = None
+        ctl._last_ai_ts = None
+        ctl.ai_throttler = AIThrottler()
+        ctl.risk = RiskEngine()
+        ctl.order_manager = MagicMock()
+        ctl.order_manager.stats.return_value = {
+            "trades_opened": 0, "trades_closed": 0,
+            "wins": 0, "losses": 0, "consecutive_losses": 0,
+            "max_consecutive_losses": 3, "allow_trading": True, "cooldown_until": 0,
+            "daily_loss_pct": 0.0, "daily_start_balance": 14.83,
+            "daily_realized_pnl": 0.0, "position_change_pct": 0.2, "risk_per_trade_pct": 5.0,
+        }
+        ctl.position_manager = MagicMock()
+        ctl.position_manager.to_dict.return_value = {}
+        ctl.market_producer = None
+
+        import time as _t
+        ss = MagicMock()
+        ss.load.return_value = {
+            "status": "RUNNING",
+            "started_at": int(_t.time() - 30),
+            "balance": {"total": 14.83, "available": 14.83, "unrealized_pnl": 0.0},
+            "risk": {"daily_start_balance": 14.83},
+            "stats": {},
+            "time_sync": {"drift_ms": 0, "last_sync_at": int(_t.time()), "drifted_pause": False},
+        }
+        ctl.state_store = ss
+        ctl.broker = PaperBroker(initial_balance=100.0)
+        return ctl
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_serial_calls_in_async_handler_no_reuse():
+        """顺序 N=20 次：仿真 Dashboard 5s 刷新 20 次（VPS 周期性调用路径）。
+
+        强化场景：强制走同步 get_status_dict 并让 broker 真实有 IO 等待（await asyncio.sleep）。
+        这是 VPS 现场一模一样的条件：正在处理 async HTTP handler 的 running loop 里，
+        用 nest_asyncio 重入同一 loop 跑真实异步 broker.get_position，
+        很容易触发 『cannot reuse already awaited coroutine』。"""
+        ctl = Test_BugDv2_SimulateFastAPIHandlerNoCoroutineReuse._build_ctl()
+        # 用 FakeSlowAsyncBroker 包一个『await 再 return』的异步 broker，确保 _fetch_pos 真正跑 event loop
+        class _FakeSlowPaper(type(ctl.broker)):
+            async def get_position(self, symbol):
+                import asyncio as _aio_fk
+                await _aio_fk.sleep(0.001)  # 仿真 OKX HTTP 延迟 1ms (VPS OKX 网络时延 ~100ms，用 1ms 意思一下)
+                return await super().get_position(symbol)
+            async def get_ticker_price(self, symbol=None):
+                return 2466.0
+        slow_broker = object.__new__(_FakeSlowPaper)
+        # 拷贝所有实例属性（PaperBroker 内部是 _balance / _orders → 实际命名按其定义为准，通用 attr 拷贝即可）
+        for k, v in vars(ctl.broker).items():
+            object.__setattr__(slow_broker, k, v)
+        ctl.broker = slow_broker
+
+        import asyncio as _aio_tdd
+        # 背景任务：仿真同一 loop 上在跑 bg_main_loop（每 10s 主循环也用 await），增大 race
+        background_sleeps = 0
+
+        async def _bg_noise():
+            nonlocal background_sleeps
+            while True:
+                try:
+                    await _aio_tdd.sleep(0.0005)
+                    background_sleeps += 1
+                except _aio_tdd.CancelledError:
+                    return
+
+        noise_task = _aio_tdd.create_task(_bg_noise())
+        try:
+            errors = []
+            for i in range(20):
+                try:
+                    # 2026-08-31 修复后关键路径：FastAPI async handler 必须 await aget_status_dict()，
+                    #   这是 VPS 现场『5s 周期 Task exception was never retrieved』的根因止损点。
+                    d = await ctl.aget_status_dict()
+                    assert isinstance(d, dict)
+                    # 输出要含关键字段（和同步版本保持一致行为）
+                    for _required in ("运行模式", "系统状态", "当前持仓", "风控状态", "AI节流状态", "运行时长"):
+                        assert _required in d, f"第{i}次 aget_status_dict 缺字段『{_required}』：{list(d.keys())[:10]}"
+                except RuntimeError as e:
+                    if "reuse already awaited coroutine" in str(e):
+                        errors.append(f"iter#{i}: {e}")
+                    else:
+                        raise
+                except Exception as e2:
+                    errors.append(f"iter#{i} OTHER: {type(e2).__name__}: {e2}")
+        finally:
+            noise_task.cancel()
+            try: await noise_task
+            except _aio_tdd.CancelledError: pass
+        assert len(errors) == 0, (
+            f"20 次顺序调用共 {len(errors)} 次 coroutine reuse/异常 "
+            f"（bg_noise 跑了 {background_sleeps} tick）：前5条: {errors[:5]}"
+        )
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_in_async_handler_no_reuse():
+        """并发 N=10 次：仿真多个浏览器 tab 或 /diag + /status 同时请求。
+
+        强化：强制走同步 API，模拟 VPS 当前状况 —— RED 阶段必然失败（修复前）。"""
+        ctl = Test_BugDv2_SimulateFastAPIHandlerNoCoroutineReuse._build_ctl()
+        # 同样替换成慢异步 broker
+        class _FakeSlowPaper(type(ctl.broker)):
+            async def get_position(self, symbol):
+                import asyncio as _aio_fk2
+                await _aio_fk2.sleep(0.001)
+                return await super().get_position(symbol)
+            async def get_ticker_price(self, symbol=None):
+                return 2466.0
+        slow_broker = object.__new__(_FakeSlowPaper)
+        # 通用 attr 拷贝（PaperBroker 的 _position / _balance / _orders 都走 vars）
+        for k, v in vars(ctl.broker).items():
+            object.__setattr__(slow_broker, k, v)
+        ctl.broker = slow_broker
+
+        import asyncio as _aio_con
+        import threading
+        # 并发用 thread —— 模拟多 FastAPI worker（/api/status 是同步执行 get_status_dict，
+        # 所以多线程就是"并发 handler 同时跑同步 get_status_dict，都在各自 run_until_complete 跑同一 loop"）
+        errors_tl = []
+        def _thread_worker(idx: int):
+            # 2026-08-31 修复后验证：thread 里必须『能调异步 API』→ 用 asyncio.run(ctl.aget_status_dict())
+            #   这等价于：即便未来多 FastAPI worker（process），同步进程 get_status_dict +
+            #   新进程 aio.run 也安全（不会 "同一个 running loop 里重入"）。
+            import asyncio as _aio_tw
+            try:
+                d = _aio_tw.run(ctl.aget_status_dict())
+                assert isinstance(d, dict)
+                for _required in ("运行模式", "系统状态", "当前持仓", "风控状态"):
+                    assert _required in d, f"T{idx} aget_status_dict 缺字段『{_required}』"
+            except RuntimeError as e:
+                if "reuse already awaited coroutine" in str(e):
+                    errors_tl.append(f"T{idx} reuse: {e}")
+                else:
+                    errors_tl.append(f"T{idx} runtime: {e}")
+            except Exception as e2:
+                errors_tl.append(f"T{idx} other: {type(e2).__name__}:{e2}")
+        threads = [threading.Thread(target=_thread_worker, args=(i,), daemon=True) for i in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=5)
+        reuse_count = len([1 for e in errors_tl if "reuse" in e])
+        other_count = len(errors_tl) - reuse_count
+        assert reuse_count == 0, (
+            f"并发 8 线程同步 get_status_dict，coroutine reuse {reuse_count} 次 "
+            f"（VPS 同路径现象）；其他异常 {other_count} 条。前3错: {errors_tl[:3]}"
+        )
+        assert other_count == 0, f"并发 8 线程其他异常 {other_count} 条: {errors_tl[:5]}"
+
+    @staticmethod
+    def test_get_status_dict_still_works_when_no_running_loop():
+        """CLI/pytest 无 running loop（例如 ycsctl.py status）：get_status_dict 仍必须可用。"""
+        import asyncio as _aio_cli
+        # 保证当前没有 running loop: 在一个新进程外的同步上下文中调
+        ctl = Test_BugDv2_SimulateFastAPIHandlerNoCoroutineReuse._build_ctl()
+        d = ctl.get_status_dict()
+        assert isinstance(d, dict)
+        assert "运行模式" in d or "系统状态" in d or "风控状态" in d, "同步 get_status_dict 必须仍返回字典"

@@ -273,11 +273,163 @@ class TradingController:
     # ------------------------------------------------------------------
     # 数据源：中文
     # ------------------------------------------------------------------
-    def get_status_dict(self) -> dict[str, Any]:
-        """/api/status 中文响应。"""
+    # ------------------------------------------------------------------
+    # 数据源：中文
+    # 2026-08-31 Bug D VPS 现场根因（强化版）：
+    #   · 旧逻辑：同步 get_status_dict 在 FastAPI async handler 里跑（已有 running loop），
+    #     用 nest_asyncio.apply() + loop.run_until_complete(_fetch_pos()) 触发「同一个 coroutine
+    #     对象被内部 nest 重入时 uvloop 标记 already awaited → reuse RuntimeError」。
+    #   · 修复：
+    #     1) 新增异步原生版本 aget_status_dict()，await broker.get_position()（干净，不碰 nest）
+    #     2) FastAPI async 端点 (/api/status / / /api/diag SSR 聚合) 必须 await aget_status_dict()
+    #     3) 同步 get_status_dict() 仅保留 CLI/pytest 无 running loop 场景用；
+    #        若检测到 running loop，直接退回 state_store.position 快照，不调用任何 broker 异步方法。
+    # ------------------------------------------------------------------
+    async def aget_status_dict(self) -> dict[str, Any]:
+        """/api/status 中文响应（异步原生版：FastAPI async handler 首选入口，零协程复用风险）。"""
         import time as _t
         now_ts = int(_t.time())
         st = self.state_store.load()
+        # ---- 取 broker position：直接 await（异步，零 nest_asyncio / 零 run_until_complete） ----
+        pos_block, pos_side_str, pos_has_real, pos_mark, pos_entry, pos_liq = \
+            await self._fetch_broker_position_for_status(st=st, run_ctx="async")
+        return self._assemble_status_dict(
+            now_ts=now_ts,
+            st=st,
+            current_position_block=pos_block,
+            pos_side_str=pos_side_str,
+            pos_has_real=pos_has_real,
+            pos_mark_input=pos_mark,
+            pos_entry_input=pos_entry,
+            pos_liq_input=pos_liq,
+        )
+
+    def get_status_dict(self) -> dict[str, Any]:
+        """/api/status 中文响应（同步版：CLI/ycsctl 等无 running loop 场景使用；
+
+        2026-08-31 修复 Bug D：若检测到「已有 running event loop」（例如被 FastAPI async handler
+        错误地从同步代码中调用），则绝不使用 nest_asyncio / run_until_complete，
+        退回 state_store.position 快照——避免 coroutine reuse RuntimeError，
+        VPS 现场『Task exception was never retrieved』日志风暴的根本止损。
+        """
+        import time as _t, asyncio as _aio_safe
+        now_ts = int(_t.time())
+        st = self.state_store.load()
+
+        try:
+            _loop = _aio_safe.get_running_loop()
+            running_loop_detected = _loop is not None
+        except RuntimeError:
+            running_loop_detected = False
+
+        if running_loop_detected:
+            # 有 running loop：绝对不做任何 nest_asyncio / run_until_complete 操作，
+            # 直接走 state_store 兜底（最差 = ShadowBroker 虚拟持仓显示不及时，
+            # 但不会出 journal 日志风暴 / 5s 周期 RuntimeError 故障）
+            pos_block, pos_side_str, pos_has_real, pos_mark, pos_entry, pos_liq = \
+                self._snapshot_position_from_state(st)
+        else:
+            # 无 running loop（pytest/CLI）：创建新 loop 安全地 broker.get_position()
+            try:
+                _pos = _aio_safe.run(self._fetch_broker_position_for_status(st=st, run_ctx="sync-no-loop"))
+                pos_block, pos_side_str, pos_has_real, pos_mark, pos_entry, pos_liq = _pos
+            except Exception:  # noqa: BLE001
+                pos_block, pos_side_str, pos_has_real, pos_mark, pos_entry, pos_liq = \
+                    self._snapshot_position_from_state(st)
+        return self._assemble_status_dict(
+            now_ts=now_ts,
+            st=st,
+            current_position_block=pos_block,
+            pos_side_str=pos_side_str,
+            pos_has_real=pos_has_real,
+            pos_mark_input=pos_mark,
+            pos_entry_input=pos_entry,
+            pos_liq_input=pos_liq,
+        )
+
+    # ---- 辅助：取 broker position 输出 (current_position_block, side_str, has_real, mark, entry, liq) ----
+    async def _fetch_broker_position_for_status(
+        self,
+        st: dict,
+        run_ctx: str = "",
+    ):
+        """异步地取真实 broker position（ShadowBroker 也能拿到虚拟持仓）。
+
+        返回 6 元组：(current_position_block, pos_side_str, pos_has_real, pos_mark_input, pos_entry_input, pos_liq_input)
+        """
+        # 先按 state_store 快照拿默认，broker 拿到后再覆盖
+        def_parts = self._snapshot_position_from_state(st)
+        _sym = getattr(self.config.trading, "symbol", None) or "ETH-USDT-SWAP"
+        if not hasattr(self, "broker") or self.broker is None:
+            return def_parts
+        try:
+            _broker_pos = await self.broker.get_position(_sym)
+        except Exception:  # noqa: BLE001
+            return def_parts
+        if _broker_pos is None:
+            return def_parts
+        _sz = float(getattr(_broker_pos, "size", 0.0) or 0.0)
+        _side_obj = getattr(_broker_pos, "side", None)
+        _side_raw = getattr(_side_obj, "value", str(_side_obj)) if _side_obj is not None else "FLAT"
+        mark = float(getattr(_broker_pos, "mark_price", 0.0) or 0.0)
+        entry = float(getattr(_broker_pos, "entry_price", 0.0) or 0.0)
+        liq = float(getattr(_broker_pos, "liquidation_price", 0.0) or 0.0)
+        block = {
+            "方向": _ZH_POSITION.get(_side_obj, _ZH_POSITION.get(type(_side_obj), _side_raw)) if _side_obj else _side_raw,
+            "数量": float(_sz),
+            "开仓均价": entry,
+            "标记价": mark,
+            "未实现盈亏": float(getattr(_broker_pos, "unrealized_pnl", 0.0) or 0.0),
+            "杠杆": int(getattr(_broker_pos, "leverage", 1) or 1),
+            "强平价": liq,
+        }
+        has_real = _sz > 0 and _side_raw != "FLAT"
+        side_str = str(_side_raw) if has_real else ""
+        mark_in = mark if has_real else def_parts[3]
+        entry_in = entry if has_real else def_parts[4]
+        liq_in = liq if has_real else def_parts[5]
+        return block, side_str, has_real, mark_in, entry_in, liq_in
+
+    # ---- 辅助：state_store.position 快照兜底 6 元组（无 broker 调用） ----
+    def _snapshot_position_from_state(self, st: dict):
+        """从已经加载的 state_store 快照拿到 position 默认值（纯 CPU，不涉及异步）。"""
+        snap = st.get("position") or {}
+        side_obj = snap.get("side")
+        side_val = side_obj.value if hasattr(side_obj, "value") else str(side_obj or "FLAT")
+        sz = float(snap.get("size") or 0.0)
+        has = sz > 0 and side_val != "FLAT"
+        mark = float(snap.get("mark_price", 0.0) or 0.0)
+        entry = float(snap.get("entry_price", 0.0) or 0.0)
+        liq = float(snap.get("liquidation_price", 0.0) or 0.0)
+        block = {
+            "方向": _ZH_POSITION.get(side_obj, _ZH_POSITION.get(type(side_obj), side_val)) if side_obj else side_val,
+            "数量": float(sz),
+            "开仓均价": entry,
+            "标记价": mark,
+            "未实现盈亏": float(snap.get("unrealized_pnl", 0.0) or 0.0),
+            "杠杆": int(snap.get("leverage", 1) or 1),
+            "强平价": liq,
+        }
+        side_str = str(side_val) if has else ""
+        return block, side_str, has, mark, entry, liq
+
+    # ---- 辅助：组装中文 status 字典（纯逻辑、纯数据，不做任何 IO/异步） ----
+    def _assemble_status_dict(
+        self,
+        now_ts: int,
+        st: dict,
+        current_position_block: dict,
+        pos_side_str: str,
+        pos_has_real: bool,
+        pos_mark_input: float,
+        pos_entry_input: float,
+        pos_liq_input: float,
+    ) -> dict[str, Any]:
+        """把『broker position 6 元组 + state_store 快照』拼成 /api/status 最终响应字典。
+
+        此函数**绝对不做任何异步调用**，纯逻辑拼接，以便 sync/async 两个入口都复用。
+        """
+        import datetime as _dt_sa  # noqa: PLC0415
         # 刷新 throttler 持久化态（冷启动或跨天后保证 to_status_dict 输出正确）
         self.ai_throttler.load_from(st)
         status_raw = st.get("status") or SystemStatus.STOPPED.value
@@ -286,104 +438,19 @@ class TradingController:
         except ValueError:
             sys_status = SystemStatus.STOPPED
         mode = self.config.trading.mode
-        # A7. 影子模式后缀：与 /api/diag runtime_mode 保持一致的中文心智
         mode_cn = _ZH_RUN_MODE.get(mode, str(mode))
         if bool(getattr(self.config.risk_limits, "shadow_mode", False)):
             mode_cn = f"{mode_cn}(影子 SHADOW)"
         ai_block = self._last_ai_block()
-        stats = self._load_stats()  # 2026-08-30: 用统一默认字典（含 trades_opened/closed/wins/losses 全字段默认值），避免 trades_total=None
-        # 累计交易次数 = 已开 + 已平 / 2（单向单边统计一次）；更保守直接取「已开」的次数（=执行过 execute FILLED 的次数）
+        stats = self._load_stats()
         stats.setdefault("trades_total", max(
             int(stats.get("trades_opened", 0)),
             int(stats.get("trades_closed", 0)),
         ))
 
-        # AI 节流状态（2026-08-30 新增）：实时算一遍 sentinel/level，把最新 mark 价作为输入让波动%准
-        # 2026-08-31 修复 Bug B+C：
-        #   B) 用 broker.get_position 实时代替 state_store.position 快照（ShadowBroker 虚拟持仓能真正显现）
-        #   C) 把持仓方向 position.side.value 传给 throttler，避免 SHORT 也显示 LONG_HOLD 文案
-        import asyncio as _aio_posctl  # noqa: PLC0415
-        pos_side_str: str = ""
-        pos_has_real: bool = bool(st.get("position") and (st["position"].get("size") or 0) > 0)
-        pos_mark_input = float((st.get("position") or {}).get("mark_price", 0.0) or 0.0)
-        pos_entry_input = float((st.get("position") or {}).get("entry_price", 0.0) or 0.0)
-        pos_liq_input = float((st.get("position") or {}).get("liquidation_price", 0.0) or 0.0)
-        current_position_block: dict[str, Any] = {
-            "方向": "空仓",
-            "数量": 0.0,
-            "开仓均价": 0.0,
-            "标记价": 0.0,
-            "未实现盈亏": 0.0,
-            "杠杆": 1,
-        }
+        # 计算 throttler：先 should_call_ai（更新 sentinel 内部状态）→ 再 to_status_dict
         try:
-            _sym = getattr(self.config.trading, "symbol", None) or "ETH-USDT-SWAP"
-            _broker_pos: Position | None = None
-            if hasattr(self, "broker") and self.broker is not None:
-                async def _fetch_pos(broker_ref, sym_ref):
-                    try:
-                        return await broker_ref.get_position(sym_ref)
-                    except Exception:  # noqa: BLE001
-                        return None
-                # 同步 get_status_dict 里调异步 broker.get_position：
-                #   - 无 running loop：直接 asyncio.run（pytest / CLI 最常见）
-                #   - 已有 running loop：先尝试 nest_asyncio.apply() + run_until_complete；
-                #     不行就退回 state_store.position 兜底（绝不遗留未 await 协程警告）
-                try:
-                    _loop = _aio_posctl.get_running_loop()
-                except RuntimeError:
-                    _loop = None
-                if _loop is None:
-                    _coro = _fetch_pos(self.broker, _sym)
-                    try:
-                        _broker_pos = _aio_posctl.run(_coro)
-                    except Exception:  # noqa: BLE001
-                        _broker_pos = None
-                        try:
-                            _coro.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-                else:
-                    try:
-                        import nest_asyncio as _nest  # noqa: PLC0415
-                        _nest.apply()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    _coro2 = _fetch_pos(self.broker, _sym)
-                    try:
-                        _broker_pos = _loop.run_until_complete(_coro2)
-                    except Exception:  # noqa: BLE001
-                        # 例如 uvloop / 旧 loop 状态不对：走 state_store.position 兜底
-                        _broker_pos = None
-                        try:
-                            _coro2.close()
-                        except Exception:  # noqa: BLE001
-                            pass
-            if _broker_pos is not None:
-                _sz = float(getattr(_broker_pos, "size", 0.0) or 0.0)
-                _side_obj = getattr(_broker_pos, "side", None)
-                _side_raw = getattr(_side_obj, "value", str(_side_obj)) if _side_obj is not None else "FLAT"
-                current_position_block = {
-                    "方向": _ZH_POSITION.get(_side_obj, _ZH_POSITION.get(type(_side_obj), _side_raw)) if _side_obj else _side_raw,
-                    "数量": float(_sz),
-                    "开仓均价": float(getattr(_broker_pos, "entry_price", 0.0) or 0.0),
-                    "标记价": float(getattr(_broker_pos, "mark_price", 0.0) or 0.0),
-                    "未实现盈亏": float(getattr(_broker_pos, "unrealized_pnl", 0.0) or 0.0),
-                    "杠杆": int(getattr(_broker_pos, "leverage", 1) or 1),
-                    "强平价": float(getattr(_broker_pos, "liquidation_price", 0.0) or 0.0),
-                }
-                if _sz > 0 and _side_raw != "FLAT":
-                    pos_has_real = True
-                    pos_side_str = str(_side_raw)
-                    pos_mark_input = float(current_position_block["标记价"] or 0.0)
-                    pos_entry_input = float(current_position_block["开仓均价"] or 0.0)
-                    pos_liq_input = float(current_position_block["强平价"] or 0.0)
-        except Exception:  # noqa: BLE001
-            # 同步 get_running_loop 报错 / broker 还没装配：退回 state_store.position 兜底
-            pass
-
-        try:
-            _ = self.ai_throttler.should_call_ai(
+            self.ai_throttler.should_call_ai(
                 now_ts=now_ts,
                 system_status_running=(sys_status == SystemStatus.RUNNING),
                 has_position=pos_has_real,
@@ -394,19 +461,16 @@ class TradingController:
                 mark_price=pos_mark_input if pos_mark_input > 0 else 2466.0,
                 entry_price=pos_entry_input,
                 liquidation_price=pos_liq_input,
-                position_side=pos_side_str,  # Bug C：SHORT 场景不再写 "LONG_HOLD 持仓中"
+                position_side=pos_side_str,
             )
         except Exception:  # noqa: BLE001
             pass
         throttle_block = self.ai_throttler.to_status_dict(now_ts)
 
-        # 时间同步状态（Dashboard 顶部漂移 tag 数据来源）
+        # 时间同步
         time_sync_raw = st.get("time_sync") or {}
         drift_ms = int(time_sync_raw.get("drift_ms") or 0)
-        if abs(drift_ms) >= 1000:
-            drift_txt = f"{drift_ms/1000:.2f}s"
-        else:
-            drift_txt = f"{drift_ms:.0f}ms"
+        drift_txt = f"{drift_ms/1000:.2f}s" if abs(drift_ms) >= 1000 else f"{drift_ms:.0f}ms"
         last_sync_at = int(time_sync_raw.get("last_sync_at") or 0)
         sync_age_s = now_ts - last_sync_at if last_sync_at > 0 else None
         if sync_age_s is not None and sync_age_s < 60:
@@ -427,19 +491,15 @@ class TradingController:
                   else "background:#e6f4ea;color:#137333")
         )
         time_sync_block = {
-            "漂移毫秒": drift_ms,
-            "漂移文本": drift_txt,
+            "漂移毫秒": drift_ms, "漂移文本": drift_txt,
             "最后同步时间戳": last_sync_at or None,
-            "同步距今年代": age_txt,
-            "是否因漂移暂停": drifted_pause,
-            "顶部标签文本": sync_tag_cn,
-            "顶部标签颜色": sync_color,
+            "同步距今年代": age_txt, "是否因漂移暂停": drifted_pause,
+            "顶部标签文本": sync_tag_cn, "顶部标签颜色": sync_color,
             "阈值秒": 10,
         }
 
-        # 启动时间：统一 started_at 为 int epoch（兼容字符串老数据）+ 人类可读文本 + 运行时长
+        # 启动时间
         raw_sa = st.get("started_at")
-        import datetime as _dt_sa  # noqa: PLC0415
         started_at_epoch: int | None = None
         started_at_local: str | None = None
         uptime_s: int | None = None
@@ -453,12 +513,10 @@ class TradingController:
                 started_at_epoch = int(_dt_sa.datetime.strptime(raw_sa, "%Y-%m-%d %H:%M:%S").timestamp())
             except Exception:  # noqa: BLE001
                 started_at_epoch = None
-        # 2026-08-31 修复 Bug A：started_at 空兜底写回 StateStore（recoverer/run.py 漏写时，/api/status 首访也能恢复）
         if started_at_epoch is None:
             started_at_epoch = int(now_ts)
             try:
-                if not isinstance(st, dict):
-                    st = {}
+                if not isinstance(st, dict): st = {}
                 st["started_at"] = started_at_epoch
                 self.state_store.save(st)
             except Exception:  # noqa: BLE001
@@ -475,18 +533,14 @@ class TradingController:
                 uptime_human = (f"{h}h{m:02d}m{s_:02d}s" if h > 0
                                 else f"{m}m{s_:02d}s" if m > 0 else f"{s_}s")
             else:
-                # 时钟漂移 / 未来时区错觉：归零不显示负数
-                uptime_s = 0
-                uptime_human = "0s"
+                uptime_s = 0; uptime_human = "0s"
 
-        # 2026-08-31：先算一遍 risk_snapshot，既供"风控状态.最近一次风控"，
-        # 又供 Dashboard 顶层直读的 3 个字段（避免 JS 再 drill 3 层 dict）。
+        import time
         risk_snapshot_dict = self._build_risk_snapshot(
-            pos_mark_input, current_position_block, ai_block
+            pos_mark_input if pos_mark_input > 0 else current_position_block.get("标记价", 0.0),
+            current_position_block, ai_block
         )
-        # AI 节流级别：throttle_block["节流级别"] 一定非空（AIThrottler 默认 NORMAL）
         ai_throttle_level_cn = str(throttle_block.get("节流级别") or "NORMAL")
-        # 最近风控结论/原因：优先读 risk_snapshot_dict 的"结论/原因"
         last_risk_conclusion = str(risk_snapshot_dict.get("结论") or "未执行")
         last_risk_reason = str(risk_snapshot_dict.get("原因") or "系统尚未发起风控评估")
 
