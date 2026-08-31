@@ -537,6 +537,49 @@ class TradingController:
         }
 
     # ------------------------------------------------------------------
+    # 流动性输入抓取（2026-08-31：SLEEP 按流动性不按 UTC；缺任何字段返回 0，节流端自动退化兼容）
+    # ------------------------------------------------------------------
+    async def _fetch_liq_inputs(self) -> tuple[float, float, float]:
+        """返回 (bid_price, ask_price, recent_volume_contracts_1m)。失败=0。
+        只做 best-effort，不抛异常（AI 节流在输入为 0 时走更宽松的旧判定，不会 SLEEP 误杀）。
+        """
+        bid = 0.0; ask = 0.0; vol_1m = 0.0
+        sym = self.config.trading.symbol
+        try:
+            # 1) 优先：调 ccxt.fetch_ticker（OKXBroker / 通用 ccxt broker 一般都有）
+            bkr = self.broker
+            # ShadowBroker：取内部真实 broker
+            if hasattr(bkr, "_inner") and getattr(bkr, "_inner", None) is not None:
+                bkr = bkr._inner  # type: ignore[assignment]
+            tkr: Any = None
+            if hasattr(bkr, "_ensure_client") and callable(getattr(bkr, "_ensure_client", None)):
+                try:
+                    ex = bkr._ensure_client()  # type: ignore[attr-defined]
+                    if ex is not None and hasattr(ex, "fetch_ticker"):
+                        tkr = await ex.fetch_ticker(sym)
+                except Exception:  # noqa: BLE001
+                    tkr = None
+            if isinstance(tkr, dict):
+                bid = float(tkr.get("bid") or 0.0)
+                ask = float(tkr.get("ask") or 0.0)
+                # 2) 1m 成交量：优先 fetch_ohlcv(1m, limit=1) 最准；取不到就用 ticker 24h 量/1440 粗估
+                try:
+                    if ex is not None and hasattr(ex, "fetch_ohlcv"):
+                        bars = await ex.fetch_ohlcv(sym, "1m", limit=1)
+                        if bars and len(bars) > 0 and len(bars[0]) >= 6:
+                            vol_1m = float(bars[0][5] or 0.0)
+                except Exception:  # noqa: BLE001
+                    vol_1m = 0.0
+                if vol_1m <= 0:
+                    # 兜底：24h 量估算 1m 量（仅用于"量足/量低"打分，误差影响不大）
+                    vol_24h = float(tkr.get("baseVolume") or 0.0)
+                    if vol_24h > 0:
+                        vol_1m = max(1.0, vol_24h / 1440.0)
+        except Exception:  # noqa: BLE001
+            pass
+        return float(bid), float(ask), float(vol_1m)
+
+    # ------------------------------------------------------------------
     # AI 节流 + 价格哨兵（新增 2026-08-30：7 级状态机自适应调用频率）
     # ------------------------------------------------------------------
     async def should_analyze(
@@ -592,6 +635,12 @@ class TradingController:
         if mark <= 0:
             mark = 2466.0  # 兜底
 
+        # 2026-08-31：抓取流动性输入（SLEEP 按价差+量+波动判断；不传则退化更宽松，不误杀）
+        _bid, _ask, _vol1m = 0.0, 0.0, 0.0
+        try:
+            _bid, _ask, _vol1m = await self._fetch_liq_inputs()
+        except Exception:  # noqa: BLE001
+            pass
         dec = self.ai_throttler.should_call_ai(
             now_ts=now_ts,
             system_status_running=running,
@@ -603,6 +652,9 @@ class TradingController:
             take_profit_price=float(take_profit_price or 0.0),
             liquidation_price=liq,
             force=bool(force),
+            bid_price=_bid,
+            ask_price=_ask,
+            recent_volume_contracts=_vol1m,
         )
         # 持久化：哪怕本轮不调 AI，价格哨兵的 last_event_pct / last_event_at / level 也要存
         st2 = self.state_store.load()
@@ -639,6 +691,12 @@ class TradingController:
         running = (status_raw == SystemStatus.RUNNING.value)
         risk_d = st_dec.get("risk") or {} if isinstance(st_dec, dict) else {}
         allow = bool(risk_d.get("allow_trading", True))
+        # 2026-08-31：流动性输入（节流根据流动性不按 UTC0-6 硬睡）
+        _bid, _ask, _vol1m = 0.0, 0.0, 0.0
+        try:
+            _bid, _ask, _vol1m = await self._fetch_liq_inputs()
+        except Exception:  # noqa: BLE001
+            pass
         dec = self.ai_throttler.should_call_ai(
             now_ts=now_ts,
             system_status_running=running,
@@ -650,6 +708,9 @@ class TradingController:
             take_profit_price=0.0,
             liquidation_price=liq,
             force=bool(force),
+            bid_price=_bid,
+            ask_price=_ask,
+            recent_volume_contracts=_vol1m,
         )
         # 未到时：直接返回上次 AI 结果 + 标注『节流』
         if not dec.should_call:

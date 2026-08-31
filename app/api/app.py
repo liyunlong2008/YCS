@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse as _JSONResponse
 from fastapi.testclient import TestClient  # noqa: F401  —— 方便测试里直接 import
 
@@ -892,7 +892,7 @@ def create_app(
                 if (elPU) {{
                   const protectTxt = (elPU.textContent || '').split('·')[1] || '· 未启用';
                   const uplPrefix = (pUpl >= 0 ? '+' : '') + pUpl.toFixed(2);
-                  elPU.textContent = uplPrefix + protectTxt.replace(/^(\s*·)?/, ' · ');
+                  elPU.textContent = uplPrefix + protectTxt.replace(/^(\\s*·)?/, ' · ');
                   elPU.classList.remove('loss','win');
                   elPU.classList.add(pUpl < 0 ? 'loss' : 'win');
                 }}
@@ -920,7 +920,7 @@ def create_app(
                   try {{
                     const elSz = document.getElementById('k-pos-size');
                     if (elSz && elSz.textContent) {{
-                      const m = String(elSz.textContent).match(/([\d.]+)/);
+                      const m = String(elSz.textContent).match(/([\\d.]+)/);
                       if (m) posSize2 = parseFloat(m[1]) || 0;
                     }}
                   }} catch(e) {{}}
@@ -1219,7 +1219,14 @@ def create_app(
     # A5. Kill-Switch HTTP 通道（POST /api/kill）：紧急全平 + 停机
     # ------------------------------------------------------------------
     @app.post("/api/kill", summary="【紧急】Kill-Switch：撤所有挂单→市价全平→写入 STOP 状态→熔断24h")
-    async def api_kill(request: Request):
+    async def api_kill(
+        request: Request,
+        x_ycs_admin_token: str = Header(
+            default="",
+            description="紧急停机口令：必须等于配置 risk_limits.kill_switch_token。其它通道：ycsctl kill、data/EMERGENCY_HALT 文件。",
+            alias="X-YCS-Admin-Token",
+        ),
+    ):
         """三通道之一：HTTP POST。其它通道：ycsctl kill、data/EMERGENCY_HALT 文件。
            安全：必须带 X-YCS-Admin-Token 头 == config.risk_limits.kill_switch_token。
         """
@@ -1229,7 +1236,7 @@ def create_app(
         expected_token = ""
         if cfg is not None and hasattr(cfg, "risk_limits"):
             expected_token = str(getattr(cfg.risk_limits, "kill_switch_token", "") or "")
-        got_token = str(request.headers.get("x-ycs-admin-token") or "")
+        got_token = str(x_ycs_admin_token or request.headers.get("x-ycs-admin-token") or "")
         if expected_token and got_token != expected_token:
             raise HTTPException(
                 status_code=_st.HTTP_401_UNAUTHORIZED,

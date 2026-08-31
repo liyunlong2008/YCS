@@ -635,20 +635,27 @@ class Test_8_DynamicVolatilityIntervals:
         )
 
     # ---- (C) SLEEP 窗 1.8% 也必须早叫（旧版只认 2% 会错过） ----
+    # 2026-08-31 更新：不再按 UTC 硬切 SLEEP，必须通过「流动性差」触发 SLEEP（用户原话：按流动性不按 UTC）。
+    #   所以本测试显式传入价差宽(+40)+量低(+30)+UTC2 加成(+25)-波动大(-10)=85≥60→SLEEP；
+    #   然后验证 1.8%（<2% 旧 SLEEP 不早叫的「坑」）依然命中 early_wake（>= sleep_wake_pct=1%）。
     def test_sleep_window_1p8pct_still_triggers_early_wake(self):
-        """SLEEP(UTC 0-6) + event=1.8% → early_wake=True（用户：亚洲深夜也不能漏 1~2% 急跌/暴涨）。
+        """SLEEP(流动性差) + event=1.8% → early_wake=True（不能漏 1~2% 急跌/暴涨）。
         旧逻辑：SLEEP 只当 big_event_1m_pct=2% 才早叫 → 1.8% 被静默错过。"""
-        thr, now = self._mk_throttler_at(utc_hour=2)  # UTC 2:00 = 典型 SLEEP 窗
-        # mark=2036 → event=1.8%（<2% 旧 SLEEP 不早叫的「坑」）
+        from app.core.ai_throttle import ThrottleLevel
+        thr, now = self._mk_throttler_at(utc_hour=2)
+        # mark=2036 → event=1.8%（<2% 旧 SLEEP 不早叫的「坑」，但 ≥ sleep_wake_pct=1% → 应该早叫）
         dec = thr.should_call_ai(
             now_ts=now, system_status_running=True, allow_trading=True,
             has_position=False, mark_price=2036.0, entry_price=0,
+            # 流动性差参数：价差≈0.59%≥0.35%(+40) + 量50张≤150(+30) + UTC2(+25) - 1.8%波动(-10) = 85≥60 → SLEEP
+            bid_price=2032.0, ask_price=2044.0,  # 价差 12 / 中价 2038 = 0.588%（够宽）
+            recent_volume_contracts=50,  # 1m 仅 50 张（≤低量阈值150）
         )
-        assert dec.level.value == "SLEEP", (
-            f"UTC 2:00 必须命中 SLEEP 档位，实际 {dec.level}"
+        assert dec.level == ThrottleLevel.SLEEP, (
+            f"价差宽+量低+UTC加成 → 流动性评分应≥60进入SLEEP，实际 {dec.level}（reason={dec.reason!r}）"
         )
         assert bool(dec.early_wake) is True, (
-            f"SLEEP 窗 + 波动 1.8% 必须 early_wake=True（不能等 2% 才早叫=错过急跌爆发行情），实际 early_wake={dec.early_wake}"
+            f"SLEEP + 波动 1.8% ≥ sleep_wake_pct(1%) 必须 early_wake=True（不能等 2% 才早叫=错过急跌爆发行情），实际 early_wake={dec.early_wake}, reason={dec.reason!r}"
         )
         assert int(dec.interval_s) <= int(600 * 0.5), (
             f"SLEEP+1.8% 间隔也要缩短到 ≤300s（原 600s 太长），实际 {dec.interval_s}"
@@ -711,5 +718,93 @@ class Test_9_MinNotionalTracksCurrentPrice:
         assert 2.485 <= m2488 <= 2.50, f"2488 → {m2488}（期望≈2.488）"
         # 两次必须不同（不能写成固定值）
         assert abs(m2466 - m2488) > 0.01, "2466 vs 2488 得到相同最小名义→写死了常数不是联动现价！"
+
+
+# ============================================================================
+# Test_10_SleepByLiquidityNotUtc（用户反馈：「节流应该根据行情流动性 而不是utc0-6」）
+#
+# 旧逻辑：elif gmtime(now).tm_hour < 6: 直接 SLEEP = 硬按时间睡（错）。
+# 新逻辑：是否 SLEEP = 『流动性真差』(价差异常 + 量低 + 波动低) + (UTC 0-6 仅加权，不是硬切)
+#         若 UTC 2:00 但价差窄/量足/有波动，说明有行情（如美盘尾盘消息）→ NORMAL 不 SLEEP；
+#         若 UTC 12:00 但价差宽/量缩/没波动，说明白天流动性也差（节假日/盘前）→ 照样 SLEEP。
+# ============================================================================
+class Test_10_SleepByLiquidityNotUtc:
+    def _mk(self, utc_hour):
+        import calendar as _cal
+        from app.core.ai_throttle import AIThrottler
+        base_ts = _cal.timegm((2025, 1, 1, utc_hour, 0, 0))
+        thr = AIThrottler()
+        thr.state.sentinel_mark_price = 2000.0
+        thr.state.sentinel_anchor_ts = base_ts - 30
+        thr.state.last_call_ts = base_ts - 120
+        thr.state.next_call_ts = 0
+        return thr, base_ts
+
+    # ---- 红用例 A：UTC 0-6 但流动性够（价差窄 + 事件波动≥0.3%）→ 必须不是 SLEEP ----
+    def test_utc2_liquidity_ok_should_not_sleep(self):
+        """UTC 2:00（旧逻辑=必SLEEP）但：价差 0.08%（窄）+ event=0.3%（有行情）→ 应该 NORMAL。
+        用户痛点：UTC 2 点如果有消息面（ETF盘前/宏观事件）流动性依然好，硬按时间 SLEEP=漏行情。"""
+        from app.core.ai_throttle import ThrottleLevel
+        thr, now = self._mk(utc_hour=2)
+        # mark=2006 → event=0.3%（有行情）；再传流动性：bid/ask 价差 0.08%（很窄） → 流动性充足
+        dec = thr.should_call_ai(
+            now_ts=now, system_status_running=True, allow_trading=True,
+            has_position=False, mark_price=2006.0, entry_price=0,
+            # 新流动性参数（不强制，不传就退回旧逻辑。传了就按流动性判）
+            bid_price=2005.2, ask_price=2006.8,  # 价差(2006.8-2005.2)/2006=0.08%
+            recent_volume_contracts=5000,  # 最近 1m 成交 5000 张（不低）
+        )
+        assert dec.level != ThrottleLevel.SLEEP, (
+            f"UTC 2:00 + 价差窄+有波动+量足 → 流动性充足，不该 SLEEP（用户：按流动性不按时间！），实际 {dec.level}"
+        )
+        assert dec.level == ThrottleLevel.NORMAL, f"期望 NORMAL，实际 {dec.level}"
+        # reason 必须包含『流动性』或『价差』字样（证明新逻辑生效）
+        assert any(w in dec.reason for w in ("流动性", "价差", "量")), (
+            f"新判定逻辑必须写明为什么没睡（流动性充足），实际 reason={dec.reason!r}"
+        )
+
+    # ---- 红用例 B：UTC 白天 12:00 但流动性极差（价差宽 + 极低量 + 0 波动）→ 应该 SLEEP ----
+    def test_utc12_liquidity_poor_should_still_sleep(self):
+        """UTC 12:00（旧逻辑=一定不 SLEEP）但价差 0.8%（宽）+ 量几乎=0 → 照样 SLEEP。
+        场景：独立日/圣诞节假日白天，交易所挂单稀疏；或 ETH 周末横盘。"""
+        from app.core.ai_throttle import ThrottleLevel
+        thr, now = self._mk(utc_hour=12)
+        # mark=2000.6 → event=0.03%（几乎没波动）；价差 0.8% 极宽；量 30 张/1m（几乎没量）
+        dec = thr.should_call_ai(
+            now_ts=now, system_status_running=True, allow_trading=True,
+            has_position=False, mark_price=2000.6, entry_price=0,
+            bid_price=1992.6, ask_price=2008.6,  # 价差(2008.6-1992.6)/2000.6 = 0.8%（极宽）
+            recent_volume_contracts=30,  # 1m 30 张（死寂）
+        )
+        assert dec.level == ThrottleLevel.SLEEP, (
+            f"UTC 12:00 但价差宽+量缩+0波动 → 流动性差，应该 SLEEP（不按时间按行情！），实际 {dec.level}"
+        )
+
+    # ---- 红用例 C：UTC 2:00 + 流动性差（和旧结果一致）→ 继续 SLEEP 没毛病 ----
+    def test_utc2_liquidity_poor_backward_compat_sleep(self):
+        """UTC 2:00 + 价差 0.6% + 量低 + 无波动 → 流动性差，SLEEP（老场景兼容）。"""
+        from app.core.ai_throttle import ThrottleLevel
+        thr, now = self._mk(utc_hour=2)
+        dec = thr.should_call_ai(
+            now_ts=now, system_status_running=True, allow_trading=True,
+            has_position=False, mark_price=2000.4, entry_price=0,
+            bid_price=1994.4, ask_price=2006.4,  # 价差≈0.6%
+            recent_volume_contracts=80,  # 量低
+        )
+        assert dec.level == ThrottleLevel.SLEEP, (
+            f"UTC 2+流动性差本来就该睡，向后兼容失败，实际 {dec.level}"
+        )
+
+    # ---- 红用例 D：不传流动性参数（纯 backward 兼容：缺输入时不得崩） → 至少回旧/正常档位 ----
+    def test_no_liquidity_args_does_not_crash(self):
+        """没接流动性实盘输入时（旧调用方），不应该 KeyError / 除 0。"""
+        thr, now = self._mk(utc_hour=12)
+        # 什么额外参数都不传（只有 should_call_ai 的老参数）
+        dec = thr.should_call_ai(
+            now_ts=now, system_status_running=True, allow_trading=True,
+            has_position=False, mark_price=2001.0, entry_price=0,
+        )
+        assert bool(dec.should_call) in (True, False)
+        assert dec.interval_s > 0
 
 
