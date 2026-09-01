@@ -415,7 +415,10 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                     # 冷却 E1：60s 窗口内上一次 close_all 失败过 → 整段跳过（不刷屏）
                     import time as _t_liq
                     _COOLDOWN_S = 60
-                    _THR_PCT = 20.0   # E2：阈值 20%
+                    # 2026-09-01 E2 修正：阈值不再是"mark 距强平价绝对百分比 20%"（老值对 10X 必
+                    #   触发，10X 初始距离才 10%<20%），改为『初始缓冲消耗率 85%』=
+                    #   吃了 85% |entry-liq| 的反方向距离（约 entry/lev 的 85% 空间走完）才主动平。
+                    _THR_PCT = 85.0   # 新语义：缓冲消耗率阈值 (%)；85%=剩 15% 安全垫时平
                     _now_liq = int(_t_liq.time())
                     _last_fail = int((st.get("_liq_close_last_fail_ts") or 0))
                     still_cooling = (_last_fail > 0) and ((_now_liq - _last_fail) < _COOLDOWN_S)
@@ -474,24 +477,47 @@ async def bg_main_loop(rt: dict[str, Any]) -> None:
                                     state_store.save(st)
                                 except Exception:  # noqa: BLE001
                                     pass
-                            # E4b) 不管成功失败，先切状态让下次 bg_main_loop RUNNING 守卫不过
-                            try:
-                                await ctl.kill_switch(reason=liq_reason[:200],
-                                                     caller="bg_main_loop:liq_proximity")
-                            except Exception:  # noqa: BLE001
-                                pass
+                            # E4b) 不管成功失败，先切状态让下次 bg_main_loop RUNNING 守卫不过。
+                            # 注意：之前写了 ctl.kill_switch(...) 但 TradingController 无该方法（
+                            # 老注释残留但未实现），会抛 AttributeError 被上方 except 吞，导致用户看
+                            # 不到真实错误原因。这里直接写 HALT 到 state_store，bg_main_loop 下一轮
+                            # RUNNING 守卫就不过了；和 kill_switch 的磁盘兜底文件并行写双保险。
+                            from app.core.constants import SystemStatus as _SS
+                            _halt_reason = str(liq_reason or "")[:200] or "强平邻近保护"
                             try:
                                 st = state_store.load()
-                                st["status"] = SystemStatus.HALT.value
+                                st["status"] = _SS.HALT.value
+                                st["halt_reason"] = (
+                                    f"[bg_main_loop:liq_proximity@{_now_liq}] 强平邻近保护触发：{_halt_reason}"
+                                )
                                 state_store.save(st)
                             except Exception:  # noqa: BLE001
-                                logger.exception("[强平前主动平仓] 写 HALT 失败，退化写 ERROR")
+                                logger.exception("[强平前主动平仓] 写 state_store status=HALT 失败（退化 ERROR）")
                                 try:
                                     st = state_store.load()
-                                    st["status"] = SystemStatus.ERROR.value
+                                    st["status"] = _SS.ERROR.value
                                     state_store.save(st)
                                 except Exception:  # noqa: BLE001
                                     pass
+                            # 磁盘兜底文件：kill_switch 三通道之一 EMERGENCY_HALT
+                            try:
+                                import pathlib as _pl_lq
+                                _rt = runtime if runtime is not None else {}
+                                _root = _rt.get("runtime_root")
+                                if _root is None:
+                                    _root = _pl_lq.Path(project_root if project_root is not None else (
+                                        _pl_lq.Path(__file__).resolve().parent / "data"
+                                    ))
+                                _data_dir = _pl_lq.Path(str(_root))
+                                _halt_f = _data_dir / "EMERGENCY_HALT"
+                                _halt_f.write_text(
+                                    f"HALT BY bg_main_loop:liq_proximity @ {_now_liq}\n"
+                                    f"reason: {_halt_reason}\n"
+                                    f"resume_hint: 删除本文件 + ycsctl restart OR echo 'HALT→RUNNING' 手动写 state_store.status\n",
+                                    encoding="utf-8",
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.exception("[强平前主动平仓] 写 EMERGENCY_HALT 兜底文件失败（忽略）")
                             # 睡眠一轮（即便 RUNNING 守卫 / 冷却 都坏，也至少 10s 不连刷两次）
                             await asyncio.sleep(loop_interval)
                             continue

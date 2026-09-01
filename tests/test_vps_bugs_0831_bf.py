@@ -344,15 +344,30 @@ class Test_BugE_LiqProximitySpamFix:
 
     @staticmethod
     def test_vps_reproduction_9pct_triggers_close():
-        """复现 VPS 21:30 现场：SHORT mark=2452 liq=2689 → dist 9.65% → 默认 10% 触发。"""
+        """【2026-09-01 语义升级复现】旧 VPS 现场：SHORT 按 price% 距离<10% 就平，
+        刚开仓 10X 距离就 10% 导致误杀。升级后语义=『缓冲消耗 ≥85%』才平。
+          · VPS 真实危险场景（SHORT 价格向上走，靠近 liq）：
+              entry=2466 mark=2667 liq=2689 → moved=201 buf=223 → 消耗 90% → 触发
+          · 安全场景（SHORT 价格向下走，正盈 / mark=2452 < entry=2466）：
+              moved=0 buf=223 → 消耗 0% → 绝对不触发（此前旧 price% 算法就误触发）
+        """
         from app.services.controller import TradingController as TC
-        # 现场参数：SHORT 空单 entry≈2466，mark≈2452，liq≈2689，lev=10
-        must_close, reason = TC.is_liq_proximity_close(
+        # DANGER 场景：SHORT mark=2667（价格涨 201 刀 ≈ 90% 223 缓冲）→ 应触发
+        danger, reason_d = TC.is_liq_proximity_close(
+            side=PositionSide.SHORT, mark_price=2667.0, entry_price=2466.0,
+            liq_price=2689.01, leverage=10,
+        )
+        assert danger is True, (
+            f"SHORT 已消耗 90% 缓冲未触发（应该平！got {reason_d}）"
+        )
+        # SAFE 场景：SHORT mark=2452（盈利，朝反方向走）→ 消耗 0% → 不触发
+        safe, reason_s = TC.is_liq_proximity_close(
             side=PositionSide.SHORT, mark_price=2452.42, entry_price=2466.0,
             liq_price=2689.01, leverage=10,
         )
-        # (2689.01 - 2452.42) / 2452.42 = 9.65% < 10% → 应该触发（行为保持 VPS 一致）
-        assert must_close is True, f"9.65%<10% 应触发强平前主动平仓（VPS 复现），got {reason}"
+        assert safe is False, (
+            f"SHORT 盈利时错误触发！got {reason_s}（旧 price% 算法就误杀 9.65%<10% 阈值）"
+        )
 
     @staticmethod
     def test_liq_close_failure_cooldown_60s_blocking():

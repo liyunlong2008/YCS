@@ -859,32 +859,43 @@ class Test_11_RiskHardeningForLiveReady:
             assert v.suggested_size >= 0.1
 
     def test_11_2_liquidation_proximity_triggers_close(self):
-        """『离强平价 ≤ 10%』要触发『必须主动平仓』判定（controller.is_liq_proximity_close）。
-        场景：ETH=2450 持多单 entry=2500 lev=10 → 强平价≈2275；现价 2310 → 距离 ≈ (2310-2275)/2275=1.54% < 10% → 必须主动平。"""
+        """【2026-09-01 语义升级】旧："mark 距强平价 ≤10% price-%" → 新："初始缓冲消耗 ≥85%"。
+        现场 Bug 修复：10X 新仓距离才 10%（≡ entry/lev），旧 20%/10% 阈值一开仓必触发。
+        升级后缓冲 = |entry - liq| ≈ entry/lev；触发条件 = 缓冲消耗 ≥ 85%。"""
         from app.core.constants import PositionSide
         from app.services.controller import TradingController
-        # 不需全构造 TradingController：is_liq_proximity_close 是静态帮助函数
-        # 如果它是方法，直接用类函数签名调用即可
         self._ensure_helper_exists()
         entry_price = 2500.0
         lev = 10
         # 多头强制平仓价 ≈ entry*(1-1/lev) = 2500*0.9 = 2250（简化 OKX 模型）
-        liq_price = entry_price * (1 - 1.0/lev)
-        mark_price_very_close = liq_price * 1.03  # 涨 3% 离开强平 → 距离=(2317.5-2250)/2250=3% → <10%
+        liq_price = entry_price * (1 - 1.0/lev)               # = 2250
+        initial_buf = entry_price - liq_price                 # = 250
+        # 触发场景：吃 90% 缓冲（=225$）→ mark = entry - 0.9 * 250 = 2275（> liq=2250）
+        mark_close = entry_price - 0.90 * initial_buf         # = 2275
         must_close, reason = TradingController.is_liq_proximity_close(
-            PositionSide.LONG, mark_price=mark_price_very_close,
+            PositionSide.LONG, mark_price=mark_close,
             entry_price=entry_price, liq_price=liq_price, leverage=lev,
         )
-        assert must_close is True, f"距离强平仅 3%，应主动平仓！{reason}"
-        assert "强平" in reason
-        # 安全场景：距离 20% → 不应触发
-        mark_safe = entry_price * 0.97  # 2425，距离 2250 = 175 → (2425-2250)/2250 ≈ 7.8%？再离远点
-        mark_safe = entry_price * 1.0   # 2500，正盈：(2500-2250)/2250≈11.1% → >10%
-        must_close2, _ = TradingController.is_liq_proximity_close(
-            PositionSide.LONG, mark_price=mark_safe,
+        assert must_close is True, (
+            f"10X LONG 已消耗 90% 初始缓冲仍未触发强平前主动平仓！got {reason}"
+        )
+        assert ("缓冲" in reason and "消耗" in reason) or "强平" in reason, reason
+        # 安全场景 1：开仓瞬间 mark≈entry（消耗 ≈ 0%）→ 绝对不能触发（此为本次修复核心）
+        mark_fresh = entry_price * 1.0                       # 2500 正盈
+        must_close_fresh, reason_fresh = TradingController.is_liq_proximity_close(
+            PositionSide.LONG, mark_price=mark_fresh,
             entry_price=entry_price, liq_price=liq_price, leverage=lev,
         )
-        assert must_close2 is False
+        assert must_close_fresh is False, (
+            f"10X LONG 刚开仓 mark≈entry 错误触发！got {reason_fresh}"
+        )
+        # 安全场景 2：消耗 60%（还剩 100$ buffer）→ 不触发
+        mark_60 = entry_price - 0.6 * initial_buf            # = 2350
+        must_close_60, _ = TradingController.is_liq_proximity_close(
+            PositionSide.LONG, mark_price=mark_60,
+            entry_price=entry_price, liq_price=liq_price, leverage=lev,
+        )
+        assert must_close_60 is False
 
     def test_11_3_shadow_to_real_switch_safety_sweep(self):
         """影子→实盘闸门：当 bootstrap_runtime 检测到『上一轮 state 有残留真实持仓/挂单 + 切到非影子模式』，

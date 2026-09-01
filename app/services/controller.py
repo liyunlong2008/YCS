@@ -139,9 +139,26 @@ class TradingController:
         entry_price: float,
         liq_price: float,
         leverage: int | float,
-        thr_pct: float = 10.0,
+        # 2026-09-01：语义从『mark 距强平价绝对百分比(%)』改为『初始安全缓冲消耗率(%)』。
+        #   · buffer_consumed_thr_pct=85 默认：初始安全缓冲 |entry - liq| ≈ entry/lev（如 10X=10% price）
+        #     当价格已吃掉 85% 缓冲（还剩 15% 空间）才主动平。
+        #   · 现场此前 thr_pct=20%（按 price 百分比），对 10X 长仓初始距离仅 10% →
+        #     开仓瞬间 9.74% < 20% → 必触发，造成"开仓 12s 后主动强平→HALT"死循环。
+        #   · 参数保留 thr_pct（老名字）= buffer_consumed_thr_pct（新语义 85% 默认），
+        #     对调用方兼容：run.py 里传 _THR_PCT=20.0 这种"老值超大"的会被 clamp 到合理区间
+        #     （≥50 视为消耗率；<50 视为"老的绝对百分比"直接转成消耗率 = 100 - 旧%*2 兜底）。
+        thr_pct: float = 85.0,
     ) -> tuple[bool, str]:
         """判断当前持仓是否已逼近强平价 → 主动平仓（不把钱给交易所保险基金）。
+
+        新语义（2026-09-01）：不再用"mark 距强平价占 mark 的绝对比例(%)"当阈值，
+        改用"初始安全缓冲已消耗比例(%)"：
+          initial_buffer = |entry_price - liq_price|  (entry 到爆仓线的最大可走距离 ≈ entry/lev)
+          moved_into_liq = 多单(entry − mark) / 空单(mark − entry)   （向爆仓方向走了多少）
+          buffer_consumed_pct = 100 * moved_into_liq / initial_buffer
+        例：10X LONG entry=2471 liq=2230 → initial_buffer ≈ 241（价格向下跌 241 刀才爆）
+            mark 跌到 entry − 0.9*241 = 2254 → buffer_consumed=90% → 触发（>85%）。
+            开仓瞬间 mark≈entry → buffer_consumed≈0% → 安全。
 
         Args:
             side: PositionSide (LONG / SHORT)。FLAT 直接返回 False。
@@ -149,17 +166,28 @@ class TradingController:
             entry_price: 开仓均价。
             liq_price: 交易所返回的强平价。若为 0，用 1/lev 简化公式兜底推导。
             leverage: 当前杠杆。
-            thr_pct: 距离阈值 (%)。默认 10% = 距离强平距离 < 10% 的剩余安全幅度就主动平。
+            thr_pct: 初始缓冲已消耗阈值(%)。默认 85% = 缓冲吃掉 85% 以上就主动平。
         Returns:
             (必须平仓=True/False, 中文原因)
         """
         from ..core.constants import PositionSide  # noqa: PLC0415
         if side in (PositionSide.FLAT, "FLAT", None):
             return False, "空仓，无需判断强平距离"
+        lev = max(1, float(leverage or 1))
+        # 向后兼容：老调用方把 thr_pct 当"绝对百分比 10%/20%"（<50），
+        # 我们自动转成消耗率语义（保守映射：旧 20% → 新 80% 缓冲消耗阈值）。
+        # >=50 的才认为是新语义 buffer_consumed_thr_pct。
+        if 0 < thr_pct < 50:
+            # 老语义 thr_pct="距强平价绝对百分比阈值(mark-price-%)" →
+            # 等价的缓冲消耗率阈值 ≈ 100 - (thr_pct / (100/lev)) * 100
+            # 简化：thr_abs=20% / lev=10 → 初始 10% buffer → 不可能到 <20%（刚开仓就 10%），
+            # 所以老参数我们当作"老逻辑错了"，回退到保守的 85% 新语义默认值即可。
+            buffer_consumed_thr = 85.0
+        else:
+            buffer_consumed_thr = float(max(50.0, min(99.0, thr_pct)))
         if not liq_price or liq_price <= 0:
             # 简化强平价估算：多头 entry*(1 - 1/lev)；空头 entry*(1 + 1/lev)
-            # （OKX 真强平价考虑资金费/手续费，略更苛刻；这里用宽松一点的估算也比让用户爆仓强）
-            lev = max(1, float(leverage or 1))
+            # （OKX 真强平价考虑资金费/手续费，略更苛刻；宽松估算比用户爆仓强）
             if side in (PositionSide.LONG, "LONG"):
                 liq_price = float(entry_price) * (1.0 - 1.0 / lev)
             else:
@@ -168,26 +196,43 @@ class TradingController:
         entry = float(entry_price or 0.0)
         if mark <= 0 or entry <= 0 or liq_price <= 0:
             return False, f"输入非法（mark={mark} entry={entry} liq={liq_price}），跳过强平距离判断"
-        # 方向决定『剩余安全距离』的计算方向
-        if side in (PositionSide.LONG, "LONG"):
-            # 多单：mark ↓ 到 liq_price → 爆仓。安全距离 = (mark - liq_price) / mark
+        is_long = side in (PositionSide.LONG, "LONG")
+        # ---- 1) 先判"已经破强平线"（最危险），直接触发 ----
+        if is_long:
             if mark <= liq_price:
                 return True, f"🔥 强平触发：标记价 {mark:.2f} ≤ 强平价 {liq_price:.2f}，立即全平多单"
-            safety_dist_pct = (mark - liq_price) / max(mark, 1e-9) * 100
-        else:  # SHORT
-            # 空单：mark ↑ 到 liq_price → 爆仓。安全距离 = (liq_price - mark) / mark
+        else:
             if mark >= liq_price:
                 return True, f"🔥 强平触发：标记价 {mark:.2f} ≥ 强平价 {liq_price:.2f}，立即全平空单"
-            safety_dist_pct = (liq_price - mark) / max(mark, 1e-9) * 100
-        if safety_dist_pct < thr_pct:
+        # ---- 2) initial buffer = |entry - liq| ----
+        if is_long:
+            initial_buffer = abs(entry - liq_price)  # entry - liq
+            if initial_buffer <= 0:
+                # entry 已经 <= liq：相当于已经到强平（数据异常场景兜底）
+                return True, f"🔥 开仓价 {entry:.2f} ≤ 强平价 {liq_price:.2f}，数据异常，立即全平多单"
+            moved_toward_liq = entry - mark  # 正数=向爆仓方向走了多少
+            if moved_toward_liq < 0:
+                moved_toward_liq = 0.0  # 往远离爆仓的方向走，没消耗缓冲
+        else:  # SHORT
+            initial_buffer = abs(liq_price - entry)
+            if initial_buffer <= 0:
+                return True, f"🔥 开仓价 {entry:.2f} ≥ 强平价 {liq_price:.2f}，数据异常，立即全平空单"
+            moved_toward_liq = mark - entry
+            if moved_toward_liq < 0:
+                moved_toward_liq = 0.0
+        buffer_consumed_pct = moved_toward_liq / initial_buffer * 100.0
+        remaining_buf_usd = initial_buffer - moved_toward_liq
+        if buffer_consumed_pct >= buffer_consumed_thr:
             return True, (
-                f"⚠️ 距强平价仅 {safety_dist_pct:.2f}% < 阈值 {thr_pct:.2f}% "
-                f"（mark={mark:.2f} liq={liq_price:.2f} side={side}），"
+                f"⚠️ 初始安全缓冲已消耗 {buffer_consumed_pct:.1f}% ≥ 阈值 {buffer_consumed_thr:.0f}% "
+                f"（entry={entry:.2f} liq={liq_price:.2f} mark={mark:.2f} "
+                f"缓冲=|entry-liq|={initial_buffer:.2f}$ 已走={moved_toward_liq:.2f}$ 剩={remaining_buf_usd:.2f}$ side={side}），"
                 "为避免资金被 OKX 保险基金没收，主动触发全平"
             )
         return False, (
-            f"安全：距强平 {safety_dist_pct:.2f}% ≥ 阈值 {thr_pct:.2f}% "
-            f"（mark={mark:.2f} liq={liq_price:.2f} side={side}）"
+            f"安全：缓冲消耗 {buffer_consumed_pct:.1f}% < 阈值 {buffer_consumed_thr:.0f}% "
+            f"（entry={entry:.2f} liq={liq_price:.2f} mark={mark:.2f} "
+            f"缓冲={initial_buffer:.2f}$ 已走={moved_toward_liq:.2f}$ 剩={remaining_buf_usd:.2f}$ side={side}）"
         )
 
     # ------------------------------------------------------------------
